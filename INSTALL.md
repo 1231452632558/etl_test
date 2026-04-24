@@ -121,10 +121,18 @@ crontab -e
 
 ### 2. Добавьте задание
 
+#### Для модульной версии (рекомендуется)
+
 Для запуска каждый день в 2:00 ночи:
 
 ```
-0 2 * * * cd /workspace && python3 /workspace/scripts/etl_pipeline.py --cleanup /path/to/nightly/dump.sql >> /workspace/logs/cron.log 2>&1
+0 2 * * * cd /workspace && python3 /workspace/scripts/etl_pipeline.py --cleanup /path/to/nightly/dump.tar.gz >> /workspace/logs/cron.log 2>&1
+```
+
+#### Для монолитной версии (legacy, не рекомендуется)
+
+```
+0 2 * * * cd /workspace && python3 /workspace/scripts/legacy/etl_pipeline.py --cleanup /path/to/nightly/dump.tar.gz >> /workspace/logs/cron_legacy.log 2>&1
 ```
 
 ### 3. Проверьте cron
@@ -165,8 +173,14 @@ sudo systemctl start postgresql
 
 При первом запуске используйте флаг `--init`:
 
+#### Для модульной версии:
 ```bash
-python3 /workspace/scripts/etl_pipeline.py --init /path/to/dump.sql
+python3 /workspace/scripts/etl_pipeline.py --init /path/to/dump.tar.gz
+```
+
+#### Для монолитной версии (legacy):
+```bash
+python3 /workspace/scripts/legacy/etl_pipeline.py --init /path/to/dump.tar.gz
 ```
 
 ## Мониторинг
