@@ -60,19 +60,21 @@ ETL pipeline разделен на независимые модульные з�
 ```bash
 /workspace/
 ├── scripts/
-│   ├── etl_pipeline.py          # Основной скрипт (оркестратор)
-│   ├── etl_pipeline_tasks.py    # Конфигурация задач пайплайна
-│   └── tasks/
-│       ├── __init__.py          # Инициализация модуля задач
-│       ├── base.py              # Базовый класс BaseTask
-│       ├── task_runner.py       # Оркестратор задач (TaskRunner)
-│       ├── extract_task.py      # Задача извлечения дампа
-│       ├── restore_task.py      # Задача восстановления во временную базу
-│       ├── compare_task.py      # Задача сравнения данных
-│       ├── transform_custom_values_task.py  # Трансформация custom values
-│       ├── load_task.py         # Загрузка изменений в основную базу
-│       ├── weekly_task.py       # Еженедельные задачи
-│       └── cleanup_task.py      # Очистка временных ресурсов
+│   ├── legacy/                   # Старая монолитная версия (для справки)
+│   │   ├── etl_pipeline.py      # Монолитный скрипт (устаревший)
+│   │   └── etl_pipeline_tasks.py # Пустой файл-заглушка
+│   ├── tasks/                    # Модульная версия (текущая)
+│   │   ├── __init__.py          # Инициализация модуля задач
+│   │   ├── base.py              # Базовый класс BaseTask
+│   │   ├── task_runner.py       # Оркестратор задач (TaskRunner)
+│   │   ├── extract_task.py      # Задача извлечения дампа
+│   │   ├── restore_task.py      # Задача восстановления во временную базу
+│   │   ├── compare_task.py      # Задача сравнения данных
+│   │   ├── transform_custom_values_task.py  # Трансформация custom values
+│   │   ├── load_task.py         # Загрузка изменений в основную базу
+│   │   ├── weekly_task.py       # Еженедельные задачи
+│   │   └── cleanup_task.py      # Очистка временных ресурсов
+│   └── etl_pipeline.py          # Основной скрипт-обертка для запуска модульной версии
 ├── config/
 │   └── etl_config.ini           # Конфигурация
 ├── logs/                         # Логи (создается автоматически)
@@ -135,7 +137,9 @@ sudo chown $USER:$USER /var/backups/postgres
 
 ## Использование
 
-### Первый запуск (инициализация)
+### Запуск модульной версии (рекомендуется)
+
+#### Первый запуск (инициализация)
 
 ```bash
 python3 /workspace/scripts/etl_pipeline.py --init /path/to/initial_dump.tar.gz
@@ -147,7 +151,7 @@ python3 /workspace/scripts/etl_pipeline.py --init /path/to/initial_dump.tar.gz
 - Создает необходимые таблицы и индексы
 - Предоставляет права пользователю
 
-### Ночная обработка (ежедневный запуск)
+#### Ночная обработка (ежедневный запуск)
 
 ```bash
 python3 /workspace/scripts/etl_pipeline.py /path/to/nightly_dump.tar.gz
@@ -178,7 +182,23 @@ python3 /workspace/scripts/etl_pipeline.py --cleanup /path/to/nightly_dump.tar.g
 6. **WeeklyTask**: Добавляет еженедельные записи (если сегодня целевой день)
 7. **CleanupTask**: Удаляет временную базу
 
+### Запуск монолитной версии (legacy, не рекомендуется)
+
+Старый монолитный скрипт сохранен в директории `scripts/legacy/` для справки или отката:
+
+```bash
+# Первый запуск
+python3 /workspace/scripts/legacy/etl_pipeline.py --init /path/to/initial_dump.tar.gz
+
+# Ночная обработка
+python3 /workspace/scripts/legacy/etl_pipeline.py /path/to/nightly_dump.tar.gz
+```
+
+**Важно**: Монолитная версия устарела и не поддерживается. Рекомендуется использовать модульную версию.
+
 ### Настройка автоматического запуска (cron)
+
+#### Для модульной версии (рекомендуется)
 
 Для ежедневного запуска в 2:00 ночи:
 
@@ -189,6 +209,12 @@ crontab -e
 Добавьте строку:
 ```cron
 0 2 * * * /usr/bin/python3 /workspace/scripts/etl_pipeline.py /path/to/nightly_dump.tar.gz --cleanup >> /workspace/logs/cron.log 2>&1
+```
+
+#### Для монолитной версии (legacy, не рекомендуется)
+
+```cron
+0 2 * * * /usr/bin/python3 /workspace/scripts/legacy/etl_pipeline.py /path/to/nightly_dump.tar.gz --cleanup >> /workspace/logs/cron_legacy.log 2>&1
 ```
 
 ## Конфигурация
@@ -344,6 +370,8 @@ rm -rf /tmp/pg_etl_temp/*
 
 ## Миграция со старого скрипта
 
+### Вариант 1: Переход на модульную версию (рекомендуется)
+
 1. Сделайте полный бэкап текущей базы:
 ```bash
 pg_dump -U postgres db_name > backup_before_migration.sql
@@ -351,7 +379,7 @@ pg_dump -U postgres db_name > backup_before_migration.sql
 
 2. Запустите новый скрипт в режиме инициализации с последним дампом:
 ```bash
-python3 etl_pipeline.py --init latest_dump.tar.gz
+python3 /workspace/scripts/etl_pipeline.py --init latest_dump.tar.gz
 ```
 
 3. Проверьте что данные корректно загружены
@@ -359,6 +387,20 @@ python3 etl_pipeline.py --init latest_dump.tar.gz
 4. Обновите crontab для использования нового скрипта
 
 5. Оставьте старый скрипт как резервный вариант на первую неделю
+
+### Вариант 2: Использование монолитной версии (legacy)
+
+Если по каким-то причинам требуется использовать старую монолитную версию:
+
+```bash
+# Инициализация
+python3 /workspace/scripts/legacy/etl_pipeline.py --init latest_dump.tar.gz
+
+# Ежедневный запуск
+python3 /workspace/scripts/legacy/etl_pipeline.py nightly_dump.tar.gz
+```
+
+**Внимание**: Монолитная версия не получает обновлений и может содержать устаревшую логику.
 
 ## Лицензия
 
