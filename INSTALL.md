@@ -112,6 +112,7 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
 ```
 
 Если `issues` не указать, она всё равно будет автоматически добавлена логикой pipeline через `issues_table`.
+`group_employee_count` и `users_active` не добавляются в `incremental_tables`, потому что это ручные weekly-таблицы, а не snapshot-таблицы из nightly dump.
 
 ## 6. Seed-файлы для ручных таблиц
 

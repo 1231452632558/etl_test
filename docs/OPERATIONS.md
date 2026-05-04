@@ -55,6 +55,10 @@ incremental_tables = table_a:id,table_b:id
 issues_table = issues
 ```
 
+`issues` можно не дублировать в `incremental_tables`, если она задается через `issues_table`.
+
+`group_employee_count` и `users_active` не должны включаться в `incremental_tables`, потому что они живут в main БД как ручные weekly-таблицы.
+
 Смысл:
 - таблица из dump считается текущим срезом данных
 - этот срез выгружается из staging

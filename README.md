@@ -182,6 +182,7 @@ repo/
 - `[schedule].target_day` — день weekly-обновления
 
 Важно: `issues_table` автоматически добавляется в snapshot-список, даже если её забыли явно указать.
+Важно: `group_employee_count` и `users_active` не должны попадать в `incremental_tables`, потому что они обновляются отдельным weekly-процессом.
 
 ## Запуск
 
