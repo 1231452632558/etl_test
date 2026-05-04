@@ -81,6 +81,7 @@ backup_storage_dir = /var/backups/postgres
 temp_dir = /tmp/pg_etl_temp
 log_dir = /workspace/logs
 log_file = /workspace/logs/etl_pipeline.log
+asterisk_csv_file = /workspace/logs/asterisk_cdr.csv
 
 [remote]
 remote_user = your_remote_user
@@ -114,7 +115,8 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
 
 ## 6. Seed-файлы для ручных таблиц
 
-Для ручных таблиц используются seed CSV:
+Для CSV/manual таблиц используются seed CSV:
+- `asterisk_cdr.csv`
 - `group_employee_count_backup.csv`
 - `users_active_backup.csv`
 
@@ -123,11 +125,14 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
 Например:
 
 ```bash
+/workspace/logs/asterisk_cdr.csv
 /workspace/logs/group_employee_count_backup.csv
 /workspace/logs/users_active_backup.csv
 ```
 
-Seed применяется только если соответствующая таблица в main БД пустая.
+Для `asterisk_cdr` seed применяется если таблица пустая в main или staging БД.
+
+Для `group_employee_count` и `users_active` seed применяется только если соответствующая таблица в main БД пустая.
 
 ## 7. Первый запуск
 
@@ -155,6 +160,7 @@ sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM issues;"
 Если используются ручные таблицы:
 
 ```bash
+sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM asterisk_cdr;"
 sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM group_employee_count;"
 sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM users_active;"
 ```

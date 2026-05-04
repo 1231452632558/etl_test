@@ -36,13 +36,14 @@ Staging нужна потому, что входящий dump нельзя ме�
 3. Создать staging БД.
 4. Восстановить SQL-файлы в staging БД.
 5. Создать служебные таблицы, если они нужны.
-6. Добавить `project_id` в `asterisk_cdr`, если нужно.
-7. Выполнить custom transform в staging.
-8. Экспортировать snapshot-таблицы в CSV.
-9. Выполнить `UPSERT` этих snapshot-таблиц в main.
-10. Выполнить weekly-upsert для ручных таблиц.
-11. Выдать права.
-12. Очистить staging БД и временные каталоги.
+6. Если `asterisk_cdr` отсутствует в dump, подгрузить её из отдельного CSV в staging.
+7. Добавить `project_id` в `asterisk_cdr`, если нужно.
+8. Выполнить custom transform в staging.
+9. Экспортировать snapshot-таблицы в CSV.
+10. Выполнить `UPSERT` этих snapshot-таблиц в main.
+11. Выполнить weekly-upsert для ручных таблиц.
+12. Выдать права.
+13. Очистить staging БД и временные каталоги.
 
 ## 3. Snapshot-таблицы
 
@@ -73,15 +74,20 @@ issues_table = issues
 
 - `group_employee_count`
 - `users_active`
+- `asterisk_cdr`
 
 ### Почему они особенные
 
-Они не приходят из внешнего dump и не должны зависеть от nightly full restore.
+`group_employee_count` и `users_active` не приходят из внешнего dump и не должны зависеть от nightly full restore.
+
+`asterisk_cdr` в текущем процессе тоже может жить как внешний CSV-источник, если в nightly dump её нет.
 
 Исторически в `dump_restore.sh` они:
 - выгружались в CSV
 - main БД пересоздавалась
 - CSV заливались обратно
+
+Отдельно `asterisk_cdr` загружалась из внешнего `CSV_FILE` с разделителем `;`.
 
 Теперь это не нужно, потому что main БД больше не удаляется.
 
@@ -90,18 +96,23 @@ issues_table = issues
 При `--init`:
 - таблицы создаются, если отсутствуют
 - если они пустые, можно загрузить их из seed CSV
+- `asterisk_cdr` может быть импортирована из `asterisk_csv_file`
 
 При nightly run:
 - pipeline не перезаливает эти таблицы из CSV
 - pipeline только выполняет weekly-upsert
+- `asterisk_cdr` при необходимости подгружается в staging из CSV и затем попадает в main как snapshot-таблица
 
 ### Seed CSV
 
 Seed CSV нужны только как стартовая точка, если надо сохранить старые ручные данные:
+- `asterisk_cdr.csv`
 - `group_employee_count_backup.csv`
 - `users_active_backup.csv`
 
-Они применяются один раз, если таблица пустая.
+Для `asterisk_cdr` seed может применяться в пустую staging/main БД.
+
+Для `group_employee_count` и `users_active` seed применяется один раз, если таблица пустая.
 
 ## 5. Weekly logic
 

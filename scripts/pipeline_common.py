@@ -60,6 +60,7 @@ class PipelineSettings:
     issues_table: str
     snapshot_tables: Dict[str, Sequence[str] | str]
     manual_seed_files: Dict[str, str]
+    asterisk_csv_file: str
 
     @classmethod
     def from_file(cls, config_path: str) -> "PipelineSettings":
@@ -99,6 +100,7 @@ class PipelineSettings:
             issues_table=issues_table,
             snapshot_tables=snapshot_tables,
             manual_seed_files=manual_seed_files,
+            asterisk_csv_file=parser.get("paths", "asterisk_csv_file", fallback=os.path.join(log_dir, "asterisk_cdr.csv")),
         )
 
     @staticmethod
@@ -491,6 +493,9 @@ class DatabaseOperations:
             self._run_psql(command, db_name=db_name, ignore_errors=True)
 
     def import_csv_if_table_empty(self, table_name: str, csv_file: str, db_name: str) -> bool:
+        return self.import_csv_to_table_if_empty(table_name, csv_file, db_name, delimiter=",")
+
+    def import_csv_to_table_if_empty(self, table_name: str, csv_file: str, db_name: str, delimiter: str = ",") -> bool:
         if not os.path.exists(csv_file):
             return False
         if not self.table_exists(table_name, db_name):
@@ -503,7 +508,7 @@ class DatabaseOperations:
         quoted_columns = ", ".join(_quote_identifier(col) for col in csv_columns)
         command = f"""
             \\copy {_quote_identifier(table_name)} ({quoted_columns}) FROM '{csv_file}'
-            WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
+            WITH (FORMAT csv, HEADER true, DELIMITER '{delimiter}', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
         """
         return bool(self._run_psql(command, db_name=db_name, ignore_errors=True))
 
@@ -515,6 +520,13 @@ class DatabaseOperations:
             if imported:
                 self.logger.info(f"Импортирован seed для {table_name}: {csv_file}")
         return results
+
+    def seed_asterisk_cdr_if_needed(self, db_name: str, csv_file: Optional[str] = None) -> bool:
+        csv_file = csv_file or self.settings.asterisk_csv_file
+        imported = self.import_csv_to_table_if_empty("asterisk_cdr", csv_file, db_name, delimiter=";")
+        if imported:
+            self.logger.info(f"Импортирован seed для asterisk_cdr: {csv_file}")
+        return imported
 
     def list_indexes(self, table_name: str, db_name: str) -> List[str]:
         table_name = _validate_identifier(table_name, "table_name")

@@ -32,7 +32,7 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 - Одинаковая бизнес-логика в монолите и task-версии
 - Трансформация `custom_values -> issues.cf_*` до загрузки в main
 - `UPSERT` по snapshot-таблицам
-- Отдельная обработка ручных таблиц `group_employee_count` и `users_active`
+- Отдельная обработка CSV/manual таблиц `asterisk_cdr`, `group_employee_count` и `users_active`
 - Ротация архивов и подробное логирование
 - Только стандартная библиотека Python и `psql`
 
@@ -113,7 +113,7 @@ repo/
 1. Создается main БД.
 2. Дамп разворачивается сразу в main.
 3. Создаются служебные таблицы, которых нет в дампе.
-4. Если ручные таблицы пустые, они заполняются из seed CSV.
+4. Если ручные CSV/manual таблицы пустые, они заполняются из seed CSV.
 5. Выполняется custom transform в main.
 
 ### Ежедневный запуск
@@ -130,17 +130,20 @@ repo/
 ## Ручные таблицы
 
 Речь про:
+- `asterisk_cdr`
 - `group_employee_count`
 - `users_active`
 
 Эти таблицы не приходят во входящем dump и исторически создавались вручную.
 
 Новая логика такая:
+- `asterisk_cdr` может подхватываться из отдельного CSV-файла `asterisk_csv_file`, если таблица в целевой БД пустая
 - на `--init` они создаются, если отсутствуют
 - если они пустые, данные можно подхватить из seed CSV рядом с логами
 - дальше они живут в main БД постоянно
-- nightly pipeline их не экспортирует и не перезаливает каждый день
-- weekly-обновление идет идемпотентно через `ON CONFLICT`
+- nightly pipeline не перезаливает каждый день `group_employee_count` и `users_active`
+- `asterisk_cdr` может подгружаться в staging из CSV, если во входящем dump этой таблицы нет
+- weekly-обновление идет идемпотентно через `ON CONFLICT` только для `group_employee_count` и `users_active`
 
 То есть старые данные из CSV сохраняются как стартовая точка, а дальнейшая жизнь таблиц становится инкрементальной.
 
@@ -173,6 +176,7 @@ repo/
 - `[paths].backup_storage_dir` — куда складывать архивы
 - `[paths].temp_dir` — где хранить временные каталоги
 - `[paths].log_file` — основной лог
+- `[paths].asterisk_csv_file` — CSV-файл для ручной загрузки `asterisk_cdr`
 - `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
 - `[tables].issues_table` — таблица для custom transform
 - `[schedule].target_day` — день weekly-обновления
@@ -227,7 +231,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 
 1. Корректность `incremental_tables` в конфиге.
 2. Наличие доступа `sudo -u postgres psql`.
-3. Что seed CSV для ручных таблиц лежат там, где ожидается логикой.
+3. Что seed CSV для `asterisk_cdr`, `group_employee_count` и `users_active` лежат там, где ожидается логикой.
 4. Что weekly `ON CONFLICT` соответствует нужной бизнес-логике.
 5. Что индексы на `custom_values` в исходной схеме действительно существуют и достаточны.
 
