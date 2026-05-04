@@ -1,207 +1,263 @@
-# Инструкция по установке и настройке
+# Установка и настройка
 
-## Предварительные требования
+## Требования
 
-Для работы ETL pipeline необходимо установить PostgreSQL 14 на Ubuntu 22.04.
+- Ubuntu 22.04
+- PostgreSQL 14
+- Python 3.x
+- Доступ к `sudo -u postgres psql`
+- SSH-доступ к серверу с nightly dump, если dump забирается по `scp`
 
-## Установка PostgreSQL 14
+Проект не требует внешних Python-зависимостей.
 
-### Вариант 1: Установка из репозитория Ubuntu (если доступен)
+## 1. Установка PostgreSQL
 
 ```bash
 sudo apt update
 sudo apt install -y postgresql-14 postgresql-client-14
 ```
 
-### Вариант 2: Установка из официального репозитория PostgreSQL
+Проверьте, что сервис поднят:
 
 ```bash
-# Добавляем репозиторий
-sudo apt install -y wget gnupg lsb-release
-wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
-echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-
-# Устанавливаем
-sudo apt update
-sudo apt install -y postgresql-14 postgresql-client-14
-```
-
-## Настройка PostgreSQL
-
-### 1. Запуск службы
-
-```bash
-sudo systemctl start postgresql
 sudo systemctl enable postgresql
+sudo systemctl start postgresql
 sudo systemctl status postgresql
 ```
 
-### 2. Настройка аутентификации
+## 2. Проверка доступа к psql
 
-Отредактируйте файл `/etc/postgresql/14/main/pg_hba.conf`:
+Pipeline использует системный `psql` и `sudo -u postgres`.
 
-```bash
-sudo nano /etc/postgresql/14/main/pg_hba.conf
-```
-
-Найдите строки и измените на:
-
-```
-# IPv4 local connections:
-host    all             all             127.0.0.1/32            trust
-
-# IPv6 local connections:
-host    all             all             ::1/128                 trust
-
-# Local connections:
-local   all             postgres                                peer
-local   all             all                                     peer
-```
-
-Перезапустите PostgreSQL:
+Проверьте:
 
 ```bash
-sudo systemctl restart postgresql
-```
-
-### 3. Проверка подключения
-
-```bash
-psql -h localhost -U postgres -c "SELECT version();"
-```
-
-Или для проверки доступности:
-
-```bash
-pg_isready -h localhost -p 5432 -U postgres
-```
-
-## Настройка прав доступа для ETL pipeline
-
-### Вариант A: Использование пользователя postgres (рекомендуется для тестирования)
-
-ETL pipeline будет запускаться от root с использованием `sudo -u postgres`:
-
-```bash
-# Тестирование
+sudo -u postgres psql -c "SELECT version();"
 sudo -u postgres psql -c "SELECT 1;"
 ```
 
-### Вариант B: Создание отдельного пользователя БД
+Если это не работает, сначала нужно настроить права на sudo и доступ к локальному PostgreSQL.
+
+## 3. Размещение проекта
+
+Пример:
 
 ```bash
-sudo -u postgres psql -c "CREATE USER etl_user WITH PASSWORD 'your_password';"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE main_db TO etl_user;"
-sudo -u postgres psql -c "ALTER DATABASE main_db OWNER TO etl_user;"
+mkdir -p /workspace
+cd /workspace
+git clone <repo-url> etl_test
+cd etl_test
 ```
 
-Затем обновите `/workspace/config/etl_config.ini`:
+## 4. Подготовка директорий
+
+```bash
+sudo mkdir -p /var/backups/postgres
+sudo mkdir -p /tmp/pg_etl_temp
+mkdir -p /workspace/logs
+```
+
+Если проект будет запускаться под конкретным пользователем, убедитесь, что ему доступны:
+- директория логов
+- временная директория
+- директория архивов
+
+## 5. Настройка конфигурации
+
+Отредактируйте `config/etl_config.ini`.
+
+Минимальный пример:
 
 ```ini
 [database]
-db_user = etl_user
+db_name = your_main_db
+db_user = your_db_user
+db_host = localhost
+db_port = 5432
+temp_db_prefix = temp_restore_
+
+[paths]
+backup_storage_dir = /var/backups/postgres
+temp_dir = /tmp/pg_etl_temp
+log_dir = /workspace/logs
+log_file = /workspace/logs/etl_pipeline.log
+
+[remote]
+remote_user = your_remote_user
+remote_host = your.remote.host
+remote_path = /path/to/dumps/
+backup_tar = nightly_dump.tar.gz
+
+[tables]
+incremental_tables = asterisk_cdr:id
+issues_table = issues
+
+[retention]
+max_backups = 5
+cleanup_temp_db = true
+
+[schedule]
+target_day = 1
 ```
 
-## Проверка установки
+### Важно про `incremental_tables`
 
-Выполните тестовый скрипт:
+Сюда надо включать таблицы, которые должны попадать из staging в main через snapshot + `UPSERT`.
+
+Пример:
+
+```ini
+incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
+```
+
+Если `issues` не указать, она всё равно будет автоматически добавлена логикой pipeline через `issues_table`.
+
+## 6. Seed-файлы для ручных таблиц
+
+Для ручных таблиц используются seed CSV:
+- `group_employee_count_backup.csv`
+- `users_active_backup.csv`
+
+По умолчанию pipeline ищет их рядом с логами, то есть в каталоге из `dirname(log_file)`.
+
+Например:
 
 ```bash
-cd /workspace
-./run_tests.sh
+/workspace/logs/group_employee_count_backup.csv
+/workspace/logs/users_active_backup.csv
 ```
 
-## Настройка автоматического запуска (cron)
+Seed применяется только если соответствующая таблица в main БД пустая.
 
-### 1. Откройте crontab
+## 7. Первый запуск
+
+Инициализация создает main БД и загружает в нее первый dump.
+
+### Task-версия
 
 ```bash
-crontab -e
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --init /path/to/initial_dump.tar.gz
 ```
 
-### 2. Добавьте задание
-
-#### Для модульной версии (рекомендуется)
-
-Для запуска каждый день в 2:00 ночи:
-
-```
-0 2 * * * cd /workspace && python3 /workspace/scripts/etl_pipeline.py --cleanup /path/to/nightly/dump.tar.gz >> /workspace/logs/cron.log 2>&1
-```
-
-#### Для монолитной версии (legacy, не рекомендуется)
-
-```
-0 2 * * * cd /workspace && python3 /workspace/scripts/legacy/etl_pipeline.py --cleanup /path/to/nightly/dump.tar.gz >> /workspace/logs/cron_legacy.log 2>&1
-```
-
-### 3. Проверьте cron
+### Монолитная версия
 
 ```bash
-# Просмотр заданий
-crontab -l
-
-# Проверка логов cron
-grep CRON /var/log/syslog
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --init /path/to/initial_dump.tar.gz
 ```
 
-## Решение проблем
-
-### Ошибка: "psycopg2 не найден"
-
-ETL pipeline использует только стандартную библиотеку Python и утилиту командной строки `psql`. 
-Убедитесь что postgresql-client установлен:
+После инициализации проверьте:
 
 ```bash
-sudo apt install -y postgresql-client-14
+sudo -u postgres psql -d your_main_db -c "\dt"
+sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM issues;"
 ```
 
-### Ошибка: "connection refused"
-
-Проверьте что PostgreSQL запущен:
+Если используются ручные таблицы:
 
 ```bash
-sudo systemctl status postgresql
-sudo systemctl start postgresql
+sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM group_employee_count;"
+sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM users_active;"
 ```
 
-### Ошибка: "authentication failed"
+## 8. Nightly запуск
 
-Проверьте настройки в `/etc/postgresql/14/main/pg_hba.conf` и перезапустите PostgreSQL.
-
-### Ошибка: "database does not exist"
-
-При первом запуске используйте флаг `--init`:
-
-#### Для модульной версии:
-```bash
-python3 /workspace/scripts/etl_pipeline.py --init /path/to/dump.tar.gz
-```
-
-#### Для монолитной версии (legacy):
-```bash
-python3 /workspace/scripts/legacy/etl_pipeline.py --init /path/to/dump.tar.gz
-```
-
-## Мониторинг
-
-### Просмотр логов ETL
+### Task-версия
 
 ```bash
-ls -lt /workspace/logs/
-tail -f /workspace/logs/etl_*.log
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
 ```
 
-### Просмотр состояния баз данных
+### Монолитная версия
 
 ```bash
-sudo -u postgres psql -c "\l"  # Список баз данных
-sudo -u postgres psql -d main_db -c "\dt"  # Таблицы в main_db
-sudo -u postgres psql -d main_db -c "SELECT COUNT(*) FROM users;"  # Количество строк
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
 ```
 
-### Проверка размера баз данных
+Флаг `--cleanup` удаляет staging БД после завершения.
+
+## 9. Cron
+
+Пример для task-версии:
+
+```cron
+0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz >> /workspace/logs/cron.log 2>&1
+```
+
+Пример для монолита:
+
+```cron
+0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz >> /workspace/logs/cron_legacy.log 2>&1
+```
+
+## 10. Что проверить перед включением в прод
+
+1. Main БД уже не должна удаляться nightly-процессом.
+2. Nightly dump должен успешно подниматься во временной staging БД.
+3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
+4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
+5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
+6. На тестовом прогоне нужно вручную сравнить `issues` и `cf_*` колонки после custom transform.
+
+## 11. Диагностика
+
+### Проверка логов
 
 ```bash
-sudo -u postgres psql -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) as size FROM pg_database ORDER BY pg_database_size(datname) DESC;"
+tail -f /workspace/logs/etl_pipeline.log
 ```
+
+### Список баз
+
+```bash
+sudo -u postgres psql -c "\l"
+```
+
+### Проверка временных БД
+
+```bash
+sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'temp_restore_%';"
+```
+
+### Проверка custom transform
+
+```bash
+sudo -u postgres psql -d your_main_db -c "\d issues"
+sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM issues LIMIT 5;"
+```
+
+### Проверка индексов на custom_values
+
+```bash
+sudo -u postgres psql -d your_main_db -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'custom_values';"
+```
+
+## 12. Частые проблемы
+
+### `database does not exist`
+
+Сначала выполните `--init`.
+
+### `Permission denied` при `scp`
+
+Проверьте SSH-доступ:
+
+```bash
+ssh your_remote_user@your_remote_host
+```
+
+### `psql` не выполняется через sudo
+
+Проверьте:
+
+```bash
+sudo -u postgres psql -c "SELECT 1;"
+```
+
+### Не создаются `cf_*` колонки
+
+Проверьте наличие:
+- `issues`
+- `custom_values`
+- `custom_fields`
+
+И посмотрите индексы на `custom_values`.
