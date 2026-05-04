@@ -239,6 +239,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 ## Дополнительные документы
 
 - Установка и окружение: `INSTALL.md`
+- Пошаговая миграция с `dump_restore.sh`: `MIGRATION.md`
 - Операционный процесс и runbook: `docs/OPERATIONS.md`
 
 ## Статус
