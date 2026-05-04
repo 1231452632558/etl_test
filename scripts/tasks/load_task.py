@@ -35,7 +35,7 @@ class LoadTask(BaseTask):
         self.logger.info("=== Задача: Загрузка изменений ===")
         
         try:
-            db_name = context.get('db_name')
+            db_name = context.get('main_db') or context.get('db_name')
             modifications = context.get('modifications', [])
             
             if not db_name:
@@ -80,8 +80,8 @@ class LoadTask(BaseTask):
             success = len(errors) == 0 and applied_count > 0
             
             return self._create_result(
-                success=success or applied_count > 0,
-                message=f"Применено {applied_count} модификаций",
+                    success=success or (applied_count > 0 or not modifications),
+                    message=f"Применено {applied_count} модификаций",
                 data={
                     'applied_count': applied_count,
                     'errors_count': len(errors)

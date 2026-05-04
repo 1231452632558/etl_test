@@ -1,140 +1,111 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ETL Pipeline - Модульная версия (оркестратор задач)
-Запускает ETL pipeline как последовательность независимых задач
+ETL Pipeline - task-ориентированная версия с тем же nightly-потоком, что и монолит.
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import argparse
+import os
+import sys
+from datetime import datetime
 from pathlib import Path
 
-# Добавляем родительскую директорию в path для импорта модулей
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from tasks import (
-    TaskRunner,
-    ExtractTask,
-    RestoreTask,
+from pipeline_common import (  # noqa: E402
+    DatabaseOperations,
+    ETLLogger,
+    PipelineSettings,
+    copy_from_remote_or_local,
+    rotate_backups,
+)
+from tasks import (  # noqa: E402
+    CleanupTask,
     CompareTask,
-    TransformCustomValuesTask,
+    ExtractTask,
     LoadTask,
+    RestoreTask,
+    TaskRunner,
+    TransformCustomValuesTask,
     WeeklyTask,
-    CleanupTask
 )
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='ETL Pipeline для PostgreSQL (Модульная версия)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Примеры использования:
-  %(prog)s --init /path/to/dump.tar.gz     # Первый запуск (инициализация)
-  %(prog)s /path/to/dump.tar.gz            # Ночная обработка
-  %(prog)s --cleanup /path/to/dump.tar.gz  # Ночная обработка с очисткой
-        """
-    )
-    
+def build_temp_db_name(settings: PipelineSettings) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{settings.temp_db_prefix}{timestamp}"
+
+
+def build_runner(settings: PipelineSettings, logger: ETLLogger, db_ops: DatabaseOperations, init_mode: bool) -> TaskRunner:
+    runner = TaskRunner(settings, logger, db_ops)
+    runner.add_task(ExtractTask(settings, logger, db_ops))
+
+    if init_mode:
+        runner.add_task(RestoreTask(settings, logger, db_ops, target="main"))
+        runner.add_task(TransformCustomValuesTask(settings, logger, db_ops, db_key="main_db"))
+    else:
+        runner.add_task(RestoreTask(settings, logger, db_ops, target="temp"))
+        runner.add_task(TransformCustomValuesTask(settings, logger, db_ops, db_key="temp_db"))
+        runner.add_task(CompareTask(settings, logger, db_ops))
+        runner.add_task(LoadTask(settings, logger, db_ops))
+        runner.add_task(WeeklyTask(settings, logger, db_ops))
+
+    runner.add_task(CleanupTask(settings, logger, db_ops))
+    return runner
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ETL Pipeline для PostgreSQL (task-версия)")
+    parser.add_argument("dump_file", help="Путь к .tar.gz или .sql дампу")
+    parser.add_argument("--init", action="store_true", help="Первичная инициализация основной БД")
+    parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
     parser.add_argument(
-        'dump_file',
-        nargs='?',
-        help='Путь к файлу дампа (.tar.gz или .sql)'
+        "--config",
+        default="/workspace/config/etl_config.ini",
+        help="Путь к конфигурационному файлу",
     )
-    
-    parser.add_argument(
-        '--init',
-        action='store_true',
-        help='Режим инициализации (первый запуск)'
-    )
-    
-    parser.add_argument(
-        '--cleanup',
-        action='store_true',
-        help='Очистить временную базу после завершения'
-    )
-    
-    parser.add_argument(
-        '--config',
-        default='/workspace/config/etl_config.ini',
-        help='Путь к конфигурационному файлу (по умолчанию: /workspace/config/etl_config.ini)'
-    )
-    
     args = parser.parse_args()
-    
-    if not args.dump_file:
-        parser.print_help()
-        print("\nОшибка: Необходимо указать путь к файлу дампа")
-        sys.exit(1)
-    
-    # Проверяем существование файла дампа
-    if not os.path.exists(args.dump_file):
-        print(f"Ошибка: Файл дампа не найден: {args.dump_file}")
-        sys.exit(1)
-    
-    # Проверяем существование конфига
+
     if not os.path.exists(args.config):
         print(f"Ошибка: Конфигурационный файл не найден: {args.config}")
         sys.exit(1)
-    
-    print("=" * 70)
-    print("ETL Pipeline - Модульная версия")
-    print("=" * 70)
-    print(f"Конфигурация: {args.config}")
-    print(f"Файл дампа: {args.dump_file}")
-    print(f"Режим: {'Инициализация' if args.init else 'Ночная обработка'}")
-    print(f"Очистка временной БД: {'Да' if args.cleanup else 'Нет'}")
-    print("=" * 70)
-    
-    try:
-        # Создаем оркестратор задач
-        runner = TaskRunner(config_path=args.config)
-        
-        # Регистрируем задачи в зависимости от режима
-        if args.init:
-            # Режим инициализации - только восстановление из дампа
-            print("\n[РЕЖИМ ИНИЦИАЛИЗАЦИИ]")
-            print("Выполняется полная загрузка дампа в основную базу...\n")
-            
-            # Для инициализации используем упрощенный пайплайн
-            runner.add_task(RestoreTask("RestoreToMain", is_init=True))
-        else:
-            # Режим ночной обработки - полный пайплайн
-            print("\n[РЕЖИМ НОЧНОЙ ОБРАБОТКИ]")
-            print("Выполняется инкрементальное обновление данных...\n")
-            
-            # Последовательность задач для ночной обработки
-            runner.add_task(ExtractTask("Extract"))
-            runner.add_task(RestoreTask("RestoreToTemp"))
-            runner.add_task(CompareTask("Compare"))
-            runner.add_task(TransformCustomValuesTask("TransformCustomValues"))
-            runner.add_task(LoadTask("Load"))
-            runner.add_task(WeeklyTask("Weekly"))
-            
-            if args.cleanup:
-                runner.add_task(CleanupTask("Cleanup"))
-        
-        # Запускаем пайплайн
-        success = runner.run(dump_file=args.dump_file)
-        
-        if success:
-            print("\n" + "=" * 70)
-            print("ETL Pipeline успешно завершен!")
-            print("=" * 70)
-            sys.exit(0)
-        else:
-            print("\n" + "=" * 70)
-            print("ETL Pipeline завершен с ошибками!")
-            print("=" * 70)
-            sys.exit(1)
-            
-    except Exception as e:
-        print(f"\nКритическая ошибка: {e}")
-        import traceback
-        traceback.print_exc()
+
+    settings = PipelineSettings.from_file(args.config)
+    logger = ETLLogger(settings.log_file, settings.log_level)
+    db_ops = DatabaseOperations(settings, logger)
+
+    actual_file = copy_from_remote_or_local(settings, logger, args.dump_file)
+    if not actual_file:
         sys.exit(1)
 
+    if not args.init:
+        rotate_backups(settings, logger)
 
-if __name__ == '__main__':
+    temp_db = None if args.init else build_temp_db_name(settings)
+    runner = build_runner(settings, logger, db_ops, args.init)
+    runner.update_context(
+        {
+            "dump_file": actual_file,
+            "temp_dir": settings.temp_dir,
+            "main_db": settings.db_name,
+            "db_name": settings.db_name,
+            "temp_db": temp_db,
+            "tables": settings.snapshot_tables,
+            "cleanup_temp_db": args.cleanup,
+            "target_day": settings.target_day,
+            "create_database": args.init,
+        }
+    )
+
+    if args.init and db_ops.database_exists(settings.db_name):
+        logger.error(f"База {settings.db_name} уже существует. Для --init нужна пустая целевая БД.")
+        sys.exit(1)
+
+    success = runner.run()
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
     main()

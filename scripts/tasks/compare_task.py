@@ -1,98 +1,66 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Задача сравнения данных между временной и основной базой
-Поиск новых и измененных строк
+Подготовка snapshot-экспортов из staging БД для последующего UPSERT в main.
 """
 
 import os
-import shutil
-import tempfile
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict
 
 from .base import BaseTask, TaskResult
+from pipeline_common import build_snapshot_exports
 
 
 class CompareTask(BaseTask):
-    """Задача сравнения данных и поиска изменений"""
-    
+    """Формирует набор CSV-снимков таблиц из staging БД."""
+
     @property
     def name(self) -> str:
         return "compare"
-    
+
     def execute(self, context: Dict[str, Any]) -> TaskResult:
-        """
-        Сравнение данных между временной и основной базой
-        
-        Args:
-            context: Контекст с ключами:
-                - 'main_db': имя основной базы
-                - 'temp_db': имя временной базы
-                - 'tables': словарь {table_name: primary_key}
-                
-        Returns:
-            TaskResult со списком изменений для каждой таблицы
-        """
         started_at = datetime.now()
-        self.logger.info("=== Задача: Сравнение данных ===")
-        
+        self.logger.info("=== Задача: Подготовка snapshot-экспортов ===")
+
         try:
-            main_db = context.get('main_db')
             temp_db = context.get('temp_db')
             tables = context.get('tables', {})
-            
-            if not main_db or not temp_db:
+            if not temp_db:
                 return self._create_result(
                     success=False,
-                    message="Не указаны имена баз данных",
+                    message="Не указана временная база данных",
                     started_at=started_at,
-                    completed_at=datetime.now()
+                    completed_at=datetime.now(),
                 )
-            
-            all_modifications = []
-            
-            # Для каждой таблицы находим новые и измененные строки
-            for table_name, primary_key in tables.items():
-                self.logger.info(f"Обработка таблицы {table_name}...")
-                
-                modified_tables = self.db_ops.find_new_and_changed_rows(
-                    table_name, primary_key, main_db, temp_db
-                )
-                
-                for change_type, tbl_name, pk, csv_file in modified_tables:
-                    self.logger.info(
-                        f"Найдены {change_type} строки в {tbl_name}: {csv_file}"
-                    )
-                    all_modifications.append({
-                        'change_type': change_type,
-                        'table_name': tbl_name,
-                        'primary_key': pk,
-                        'csv_file': csv_file
-                    })
-            
-            self.logger.info(
-                f"Всего найдено модификаций: {len(all_modifications)}"
+
+            export_dir = os.path.join(
+                self.config.temp_dir,
+                f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             )
-            
+            modifications = build_snapshot_exports(self.db_ops, temp_db, tables, export_dir)
+
+            for mod in modifications:
+                self.logger.info(
+                    f"Подготовлен snapshot {mod['table_name']}: {mod['csv_file']} ({mod['row_count']} rows)"
+                )
+
             return self._create_result(
                 success=True,
-                message=f"Найдено {len(all_modifications)} модификаций",
+                message=f"Подготовлено snapshot-файлов: {len(modifications)}",
                 data={
-                    'modifications': all_modifications,
-                    'main_db': main_db,
-                    'temp_db': temp_db
+                    'modifications': modifications,
+                    'export_dir': export_dir,
                 },
                 started_at=started_at,
-                completed_at=datetime.now()
+                completed_at=datetime.now(),
             )
-            
-        except Exception as e:
-            self.logger.error(f"Ошибка при сравнении данных: {e}")
+        except Exception as exc:
+            self.logger.error(f"Ошибка подготовки snapshot-экспортов: {exc}")
             return self._create_result(
                 success=False,
-                message=f"Ошибка сравнения: {str(e)}",
-                errors=[str(e)],
+                message=f"Ошибка compare stage: {exc}",
+                errors=[str(exc)],
                 started_at=started_at,
-                completed_at=datetime.now()
+                completed_at=datetime.now(),
             )
