@@ -251,6 +251,39 @@ class DatabaseOperations:
             return result.stdout
         return True
 
+    def _run_psql_script(
+        self,
+        script: str,
+        db_name: Optional[str] = None,
+        ignore_errors: bool = False,
+    ) -> bool:
+        target_db = db_name or self.settings.db_name
+        cmd = self._psql_base_cmd(target_db)
+        try:
+            result = subprocess.run(
+                cmd,
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+            )
+        except subprocess.TimeoutExpired:
+            self.logger.error("PSQL script timed out")
+            return False
+        except Exception as exc:
+            self.logger.error(f"Ошибка запуска psql script: {exc}")
+            return False
+
+        if result.returncode != 0:
+            stderr = (result.stderr or "").strip()
+            if stderr and not ignore_errors:
+                self.logger.error(f"PSQL error: {stderr}")
+            elif stderr:
+                self.logger.warning(f"PSQL warning: {stderr}")
+            return False
+
+        return True
+
     def run_scalar(self, query: str, db_name: Optional[str] = None) -> str:
         result = self._run_psql(query, db_name=db_name, capture_output=True, tuples_only=True)
         if not result:
@@ -409,7 +442,7 @@ class DatabaseOperations:
             f'{_quote_identifier(col)} = EXCLUDED.{_quote_identifier(col)}' for col in update_columns
         )
 
-        command = f"""
+        script = f"""
             CREATE TEMP TABLE temp_upsert AS
             SELECT {quoted_columns}
             FROM {_quote_identifier(table_name)}
@@ -426,7 +459,7 @@ class DatabaseOperations:
 
             DROP TABLE temp_upsert;
         """
-        return bool(self._run_psql(command, db_name=db_name))
+        return self._run_psql_script(script, db_name=db_name)
 
     def create_required_tables(self, db_name: str) -> None:
         statements = [
