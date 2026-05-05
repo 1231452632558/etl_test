@@ -633,7 +633,7 @@ class DatabaseOperations:
         )
         select_clauses = ",\n                    ".join(
             (
-                "STRING_AGG(DISTINCT NULLIF(cv.value, ''), ', ' ORDER BY NULLIF(cv.value, '')) "
+                "STRING_AGG(NULLIF(cv.value, ''), ', ' ORDER BY cv.id) "
                 f"FILTER (WHERE cv.custom_field_id = {int(field_id)}) AS {_quote_identifier(column_name)}"
             )
             for field_id, _, column_name in field_mappings
