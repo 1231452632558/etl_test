@@ -194,6 +194,10 @@ class DatabaseOperations:
         self.settings = settings
         self.logger = logger
 
+    def _preview_sql(self, text: str, limit: int = 220) -> str:
+        compact = " ".join(text.split())
+        return compact[:limit] + ("..." if len(compact) > limit else "")
+
     def _psql_base_cmd(self, db_name: str) -> List[str]:
         return [
             "sudo",
@@ -218,6 +222,7 @@ class DatabaseOperations:
         capture_output: bool = False,
         ignore_errors: bool = False,
         tuples_only: bool = False,
+        context_label: Optional[str] = None,
     ) -> bool | str:
         target_db = db_name or self.settings.db_name
         cmd = self._psql_base_cmd(target_db)
@@ -233,18 +238,24 @@ class DatabaseOperations:
                 timeout=600,
             )
         except subprocess.TimeoutExpired:
-            self.logger.error(f"Команда psql превысила лимит времени: {command[:120]}")
+            label = f" [{context_label}]" if context_label else ""
+            self.logger.error(
+                f"PSQL timeout{label}: db={target_db}, sql={self._preview_sql(command, 160)}"
+            )
             return "" if capture_output else False
         except Exception as exc:
-            self.logger.error(f"Ошибка запуска psql: {exc}")
+            label = f" [{context_label}]" if context_label else ""
+            self.logger.error(f"Ошибка запуска psql{label}: db={target_db}, error={exc}")
             return "" if capture_output else False
 
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
+            label = f" [{context_label}]" if context_label else ""
+            details = f"db={target_db}, sql={self._preview_sql(command, 160)}"
             if stderr and not ignore_errors:
-                self.logger.error(f"PSQL error: {stderr}")
+                self.logger.error(f"PSQL error{label}: {stderr} | {details}")
             elif stderr:
-                self.logger.warning(f"PSQL warning: {stderr}")
+                self.logger.warning(f"PSQL warning{label}: {stderr} | {details}")
             return "" if capture_output else False
 
         if capture_output:
@@ -256,6 +267,7 @@ class DatabaseOperations:
         script: str,
         db_name: Optional[str] = None,
         ignore_errors: bool = False,
+        context_label: Optional[str] = None,
     ) -> bool:
         target_db = db_name or self.settings.db_name
         cmd = self._psql_base_cmd(target_db)
@@ -268,18 +280,24 @@ class DatabaseOperations:
                 timeout=1800,
             )
         except subprocess.TimeoutExpired:
-            self.logger.error("PSQL script timed out")
+            label = f" [{context_label}]" if context_label else ""
+            self.logger.error(
+                f"PSQL script timeout{label}: db={target_db}, sql={self._preview_sql(script, 180)}"
+            )
             return False
         except Exception as exc:
-            self.logger.error(f"Ошибка запуска psql script: {exc}")
+            label = f" [{context_label}]" if context_label else ""
+            self.logger.error(f"Ошибка запуска psql script{label}: db={target_db}, error={exc}")
             return False
 
         if result.returncode != 0:
             stderr = (result.stderr or "").strip()
+            label = f" [{context_label}]" if context_label else ""
+            details = f"db={target_db}, sql={self._preview_sql(script, 180)}"
             if stderr and not ignore_errors:
-                self.logger.error(f"PSQL error: {stderr}")
+                self.logger.error(f"PSQL error{label}: {stderr} | {details}")
             elif stderr:
-                self.logger.warning(f"PSQL warning: {stderr}")
+                self.logger.warning(f"PSQL warning{label}: {stderr} | {details}")
             return False
 
         return True
@@ -308,10 +326,10 @@ class DatabaseOperations:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         except subprocess.TimeoutExpired:
-            self.logger.error(f"SQL file execution timed out: {sql_file}")
+            self.logger.error(f"SQL file execution timed out: db={target_db}, file={sql_file}")
             return False
         except Exception as exc:
-            self.logger.error(f"Error executing SQL file: {exc}")
+            self.logger.error(f"Error executing SQL file: db={target_db}, file={sql_file}, error={exc}")
             return False
 
         if result.returncode != 0:
@@ -319,7 +337,7 @@ class DatabaseOperations:
                 line for line in result.stderr.splitlines() if "already exists" not in line.lower()
             ).strip()
             if stderr:
-                self.logger.error(f"SQL file error: {stderr}")
+                self.logger.error(f"SQL file error: db={target_db}, file={sql_file}, error={stderr}")
                 return False
         return True
 
@@ -401,6 +419,9 @@ class DatabaseOperations:
         count_query = f"SELECT COUNT(*) FROM ({query}) AS subq;"
         count = int(self.run_scalar(count_query, db_name=db_name) or 0)
         if count == 0:
+            self.logger.info(
+                f"Экспорт пропущен: db={db_name}, csv={csv_file}, rows=0, sql={self._preview_sql(query, 120)}"
+            )
             return 0
 
         export_cmd = self._psql_base_cmd(db_name) + [
@@ -410,8 +431,11 @@ class DatabaseOperations:
         with open(csv_file, "w", encoding="utf-8") as handle:
             result = subprocess.run(export_cmd, stdout=handle, stderr=subprocess.PIPE, text=True, timeout=1800)
         if result.returncode != 0:
-            self.logger.error(f"Export error: {result.stderr.strip()}")
+            self.logger.error(
+                f"Export error: db={db_name}, csv={csv_file}, error={result.stderr.strip()}, sql={self._preview_sql(query, 120)}"
+            )
             return 0
+        self.logger.info(f"Экспортирован CSV: db={db_name}, csv={csv_file}, rows={count}")
         return count
 
     def export_table_to_csv(self, table_name: str, csv_file: str, db_name: str) -> int:
@@ -421,7 +445,7 @@ class DatabaseOperations:
 
     def upsert_from_csv(self, table_name: str, primary_key: Sequence[str] | str, csv_file: str, db_name: str) -> bool:
         if not os.path.exists(csv_file):
-            self.logger.warning(f"CSV файл не найден: {csv_file}")
+            self.logger.warning(f"CSV файл не найден для UPSERT: table={table_name}, csv={csv_file}")
             return False
 
         table_name = _validate_identifier(table_name, "table_name")
@@ -432,7 +456,10 @@ class DatabaseOperations:
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]
         if not columns:
-            self.logger.error(f"В CSV {csv_file} нет колонок, совпадающих с {table_name}")
+            self.logger.error(
+                f"В CSV нет совпадающих колонок для UPSERT: table={table_name}, csv={csv_file}, "
+                f"csv_columns={csv_columns}, table_columns={sorted(table_columns)}"
+            )
             return False
 
         quoted_columns = ", ".join(_quote_identifier(col) for col in columns)
@@ -459,7 +486,11 @@ class DatabaseOperations:
 
             DROP TABLE temp_upsert;
         """
-        return self._run_psql_script(script, db_name=db_name)
+        self.logger.info(
+            f"UPSERT подготовлен: db={db_name}, table={table_name}, pk={pk_cols}, "
+            f"csv={csv_file}, columns={columns}"
+        )
+        return self._run_psql_script(script, db_name=db_name, context_label=f"upsert:{table_name}")
 
     def create_required_tables(self, db_name: str) -> None:
         statements = [
@@ -546,22 +577,30 @@ class DatabaseOperations:
 
     def import_csv_to_table_if_empty(self, table_name: str, csv_file: str, db_name: str, delimiter: str = ",") -> bool:
         if not os.path.exists(csv_file):
+            self.logger.warning(f"Seed CSV не найден: table={table_name}, csv={csv_file}")
             return False
         if not self.table_exists(table_name, db_name):
+            self.logger.warning(f"Seed import пропущен: таблица отсутствует, table={table_name}, db={db_name}")
             return False
         if self.count_rows(table_name, db_name) > 0:
+            self.logger.info(f"Seed import пропущен: таблица не пуста, table={table_name}, db={db_name}")
             return False
 
         table_name = _validate_identifier(table_name, "table_name")
         table_columns = self.get_table_columns(table_name, db_name)
         table_columns_by_lower = {column.lower(): column for column in table_columns}
         csv_columns = [_normalize_csv_column_name(col) for col in _read_csv_header(csv_file, delimiter=delimiter)]
+        self.logger.info(
+            f"Seed import старт: db={db_name}, table={table_name}, csv={csv_file}, delimiter='{delimiter}', "
+            f"csv_columns={csv_columns}"
+        )
         mapped_columns = []
         for csv_column in csv_columns:
             matched_column = table_columns_by_lower.get(csv_column.lower())
             if not matched_column:
                 self.logger.warning(
-                    f"Колонка {csv_column} из {csv_file} отсутствует в таблице {table_name}, импорт пропущен"
+                    f"Колонка {csv_column} из {csv_file} отсутствует в таблице {table_name}, импорт пропущен. "
+                    f"table_columns={table_columns}"
                 )
                 return False
             mapped_columns.append(matched_column)
@@ -572,7 +611,17 @@ class DatabaseOperations:
             f"FROM '{csv_file}' "
             f"WITH (FORMAT csv, HEADER true, DELIMITER '{delimiter}', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');"
         )
-        return bool(self._run_psql(command, db_name=db_name, ignore_errors=True))
+        result = bool(
+            self._run_psql(
+                command,
+                db_name=db_name,
+                ignore_errors=True,
+                context_label=f"seed:{table_name}",
+            )
+        )
+        if result:
+            self.logger.info(f"Seed import выполнен: db={db_name}, table={table_name}, csv={csv_file}")
+        return result
 
     def seed_manual_tables_if_needed(self, db_name: str, seed_files: Dict[str, str]) -> Dict[str, bool]:
         results: Dict[str, bool] = {}
@@ -639,6 +688,9 @@ class DatabaseOperations:
             db_name=db_name,
         )
         if not custom_fields:
+            self.logger.warning(
+                f"Custom transform: не найдены issue custom fields через custom_values, db={db_name}"
+            )
             return {
                 "processed_count": 0,
                 "custom_fields_count": 0,
@@ -659,6 +711,10 @@ class DatabaseOperations:
                 if self._run_psql(alter, db_name=db_name, ignore_errors=True):
                     added_columns.append(column_name)
                     existing_columns.add(column_name)
+        self.logger.info(
+            f"Custom transform mappings: db={db_name}, issues_table={issues_table}, "
+            f"fields={len(field_mappings)}, added_columns={len(added_columns)}"
+        )
 
         set_clauses = ",\n                ".join(
             f'{_quote_identifier(column_name)} = src.{_quote_identifier(column_name)}'
@@ -687,7 +743,7 @@ class DatabaseOperations:
             FROM aggregated AS src
             WHERE src.issue_id = issues.id;
         """
-        self._run_psql(update_query, db_name=db_name)
+        self._run_psql(update_query, db_name=db_name, context_label="custom_transform:update")
 
         processed_count = int(
             self.run_scalar(
