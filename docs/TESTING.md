@@ -81,6 +81,11 @@ sudo mkdir -p /tmp/pg_etl_temp
 /workspace/logs/users_active_backup.csv
 ```
 
+Важно:
+- `asterisk_cdr.csv` должна лежать ровно по пути, указанному в `asterisk_csv_file`
+- если файл лежит, например, в `/workspace/asterisk_cdr.csv`, а в конфиге указано `/workspace/logs/asterisk_cdr.csv`, pipeline его не найдет
+- `group_employee_count_backup.csv` и `users_active_backup.csv` тоже должны лежать ровно в ожидаемом месте
+
 ## 5. Очистка тестового окружения
 
 Перед прогоном очистите старые тестовые БД:
@@ -141,8 +146,11 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM users_active;"
 Ожидаемый результат:
 - main БД создана
 - служебные таблицы существуют
-- `asterisk_cdr` загружена из dump или из CSV
-- ручные weekly-таблицы существуют
+- `asterisk_cdr` заполнена данными только если:
+  - таблица пришла во входящем dump
+  - или CSV найдена по пути `asterisk_csv_file`
+- `group_employee_count` и `users_active` существуют как таблицы даже если соответствующие CSV не найдены
+- `group_employee_count` и `users_active` могут остаться пустыми, если seed CSV отсутствуют
 
 ## 8. Тест 3. Проверка custom transform после init
 
