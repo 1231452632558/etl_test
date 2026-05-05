@@ -74,6 +74,7 @@ class ETLPipeline:
             self.db_ops.seed_asterisk_cdr_if_needed(main_db)
             self.db_ops.add_project_id_column(main_db)
             self.db_ops.seed_manual_tables_if_needed(main_db, self.settings.manual_seed_files)
+            self.db_ops.log_pipeline_schema_snapshot(main_db, self.settings.issues_table)
 
             transform_result = self.db_ops.transform_custom_values(main_db, self.settings.issues_table)
             self.logger.info(
@@ -120,6 +121,7 @@ class ETLPipeline:
             self.db_ops.create_required_tables(temp_db)
             self.db_ops.seed_asterisk_cdr_if_needed(temp_db)
             self.db_ops.add_project_id_column(temp_db)
+            self.db_ops.log_pipeline_schema_snapshot(temp_db, self.settings.issues_table)
 
             transform_result = self.db_ops.transform_custom_values(temp_db, self.settings.issues_table)
             self.logger.info(

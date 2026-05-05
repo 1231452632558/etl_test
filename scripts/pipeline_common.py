@@ -400,6 +400,17 @@ class DatabaseOperations:
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
 
+    def get_table_column_details(self, table_name: str, db_name: str) -> List[Tuple[str, str]]:
+        table_name = _validate_identifier(table_name, "table_name")
+        query = f"""
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = '{table_name}'
+            ORDER BY ordinal_position;
+        """
+        return [(row[0], row[1]) for row in self.run_rows(query, db_name=db_name) if len(row) >= 2]
+
     def table_exists(self, table_name: str, db_name: str) -> bool:
         table_name = _validate_identifier(table_name, "table_name")
         query = f"""
@@ -414,6 +425,38 @@ class DatabaseOperations:
         table_name = _validate_identifier(table_name, "table_name")
         value = self.run_scalar(f"SELECT COUNT(*) FROM {_quote_identifier(table_name)};", db_name=db_name)
         return int(value or 0)
+
+    def log_table_schema(self, table_name: str, db_name: str, include_indexes: bool = True) -> None:
+        if not self.table_exists(table_name, db_name):
+            self.logger.warning(f"Schema snapshot: таблица отсутствует, db={db_name}, table={table_name}")
+            return
+
+        column_details = self.get_table_column_details(table_name, db_name)
+        row_count = self.count_rows(table_name, db_name)
+        columns_preview = ", ".join(f"{name}:{dtype}" for name, dtype in column_details[:20])
+        if len(column_details) > 20:
+            columns_preview += ", ..."
+        self.logger.info(
+            f"Schema snapshot: db={db_name}, table={table_name}, rows={row_count}, "
+            f"columns=[{columns_preview}]"
+        )
+        if include_indexes:
+            indexes = self.list_indexes(table_name, db_name)
+            if indexes:
+                indexes_preview = " | ".join(indexes[:5])
+                if len(indexes) > 5:
+                    indexes_preview += " | ..."
+                self.logger.info(
+                    f"Index snapshot: db={db_name}, table={table_name}, indexes={indexes_preview}"
+                )
+            else:
+                self.logger.warning(f"Index snapshot: индексы не найдены, db={db_name}, table={table_name}")
+
+    def log_pipeline_schema_snapshot(self, db_name: str, issues_table: str = "issues") -> None:
+        tables = [issues_table, "custom_values", "custom_fields", "asterisk_cdr", "group_employee_count", "users_active"]
+        self.logger.info(f"=== Schema Snapshot: db={db_name} ===")
+        for table_name in tables:
+            self.log_table_schema(table_name, db_name)
 
     def export_query_to_csv(self, query: str, csv_file: str, db_name: str) -> int:
         count_query = f"SELECT COUNT(*) FROM ({query}) AS subq;"
@@ -715,6 +758,11 @@ class DatabaseOperations:
             f"Custom transform mappings: db={db_name}, issues_table={issues_table}, "
             f"fields={len(field_mappings)}, added_columns={len(added_columns)}"
         )
+        sample_mappings = ", ".join(
+            f"{field_id}:{field_name}->{column_name}" for field_id, field_name, column_name in field_mappings[:10]
+        )
+        if sample_mappings:
+            self.logger.info(f"Custom transform sample mappings: db={db_name}, {sample_mappings}")
 
         set_clauses = ",\n                ".join(
             f'{_quote_identifier(column_name)} = src.{_quote_identifier(column_name)}'
