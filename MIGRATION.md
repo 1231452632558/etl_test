@@ -83,6 +83,8 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `db_name` — текущая рабочая БД
 - `temp_db_prefix` — staging prefix
 - `asterisk_csv_file` — путь к CSV для `asterisk_cdr`
+- `group_employee_count_csv_file` — путь к CSV для `group_employee_count`
+- `users_active_csv_file` — путь к CSV для `users_active`
 - `issues_table = issues`
 - `incremental_tables` — только snapshot-таблицы
 

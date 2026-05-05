@@ -56,6 +56,8 @@ temp_db_prefix = temp_restore_
 [paths]
 log_file = /workspace/logs/etl_pipeline.log
 asterisk_csv_file = /workspace/logs/asterisk_cdr.csv
+group_employee_count_csv_file = /workspace/logs/group_employee_count_backup.csv
+users_active_csv_file = /workspace/logs/users_active_backup.csv
 
 [tables]
 incremental_tables = asterisk_cdr:id
@@ -84,7 +86,7 @@ sudo mkdir -p /tmp/pg_etl_temp
 Важно:
 - `asterisk_cdr.csv` должна лежать ровно по пути, указанному в `asterisk_csv_file`
 - если файл лежит, например, в `/workspace/asterisk_cdr.csv`, а в конфиге указано `/workspace/logs/asterisk_cdr.csv`, pipeline его не найдет
-- `group_employee_count_backup.csv` и `users_active_backup.csv` тоже должны лежать ровно в ожидаемом месте
+- `group_employee_count_backup.csv` и `users_active_backup.csv` должны лежать ровно по путям `group_employee_count_csv_file` и `users_active_csv_file`
 
 ## 5. Очистка тестового окружения
 

@@ -70,8 +70,16 @@ class PipelineSettings:
         log_file = parser.get("paths", "log_file", fallback="/workspace/logs/etl_pipeline.log")
         log_dir = os.path.dirname(log_file)
         manual_seed_files = {
-            "group_employee_count": os.path.join(log_dir, "group_employee_count_backup.csv"),
-            "users_active": os.path.join(log_dir, "users_active_backup.csv"),
+            "group_employee_count": parser.get(
+                "paths",
+                "group_employee_count_csv_file",
+                fallback=os.path.join(log_dir, "group_employee_count_backup.csv"),
+            ),
+            "users_active": parser.get(
+                "paths",
+                "users_active_csv_file",
+                fallback=os.path.join(log_dir, "users_active_backup.csv"),
+            ),
         }
 
         snapshot_tables = cls._parse_snapshot_tables(parser)
@@ -100,7 +108,11 @@ class PipelineSettings:
             issues_table=issues_table,
             snapshot_tables=snapshot_tables,
             manual_seed_files=manual_seed_files,
-            asterisk_csv_file=parser.get("paths", "asterisk_csv_file", fallback=os.path.join(log_dir, "asterisk_cdr.csv")),
+            asterisk_csv_file=parser.get(
+                "paths",
+                "asterisk_csv_file",
+                fallback=os.path.join(log_dir, "asterisk_cdr.csv"),
+            ),
         )
 
     @staticmethod

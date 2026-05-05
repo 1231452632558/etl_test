@@ -101,6 +101,7 @@ issues_table = issues
 - таблицы создаются, если отсутствуют
 - если они пустые, можно загрузить их из seed CSV
 - `asterisk_cdr` может быть импортирована из `asterisk_csv_file`
+- `group_employee_count` и `users_active` могут быть импортированы из `group_employee_count_csv_file` и `users_active_csv_file`
 
 При nightly run:
 - pipeline не перезаливает эти таблицы из CSV

@@ -82,6 +82,8 @@ temp_dir = /tmp/pg_etl_temp
 log_dir = /workspace/logs
 log_file = /workspace/logs/etl_pipeline.log
 asterisk_csv_file = /workspace/logs/asterisk_cdr.csv
+group_employee_count_csv_file = /workspace/logs/group_employee_count_backup.csv
+users_active_csv_file = /workspace/logs/users_active_backup.csv
 
 [remote]
 remote_user = your_remote_user
@@ -121,9 +123,7 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
 - `group_employee_count_backup.csv`
 - `users_active_backup.csv`
 
-По умолчанию pipeline ищет их рядом с логами, то есть в каталоге из `dirname(log_file)`.
-
-Например:
+Рекомендуемые пути:
 
 ```bash
 /workspace/logs/asterisk_cdr.csv

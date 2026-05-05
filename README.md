@@ -177,6 +177,8 @@ repo/
 - `[paths].temp_dir` — где хранить временные каталоги
 - `[paths].log_file` — основной лог
 - `[paths].asterisk_csv_file` — CSV-файл для ручной загрузки `asterisk_cdr`
+- `[paths].group_employee_count_csv_file` — CSV-файл для начального наполнения `group_employee_count`
+- `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
 - `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
 - `[tables].issues_table` — таблица для custom transform
 - `[schedule].target_day` — день weekly-обновления
