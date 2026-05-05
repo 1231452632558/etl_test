@@ -592,10 +592,12 @@ class DatabaseOperations:
 
         custom_fields = self.run_rows(
             """
-            SELECT id, name
-            FROM custom_fields
-            WHERE COALESCE(type::text, '') IN ('1', 'IssueCustomField')
-            ORDER BY id;
+            SELECT DISTINCT cf.id, cf.name
+            FROM custom_fields cf
+            JOIN custom_values cv
+              ON cv.custom_field_id = cf.id
+            WHERE cv.customized_type = 'Issue'
+            ORDER BY cf.id;
             """,
             db_name=db_name,
         )
