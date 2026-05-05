@@ -518,10 +518,11 @@ class DatabaseOperations:
         table_name = _validate_identifier(table_name, "table_name")
         csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file, delimiter=delimiter)]
         quoted_columns = ", ".join(_quote_identifier(col) for col in csv_columns)
-        command = f"""
-            \\copy {_quote_identifier(table_name)} ({quoted_columns}) FROM '{csv_file}'
-            WITH (FORMAT csv, HEADER true, DELIMITER '{delimiter}', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
-        """
+        command = (
+            f"\\copy {_quote_identifier(table_name)} ({quoted_columns}) "
+            f"FROM '{csv_file}' "
+            f"WITH (FORMAT csv, HEADER true, DELIMITER '{delimiter}', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');"
+        )
         return bool(self._run_psql(command, db_name=db_name, ignore_errors=True))
 
     def seed_manual_tables_if_needed(self, db_name: str, seed_files: Dict[str, str]) -> Dict[str, bool]:
