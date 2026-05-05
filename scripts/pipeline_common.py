@@ -31,9 +31,9 @@ def _quote_identifier(identifier: str) -> str:
     return f'"{identifier}"'
 
 
-def _read_csv_header(csv_file: str) -> List[str]:
+def _read_csv_header(csv_file: str, delimiter: str = ",") -> List[str]:
     with open(csv_file, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle)
+        reader = csv.reader(handle, delimiter=delimiter)
         return next(reader, [])
 
 
@@ -516,7 +516,7 @@ class DatabaseOperations:
             return False
 
         table_name = _validate_identifier(table_name, "table_name")
-        csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file)]
+        csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file, delimiter=delimiter)]
         quoted_columns = ", ".join(_quote_identifier(col) for col in csv_columns)
         command = f"""
             \\copy {_quote_identifier(table_name)} ({quoted_columns}) FROM '{csv_file}'
