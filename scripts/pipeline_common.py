@@ -571,7 +571,11 @@ class DatabaseOperations:
     def _sanitize_custom_column_name(self, name: str, field_id: str, used_names: set[str]) -> str:
         sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
         sanitized = re.sub(r"_+", "_", sanitized).strip("_").lower()
-        base = f"cf_{sanitized[:45]}" if sanitized else "cf_field"
+        generic_names = {"field", "custom_field", "customfield", "custom_value", "customvalue", "value"}
+        if not sanitized or sanitized in generic_names:
+            base = f"cf_{field_id}"
+        else:
+            base = f"cf_{sanitized[:45]}"
         candidate = base
         if candidate in used_names:
             candidate = f"{base}_{field_id}"
