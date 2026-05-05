@@ -37,6 +37,10 @@ def _read_csv_header(csv_file: str, delimiter: str = ",") -> List[str]:
         return next(reader, [])
 
 
+def _normalize_csv_column_name(name: str) -> str:
+    return _validate_identifier(name.strip().lower(), "column")
+
+
 @dataclass
 class PipelineSettings:
     config_path: str
@@ -516,8 +520,20 @@ class DatabaseOperations:
             return False
 
         table_name = _validate_identifier(table_name, "table_name")
-        csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file, delimiter=delimiter)]
-        quoted_columns = ", ".join(_quote_identifier(col) for col in csv_columns)
+        table_columns = self.get_table_columns(table_name, db_name)
+        table_columns_by_lower = {column.lower(): column for column in table_columns}
+        csv_columns = [_normalize_csv_column_name(col) for col in _read_csv_header(csv_file, delimiter=delimiter)]
+        mapped_columns = []
+        for csv_column in csv_columns:
+            matched_column = table_columns_by_lower.get(csv_column.lower())
+            if not matched_column:
+                self.logger.warning(
+                    f"Колонка {csv_column} из {csv_file} отсутствует в таблице {table_name}, импорт пропущен"
+                )
+                return False
+            mapped_columns.append(matched_column)
+
+        quoted_columns = ", ".join(_quote_identifier(col) for col in mapped_columns)
         command = (
             f"\\copy {_quote_identifier(table_name)} ({quoted_columns}) "
             f"FROM '{csv_file}' "
@@ -578,7 +594,7 @@ class DatabaseOperations:
             """
             SELECT id, name
             FROM custom_fields
-            WHERE type = 1
+            WHERE COALESCE(type::text, '') IN ('1', 'IssueCustomField')
             ORDER BY id;
             """,
             db_name=db_name,
