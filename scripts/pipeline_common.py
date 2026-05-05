@@ -41,6 +41,22 @@ def _normalize_csv_column_name(name: str) -> str:
     return _validate_identifier(name.strip().lower(), "column")
 
 
+def _strip_csv_header(source_csv: str, delimiter: str = ",") -> str:
+    fd, temp_csv = tempfile.mkstemp(prefix="pg_etl_upsert_", suffix=".csv")
+    os.close(fd)
+
+    with open(source_csv, "r", encoding="utf-8", newline="") as source_handle, open(
+        temp_csv, "w", encoding="utf-8", newline=""
+    ) as target_handle:
+        reader = csv.reader(source_handle, delimiter=delimiter)
+        writer = csv.writer(target_handle, delimiter=delimiter)
+        next(reader, None)
+        for row in reader:
+            writer.writerow(row)
+
+    return temp_csv
+
+
 @dataclass
 class PipelineSettings:
     config_path: str
@@ -511,29 +527,36 @@ class DatabaseOperations:
         update_clause = ", ".join(
             f'{_quote_identifier(col)} = EXCLUDED.{_quote_identifier(col)}' for col in update_columns
         )
+        data_csv_file = _strip_csv_header(csv_file, delimiter=",")
 
         script = f"""
-            CREATE TEMP TABLE temp_upsert AS
-            SELECT {quoted_columns}
-            FROM {_quote_identifier(table_name)}
-            LIMIT 0;
+CREATE TEMP TABLE temp_upsert AS
+SELECT {quoted_columns}
+FROM {_quote_identifier(table_name)}
+LIMIT 0;
 
-            \\copy temp_upsert ({quoted_columns}) FROM '{csv_file}'
-            WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
+\\copy temp_upsert ({quoted_columns}) FROM '{data_csv_file}'
+WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
 
-            INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
-            SELECT {quoted_columns}
-            FROM temp_upsert
-            ON CONFLICT ({conflict_columns})
-            DO UPDATE SET {update_clause};
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM temp_upsert
+ON CONFLICT ({conflict_columns})
+DO UPDATE SET {update_clause};
 
-            DROP TABLE temp_upsert;
-        """
+DROP TABLE temp_upsert;
+"""
         self.logger.info(
             f"UPSERT подготовлен: db={db_name}, table={table_name}, pk={pk_cols}, "
-            f"csv={csv_file}, columns={columns}"
+            f"csv={csv_file}, data_csv={data_csv_file}, header=true->stripped, delimiter=',', columns={columns}"
         )
-        return self._run_psql_script(script, db_name=db_name, context_label=f"upsert:{table_name}")
+        try:
+            return self._run_psql_script(script, db_name=db_name, context_label=f"upsert:{table_name}")
+        finally:
+            try:
+                os.remove(data_csv_file)
+            except OSError:
+                pass
 
     def create_required_tables(self, db_name: str) -> None:
         statements = [
