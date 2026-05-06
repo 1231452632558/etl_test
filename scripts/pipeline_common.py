@@ -118,7 +118,7 @@ class PipelineSettings:
             temp_dir=parser.get("paths", "temp_dir", fallback="/tmp/pg_etl_temp"),
             log_file=log_file,
             log_level=parser.get("logging", "log_level", fallback="INFO"),
-            max_backups=parser.getint("retention", "max_backups", fallback=5),
+            max_backups=parser.getint("retention", "max_backups", fallback=3),
             cleanup_temp_db=parser.getboolean("retention", "cleanup_temp_db", fallback=True),
             target_day=parser.getint("schedule", "target_day", fallback=1),
             remote_user=parser.get("remote", "remote_user", fallback=""),

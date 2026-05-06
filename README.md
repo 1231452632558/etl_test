@@ -181,6 +181,7 @@ repo/
 - `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
 - `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
 - `[tables].issues_table` — таблица для custom transform
+- `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
 - `[schedule].target_day` — день weekly-обновления
 
 Важно: `issues_table` автоматически добавляется в snapshot-список, даже если её забыли явно указать.

@@ -96,7 +96,7 @@ incremental_tables = asterisk_cdr:id
 issues_table = issues
 
 [retention]
-max_backups = 5
+max_backups = 3
 cleanup_temp_db = true
 
 [schedule]
