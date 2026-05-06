@@ -99,7 +99,13 @@ class ETLPipeline:
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
 
-        if self.settings.remote_user and self.settings.remote_host and self.settings.remote_path and self.settings.backup_tar:
+        if (
+            not os.path.exists(dump_file)
+            and self.settings.remote_user
+            and self.settings.remote_host
+            and self.settings.remote_path
+            and self.settings.backup_tar
+        ):
             archive_existing_backup(self.settings, self.logger)
             rotate_backups(self.settings, self.logger)
 

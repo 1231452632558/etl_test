@@ -33,8 +33,10 @@ def _quote_identifier(identifier: str) -> str:
 
 def _read_csv_header(csv_file: str, delimiter: str = ",") -> List[str]:
     with open(csv_file, "r", encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle, delimiter=delimiter)
-        return next(reader, [])
+        header_line = handle.readline()
+    if not header_line:
+        return []
+    return next(csv.reader([header_line], delimiter=delimiter), [])
 
 
 def _normalize_csv_column_name(name: str) -> str:
@@ -44,15 +46,11 @@ def _normalize_csv_column_name(name: str) -> str:
 def _strip_csv_header(source_csv: str, delimiter: str = ",") -> str:
     fd, temp_csv = tempfile.mkstemp(prefix="pg_etl_upsert_", suffix=".csv")
     os.close(fd)
+    os.chmod(temp_csv, 0o644)
 
-    with open(source_csv, "r", encoding="utf-8", newline="") as source_handle, open(
-        temp_csv, "w", encoding="utf-8", newline=""
-    ) as target_handle:
-        reader = csv.reader(source_handle, delimiter=delimiter)
-        writer = csv.writer(target_handle, delimiter=delimiter)
-        next(reader, None)
-        for row in reader:
-            writer.writerow(row)
+    with open(source_csv, "rb") as source_handle, open(temp_csv, "wb") as target_handle:
+        source_handle.readline()
+        shutil.copyfileobj(source_handle, target_handle)
 
     return temp_csv
 
@@ -876,6 +874,10 @@ DROP TABLE temp_upsert;
 
 
 def copy_from_remote_or_local(settings: PipelineSettings, logger: ETLLogger, dump_file: str) -> Optional[str]:
+    if os.path.exists(dump_file):
+        logger.info(f"Использую локальный дамп: {dump_file}")
+        return dump_file
+
     if settings.remote_user and settings.remote_host and settings.remote_path and settings.backup_tar:
         logger.info("Шаг 1: Копирование архива с удаленного сервера...")
         source = f"{settings.remote_user}@{settings.remote_host}:{settings.remote_path}{settings.backup_tar}"

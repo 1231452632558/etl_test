@@ -82,7 +82,14 @@ def main() -> None:
 
     cleanup_temp_artifacts(settings.temp_dir, logger)
 
-    if not args.init and settings.remote_user and settings.remote_host and settings.remote_path and settings.backup_tar:
+    if (
+        not args.init
+        and not os.path.exists(args.dump_file)
+        and settings.remote_user
+        and settings.remote_host
+        and settings.remote_path
+        and settings.backup_tar
+    ):
         archive_existing_backup(settings, logger)
         rotate_backups(settings, logger)
 
