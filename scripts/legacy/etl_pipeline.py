@@ -19,9 +19,12 @@ from pipeline_common import (  # noqa: E402
     DatabaseOperations,
     ETLLogger,
     PipelineSettings,
+    archive_existing_backup,
     build_snapshot_exports,
+    cleanup_temp_artifacts,
     copy_from_remote_or_local,
     extract_dump,
+    log_git_revision,
     rotate_backups,
 )
 
@@ -32,6 +35,7 @@ class ETLPipeline:
     def __init__(self, config_path: str):
         self.settings = PipelineSettings.from_file(config_path)
         self.logger = ETLLogger(self.settings.log_file, self.settings.log_level)
+        log_git_revision(self.logger)
         self.db_ops = DatabaseOperations(self.settings, self.logger)
 
     def _build_temp_db_name(self) -> str:
@@ -48,6 +52,7 @@ class ETLPipeline:
 
     def run_init(self, dump_file: str) -> bool:
         self.logger.info("=== ЗАПУСК ИНИЦИАЛИЗАЦИИ ===")
+        cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
         actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
         if not actual_file:
             return False
@@ -92,12 +97,15 @@ class ETLPipeline:
     def run_nightly(self, dump_file: str, cleanup: bool = True) -> bool:
         self.logger.info("=== ЗАПУСК НОЧНОЙ ОБРАБОТКИ ===")
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
+        cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+
+        if self.settings.remote_user and self.settings.remote_host and self.settings.remote_path and self.settings.backup_tar:
+            archive_existing_backup(self.settings, self.logger)
+            rotate_backups(self.settings, self.logger)
 
         actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
         if not actual_file:
             return False
-
-        rotate_backups(self.settings, self.logger)
 
         extract_dir, sql_files = extract_dump(actual_file, self.settings.temp_dir, self.logger)
         if not sql_files:
@@ -162,6 +170,7 @@ class ETLPipeline:
             return True
         finally:
             self._cleanup(temp_db, extract_dir, export_dir, cleanup)
+            cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
 
     def run(self, dump_file: str, init_mode: bool = False, cleanup: bool = True) -> bool:
         self.logger.info(f"Дата запуска: {datetime.now()}")

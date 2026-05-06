@@ -96,6 +96,7 @@ class TaskRunner:
         self.logger.info("=" * 60)
         
         all_success = True
+        failed_index: Optional[int] = None
         
         for idx, task in enumerate(self.tasks, 1):
             self.logger.info(f"\n[{idx}/{len(self.tasks)}] Выполнение задачи: {task.name}")
@@ -137,6 +138,7 @@ class TaskRunner:
                 if not result.success:
                     all_success = False
                     if fail_fast:
+                        failed_index = idx - 1
                         self.logger.error(
                             f"Прерывание выполнения из-за ошибки в задаче {task.name}"
                         )
@@ -145,6 +147,7 @@ class TaskRunner:
             except Exception as e:
                 self.logger.error(f"Исключение при выполнении задачи {task.name}: {e}")
                 all_success = False
+                failed_index = idx - 1
                 
                 self.execution_history.append(TaskExecutionRecord(
                     task_name=task.name,
@@ -160,11 +163,40 @@ class TaskRunner:
                 
                 if fail_fast:
                     break
+
+        if not all_success and failed_index is not None:
+            self._run_cleanup_tasks_from(failed_index + 1)
         
         # Итоговый отчет
         self._log_summary(all_success)
         
         return all_success
+
+    def _run_cleanup_tasks_from(self, start_index: int) -> None:
+        for task in self.tasks[start_index:]:
+            if task.name != "cleanup":
+                continue
+            self.logger.info("\n[cleanup] Выполнение обязательной очистки после ошибки")
+            self.logger.info("-" * 40)
+            try:
+                result = task.execute(self.context)
+                self.execution_history.append(TaskExecutionRecord(task_name=task.name, result=result))
+                duration = result.duration or 0
+                status = "✓ УСПЕШНО" if result.success else "✗ ОШИБКА"
+                self.logger.info(
+                    f"Задача {task.name}: {status} "
+                    f"(время: {duration:.2f}с)"
+                )
+                self.logger.info(f"Сообщение: {result.message}")
+                if result.warnings:
+                    for warning in result.warnings:
+                        self.logger.warning(f"Предупреждение: {warning}")
+                if result.errors:
+                    for error in result.errors:
+                        self.logger.error(f"Ошибка: {error}")
+            except Exception as exc:
+                self.logger.error(f"Исключение при выполнении cleanup: {exc}")
+            break
     
     def _log_summary(self, all_success: bool):
         """Логирование итогового отчета"""

@@ -18,7 +18,10 @@ from pipeline_common import (  # noqa: E402
     DatabaseOperations,
     ETLLogger,
     PipelineSettings,
+    archive_existing_backup,
+    cleanup_temp_artifacts,
     copy_from_remote_or_local,
+    log_git_revision,
     rotate_backups,
 )
 from tasks import (  # noqa: E402
@@ -74,14 +77,18 @@ def main() -> None:
 
     settings = PipelineSettings.from_file(args.config)
     logger = ETLLogger(settings.log_file, settings.log_level)
+    log_git_revision(logger)
     db_ops = DatabaseOperations(settings, logger)
+
+    cleanup_temp_artifacts(settings.temp_dir, logger)
+
+    if not args.init and settings.remote_user and settings.remote_host and settings.remote_path and settings.backup_tar:
+        archive_existing_backup(settings, logger)
+        rotate_backups(settings, logger)
 
     actual_file = copy_from_remote_or_local(settings, logger, args.dump_file)
     if not actual_file:
         sys.exit(1)
-
-    if not args.init:
-        rotate_backups(settings, logger)
 
     temp_db = None if args.init else build_temp_db_name(settings)
     runner = build_runner(settings, logger, db_ops, args.init)
@@ -104,6 +111,7 @@ def main() -> None:
         sys.exit(1)
 
     success = runner.run()
+    cleanup_temp_artifacts(settings.temp_dir, logger)
     sys.exit(0 if success else 1)
 
 

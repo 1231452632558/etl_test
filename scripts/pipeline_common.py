@@ -893,6 +893,28 @@ def copy_from_remote_or_local(settings: PipelineSettings, logger: ETLLogger, dum
     return None
 
 
+def archive_existing_backup(settings: PipelineSettings, logger: ETLLogger) -> None:
+    os.makedirs(settings.backup_storage_dir, exist_ok=True)
+    current_tar = os.path.join(settings.backup_storage_dir, settings.backup_tar) if settings.backup_tar else ""
+    if not current_tar or not os.path.exists(current_tar):
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = os.path.join(settings.backup_storage_dir, f"old_{timestamp}")
+    os.makedirs(archive_dir, exist_ok=True)
+    archived_any = False
+
+    for candidate in (current_tar,):
+        if candidate and os.path.exists(candidate):
+            shutil.move(candidate, os.path.join(archive_dir, os.path.basename(candidate)))
+            archived_any = True
+
+    if archived_any:
+        logger.info(f"Текущий архив перенесен в {archive_dir}")
+    else:
+        shutil.rmtree(archive_dir, ignore_errors=True)
+
+
 def rotate_backups(settings: PipelineSettings, logger: ETLLogger) -> None:
     logger.info("Шаг 0: Ротация старых бэкапов...")
     os.makedirs(settings.backup_storage_dir, exist_ok=True)
@@ -905,11 +927,69 @@ def rotate_backups(settings: PipelineSettings, logger: ETLLogger) -> None:
             old_dirs.append((os.path.getmtime(full_path), full_path))
 
     old_dirs.sort(reverse=True)
-    if len(old_dirs) < settings.max_backups:
+    if len(old_dirs) <= settings.max_backups:
         return
 
-    for _, dir_path in old_dirs[settings.max_backups - 1 :]:
+    for _, dir_path in old_dirs[settings.max_backups:]:
         shutil.rmtree(dir_path, ignore_errors=True)
+
+
+def cleanup_temp_artifacts(temp_dir: str, logger: ETLLogger, keep_latest: int = 0) -> None:
+    os.makedirs(temp_dir, exist_ok=True)
+    prefixes = ("extract_", "snapshot_", "pg_etl_upsert_")
+    candidates: List[Tuple[float, str]] = []
+    for item in os.listdir(temp_dir):
+        if not item.startswith(prefixes):
+            continue
+        full_path = os.path.join(temp_dir, item)
+        try:
+            mtime = os.path.getmtime(full_path)
+        except OSError:
+            continue
+        candidates.append((mtime, full_path))
+
+    candidates.sort(reverse=True)
+    for _, path in candidates[keep_latest:]:
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+            logger.info(f"Удален временный артефакт: {path}")
+        except OSError as exc:
+            logger.warning(f"Не удалось удалить временный артефакт {path}: {exc}")
+
+
+def log_git_revision(logger: ETLLogger) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        branch = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        dirty = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--short"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if commit.returncode == 0 and branch.returncode == 0:
+            dirty_flag = "dirty" if (dirty.stdout or "").strip() else "clean"
+            logger.info(
+                f"Версия репозитория: branch={branch.stdout.strip()}, commit={commit.stdout.strip()}, state={dirty_flag}"
+            )
+            if dirty_flag == "dirty":
+                logger.warning("В рабочем дереве есть незакоммиченные изменения")
+    except Exception as exc:
+        logger.warning(f"Не удалось определить git-версию репозитория: {exc}")
 
 
 def extract_dump(dump_file: str, temp_dir: str, logger: ETLLogger) -> Tuple[Optional[str], List[str]]:
