@@ -94,6 +94,7 @@ backup_tar = nightly_dump.tar.gz
 [tables]
 incremental_tables = asterisk_cdr:id
 issues_table = issues
+projects_table = projects
 
 [retention]
 max_backups = 3
@@ -110,10 +111,10 @@ target_day = 1
 Пример:
 
 ```ini
-incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id,issues:id
+incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id
 ```
 
-Если `issues` не указать, она всё равно будет автоматически добавлена логикой pipeline через `issues_table`.
+Если `issues` или `projects` не указать, они всё равно будут автоматически добавлены логикой pipeline через `issues_table` и `projects_table`.
 `group_employee_count` и `users_active` не добавляются в `incremental_tables`, потому что это ручные weekly-таблицы, а не snapshot-таблицы из nightly dump.
 
 ## 6. Seed-файлы для ручных таблиц
@@ -203,7 +204,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
 4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
-6. На тестовом прогоне нужно вручную сравнить `issues` и `cf_*` колонки после custom transform.
+6. На тестовом прогоне нужно вручную сравнить `issues`, `projects` и их `cf_*` колонки после custom transform.
 
 ## 11. Диагностика
 
@@ -229,7 +230,9 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 
 ```bash
 sudo -u postgres psql -d your_main_db -c "\d issues"
+sudo -u postgres psql -d your_main_db -c "\d projects"
 sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM issues LIMIT 5;"
+sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM projects LIMIT 5;"
 ```
 
 ### Проверка индексов на custom_values
@@ -264,6 +267,7 @@ sudo -u postgres psql -c "SELECT 1;"
 
 Проверьте наличие:
 - `issues`
+- `projects`
 - `custom_values`
 - `custom_fields`
 

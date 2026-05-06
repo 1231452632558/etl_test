@@ -38,7 +38,7 @@ sudo -u postgres psql -c "SELECT 1;"
 
 ### Желательные
 
-1. Дамп, содержащий `issues`, `custom_values`, `custom_fields`.
+1. Дамп, содержащий `issues`, `projects`, `custom_values`, `custom_fields`.
 2. CSV для `asterisk_cdr`, если `asterisk_cdr` не приходит во входящем dump.
 3. CSV:
    - `group_employee_count_backup.csv`
@@ -62,11 +62,12 @@ users_active_csv_file = /workspace/logs/users_active_backup.csv
 [tables]
 incremental_tables = asterisk_cdr:id
 issues_table = issues
+projects_table = projects
 ```
 
 Важно:
 - `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
-- `issues` можно не добавлять руками, если задан `issues_table`
+- `issues` и `projects` можно не добавлять руками, если заданы `issues_table` и `projects_table`
 
 ## 4. Подготовка директорий и seed CSV
 
@@ -116,6 +117,7 @@ sudo -u postgres psql -c \"SELECT datname FROM pg_database WHERE datname LIKE 't
 
 Что он не проверяет полноценно:
 - `custom_values -> issues`
+- `custom_values -> projects`
 - `asterisk_cdr` CSV-source
 - weekly/manual таблицы
 - продовую схему данных
@@ -156,17 +158,20 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM users_active;"
 
 ## 8. Тест 3. Проверка custom transform после init
 
-Если dump содержит `issues/custom_values/custom_fields`, проверьте:
+Если dump содержит `issues/projects/custom_values/custom_fields`, проверьте:
 
 ```bash
 sudo -u postgres psql -d test_main_db -c "\d issues"
+sudo -u postgres psql -d test_main_db -c "\d projects"
 sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHERE customized_type = 'Issue';"
+sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHERE customized_type = 'Project';"
 ```
 
 Проверить вручную:
 1. В `issues` появились колонки `cf_*`.
-2. Значения в `cf_*` не пустые там, где есть данные в `custom_values`.
-3. Количество обработанных issues выглядит правдоподобно по логу.
+2. В `projects` появились колонки `cf_*`, если в dump есть project custom values.
+3. Значения в `cf_*` не пустые там, где есть данные в `custom_values`.
+4. Количество обработанных `issues` и `projects` выглядит правдоподобно по логу.
 
 ## 9. Тест 4. Nightly run без удаления main БД
 
@@ -265,6 +270,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
    - набор таблиц
    - row count в snapshot-таблицах
    - `cf_*` колонки в `issues`
+   - `cf_*` колонки в `projects`
    - `group_employee_count`
    - `users_active`
 
@@ -273,6 +279,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
 ```bash
 sudo -u postgres psql -d test_main_db_task -c "SELECT COUNT(*) FROM issues;"
 sudo -u postgres psql -d test_main_db_mono -c "SELECT COUNT(*) FROM issues;"
+sudo -u postgres psql -d test_main_db_task -c "SELECT COUNT(*) FROM projects;"
+sudo -u postgres psql -d test_main_db_mono -c "SELECT COUNT(*) FROM projects;"
 ```
 
 ## 14. Что смотреть в логах
@@ -297,7 +305,7 @@ tail -f /workspace/logs/etl_pipeline.log
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. `issues` получает `cf_*` колонки и значения.
+3. `issues` и `projects` получают `cf_*` колонки и значения.
 4. `asterisk_cdr` присутствует после прогона.
 5. `group_employee_count` и `users_active` не теряют историю.
 6. Нет дублей в weekly-таблицах.

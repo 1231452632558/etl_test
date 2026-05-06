@@ -30,7 +30,7 @@
 ## Что меняется
 
 - Main БД становится долгоживущей
-- `issues` загружается в main уже после materialized custom transform
+- `issues` и `projects` загружаются в main уже после materialized custom transform
 - `asterisk_cdr` и другие snapshot-таблицы вливаются через `UPSERT`
 - `group_employee_count` и `users_active` больше не живут через nightly export/import
 
@@ -63,13 +63,13 @@
 2. Какие таблицы реально должны идти через snapshot nightly-поток.
 3. Где сейчас лежит CSV для `asterisk_cdr`.
 4. Где лежат CSV для `group_employee_count` и `users_active`.
-5. Какие индексы уже есть на `custom_values` и `issues`.
+5. Какие индексы уже есть на `custom_values`, `issues` и `projects`.
 
 Проверки:
 
 ```bash
 sudo -u postgres psql -d <main_db> -c "\dt"
-sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('custom_values', 'issues');"
+sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('custom_values', 'issues', 'projects');"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM asterisk_cdr;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM group_employee_count;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
@@ -86,10 +86,11 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `group_employee_count_csv_file` — путь к CSV для `group_employee_count`
 - `users_active_csv_file` — путь к CSV для `users_active`
 - `issues_table = issues`
+- `projects_table = projects`
 - `incremental_tables` — только snapshot-таблицы
 
 Важно:
-- `issues` можно не добавлять в `incremental_tables`, она подтянется автоматически через `issues_table`
+- `issues` и `projects` можно не добавлять в `incremental_tables`, они подтянутся автоматически через `issues_table` и `projects_table`
 - `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
 
 Минимальный пример:
@@ -98,6 +99,7 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 [tables]
 incremental_tables = asterisk_cdr:id
 issues_table = issues
+projects_table = projects
 ```
 
 ## Этап 3. Подготовка seed CSV
@@ -134,6 +136,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 
 Что проверить:
 - `issues` содержит `cf_*`
+- `projects` содержит `cf_*`
 - `asterisk_cdr` загружена корректно
 - `group_employee_count` и `users_active` не потеряли исторические данные
 - staging БД очищается после завершения
@@ -167,7 +170,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 Что произойдет:
 1. dump поднимется во staging
 2. `asterisk_cdr` при необходимости догрузится из CSV
-3. custom transform выполнится в staging
+3. custom transform выполнится в staging для `issues` и `projects`
 4. snapshot-таблицы будут влиты в main через `UPSERT`
 5. weekly-таблицы обновятся отдельным шагом
 
@@ -187,14 +190,16 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --init /path/to/i
 
 ```bash
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM issues;"
+sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM projects;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM asterisk_cdr;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM group_employee_count;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 sudo -u postgres psql -d <main_db> -c "\d issues"
+sudo -u postgres psql -d <main_db> -c "\d projects"
 ```
 
 Дополнительно:
-1. Визуально проверить несколько `issues` с custom fields.
+1. Визуально проверить несколько `issues` и `projects` с custom fields.
 2. Проверить, что `cf_*` колонки заполнились.
 3. Проверить, что `project_id` в `asterisk_cdr` задан.
 4. Проверить, что weekly-таблицы не задублировались.
@@ -248,12 +253,12 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 - проверен доступ к nightly dump
 - seed CSV лежат в нужных местах
 - `incremental_tables` не содержит weekly-таблицы
-- `issues_table` задана
+- `issues_table` и `projects_table` заданы
 
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues.cf_*` появились и заполнены
+- `issues.cf_*` и `projects.cf_*` появились и заполнены
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

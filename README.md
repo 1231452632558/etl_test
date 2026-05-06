@@ -30,7 +30,7 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 - Стабильная main БД без nightly `DROP DATABASE`
 - Обязательная staging БД для каждого входящего дампа
 - Одинаковая бизнес-логика в монолите и task-версии
-- Трансформация `custom_values -> issues.cf_*` до загрузки в main
+- Трансформация `custom_values -> issues.cf_*` и `custom_values -> projects.cf_*` до загрузки в main
 - `UPSERT` по snapshot-таблицам
 - Отдельная обработка CSV/manual таблиц `asterisk_cdr`, `group_employee_count` и `users_active`
 - Ротация архивов и подробное логирование
@@ -114,14 +114,14 @@ repo/
 2. Дамп разворачивается сразу в main.
 3. Создаются служебные таблицы, которых нет в дампе.
 4. Если ручные CSV/manual таблицы пустые, они заполняются из seed CSV.
-5. Выполняется custom transform в main.
+5. Выполняется custom transform в main для `issues` и `projects`.
 
 ### Ежедневный запуск
 
 Используется каждый день:
 1. Nightly dump разворачивается в новую staging БД.
 2. Во staging создаются служебные таблицы и патчится `asterisk_cdr.project_id`.
-3. Во staging выполняется custom transform.
+3. Во staging выполняется custom transform для `issues` и `projects`.
 4. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
 5. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
 6. В main БД выполняется weekly-update ручных таблиц.
@@ -150,20 +150,20 @@ repo/
 ## Custom transform
 
 Цель шага:
-- взять `issues`
+- взять `issues` и `projects`
 - найти связанные строки в `custom_values`
 - получить названия полей из `custom_fields`
 - материализовать их в отдельные колонки `cf_*`
 
 Текущая реализация:
-- проверяет наличие таблиц `issues`, `custom_values`, `custom_fields`
-- получает все issue custom fields
+- проверяет наличие таблиц `issues`, `projects`, `custom_values`, `custom_fields`
+- получает все custom fields для `customized_type = 'Issue'` и `customized_type = 'Project'`
 - создает недостающие колонки `cf_*`
 - агрегирует значения по `customized_id`
-- обновляет `issues` одним set-based SQL
+- обновляет `issues` и `projects` set-based SQL
 
 Почему это важно:
-- именно `issues` в уже преобразованном виде попадает в snapshot и затем в main БД
+- именно `issues` и `projects` в уже преобразованном виде попадают в snapshot и затем в main БД
 - это убирает зависимость от последующего JOIN при аналитике
 
 ## Конфигурация
@@ -181,10 +181,11 @@ repo/
 - `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
 - `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
 - `[tables].issues_table` — таблица для custom transform
+- `[tables].projects_table` — таблица `projects` для custom transform
 - `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
 - `[schedule].target_day` — день weekly-обновления
 
-Важно: `issues_table` автоматически добавляется в snapshot-список, даже если её забыли явно указать.
+Важно: `issues_table` и `projects_table` автоматически добавляются в snapshot-список, даже если их забыли явно указать.
 Важно: `group_employee_count` и `users_active` не должны попадать в `incremental_tables`, потому что они обновляются отдельным weekly-процессом.
 
 ## Запуск

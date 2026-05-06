@@ -19,7 +19,7 @@
 - не удаляется каждый день
 - накапливает актуальное состояние snapshot-таблиц
 - хранит ручные таблицы
-- хранит материализованные `cf_*` колонки в `issues`
+- хранит материализованные `cf_*` колонки в `issues` и `projects`
 
 ### Staging database
 
@@ -53,9 +53,10 @@ Snapshot-таблицы задаются через:
 [tables]
 incremental_tables = table_a:id,table_b:id
 issues_table = issues
+projects_table = projects
 ```
 
-`issues` можно не дублировать в `incremental_tables`, если она задается через `issues_table`.
+`issues` и `projects` можно не дублировать в `incremental_tables`, если они заданы через `issues_table` и `projects_table`.
 
 `group_employee_count` и `users_active` не должны включаться в `incremental_tables`, потому что они живут в main БД как ручные weekly-таблицы.
 
@@ -143,27 +144,29 @@ Seed CSV нужны только как стартовая точка, если 
 
 Из:
 - `issues`
+- `projects`
 - `custom_values`
 - `custom_fields`
 
 В:
 - `issues.cf_*`
+- `projects.cf_*`
 
 ### Зачем это нужно
 
-Чтобы аналитика читала уже материализованные custom-поля напрямую из `issues`, без постоянных JOIN к `custom_values`.
+Чтобы аналитика читала уже материализованные custom-поля напрямую из `issues` и `projects`, без постоянных JOIN к `custom_values`.
 
 ### Текущий подход
 
-1. Получить все issue custom fields.
+1. Получить все custom fields для `Issue` и `Project`.
 2. Сгенерировать для них имена `cf_*`.
 3. Создать недостающие колонки.
 4. Агрегировать значения по `customized_id`.
-5. Обновить `issues` одним SQL.
+5. Обновить `issues` и `projects` отдельными set-based SQL.
 
 ### Почему шаг делается в staging
 
-Так в main попадает уже подготовленная `issues`, и nightly загрузка работает с конечной схемой, а не с сырыми `custom_values`.
+Так в main попадают уже подготовленные `issues` и `projects`, и nightly загрузка работает с конечной схемой, а не с сырыми `custom_values`.
 
 ## 7. Индексы и производительность
 
@@ -172,6 +175,7 @@ Seed CSV нужны только как стартовая точка, если 
 Перед rollout стоит проверить индексы на:
 - `custom_values`
 - `issues`
+- `projects`
 - PK таблиц из `incremental_tables`
 
 Минимум стоит посмотреть:
@@ -180,6 +184,7 @@ Seed CSV нужны только как стартовая точка, если 
 SELECT indexname, indexdef
 FROM pg_indexes
 WHERE tablename IN ('custom_values', 'issues');
+-- при необходимости добавьте 'projects'
 ```
 
 Особенно полезны индексы, покрывающие:
@@ -194,14 +199,14 @@ WHERE tablename IN ('custom_values', 'issues');
 Проверить:
 - main БД создана
 - ручные таблицы существуют
-- `issues` содержит `cf_*` колонки
+- `issues` и `projects` содержат `cf_*` колонки
 - seed CSV импортировались, если таблицы были пусты
 
 ### После первого nightly
 
 Проверить:
 - staging БД создалась и удалилась
-- `issues` в main обновилась
+- `issues` и `projects` в main обновились
 - `UPSERT` сработал по нужным таблицам
 - weekly-таблицы не получили дубликаты
 
@@ -217,7 +222,7 @@ WHERE tablename IN ('custom_values', 'issues');
 - нет висящих staging БД
 - нет ошибок в `etl_pipeline.log`
 - размеры экспортов выглядят ожидаемо
-- `issues` и `cf_*` визуально корректны
+- `issues`, `projects` и их `cf_*` визуально корректны
 
 ## 10. Когда использовать монолит, когда tasks
 
