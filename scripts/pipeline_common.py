@@ -527,14 +527,17 @@ class DatabaseOperations:
         )
         data_csv_file = _strip_csv_header(csv_file, delimiter=",")
 
+        copy_command = (
+            f"\\copy temp_upsert ({quoted_columns}) FROM '{data_csv_file}' "
+            f"WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');"
+        )
         script = f"""
 CREATE TEMP TABLE temp_upsert AS
 SELECT {quoted_columns}
 FROM {_quote_identifier(table_name)}
 LIMIT 0;
 
-\\copy temp_upsert ({quoted_columns}) FROM '{data_csv_file}'
-WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '"', ESCAPE '"', ENCODING 'UTF8');
+{copy_command}
 
 INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
 SELECT {quoted_columns}
