@@ -79,12 +79,19 @@ class ETLPipeline:
             self.db_ops.seed_asterisk_cdr_if_needed(main_db)
             self.db_ops.add_project_id_column(main_db)
             self.db_ops.seed_manual_tables_if_needed(main_db, self.settings.manual_seed_files)
-            self.db_ops.log_pipeline_schema_snapshot(main_db, self.settings.issues_table)
+            self.db_ops.log_pipeline_schema_snapshot(main_db, self.settings.issues_table, self.settings.projects_table)
 
-            transform_result = self.db_ops.transform_custom_values(main_db, self.settings.issues_table)
+            transform_result = self.db_ops.transform_custom_values(
+                main_db,
+                self.settings.issues_table,
+                self.settings.projects_table,
+            )
+            issues_result = transform_result.get("entities", {}).get("issues", {})
+            projects_result = transform_result.get("entities", {}).get("projects", {})
             self.logger.info(
                 f"Custom transform: fields={transform_result['custom_fields_count']}, "
-                f"issues={transform_result['processed_count']}"
+                f"issues={issues_result.get('processed_count', 0)}, "
+                f"projects={projects_result.get('processed_count', 0)}"
             )
 
             self.db_ops.grant_privileges(main_db)
@@ -135,12 +142,20 @@ class ETLPipeline:
             self.db_ops.create_required_tables(temp_db)
             self.db_ops.seed_asterisk_cdr_if_needed(temp_db)
             self.db_ops.add_project_id_column(temp_db)
-            self.db_ops.log_pipeline_schema_snapshot(temp_db, self.settings.issues_table)
+            self.db_ops.log_pipeline_schema_snapshot(temp_db, self.settings.issues_table, self.settings.projects_table)
 
-            transform_result = self.db_ops.transform_custom_values(temp_db, self.settings.issues_table)
+            transform_result = self.db_ops.transform_custom_values(
+                temp_db,
+                self.settings.issues_table,
+                self.settings.projects_table,
+            )
+            issues_result = transform_result.get("entities", {}).get("issues", {})
+            projects_result = transform_result.get("entities", {}).get("projects", {})
             self.logger.info(
                 f"Custom transform в staging: fields={transform_result['custom_fields_count']}, "
-                f"issues={transform_result['processed_count']}, indexes={transform_result['index_count']}"
+                f"issues={issues_result.get('processed_count', 0)}, "
+                f"projects={projects_result.get('processed_count', 0)}, "
+                f"indexes={transform_result['index_count']}"
             )
 
             modifications = build_snapshot_exports(

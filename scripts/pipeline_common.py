@@ -76,6 +76,7 @@ class PipelineSettings:
     remote_path: str
     backup_tar: str
     issues_table: str
+    projects_table: str
     snapshot_tables: Dict[str, Sequence[str] | str]
     manual_seed_files: Dict[str, str]
     asterisk_csv_file: str
@@ -102,7 +103,9 @@ class PipelineSettings:
 
         snapshot_tables = cls._parse_snapshot_tables(parser)
         issues_table = parser.get("tables", "issues_table", fallback="issues").strip() or "issues"
+        projects_table = parser.get("tables", "projects_table", fallback="projects").strip() or "projects"
         snapshot_tables.setdefault(issues_table, "id")
+        snapshot_tables.setdefault(projects_table, "id")
 
         return cls(
             config_path=config_path,
@@ -124,6 +127,7 @@ class PipelineSettings:
             remote_path=parser.get("remote", "remote_path", fallback=""),
             backup_tar=parser.get("remote", "backup_tar", fallback=""),
             issues_table=issues_table,
+            projects_table=projects_table,
             snapshot_tables=snapshot_tables,
             manual_seed_files=manual_seed_files,
             asterisk_csv_file=parser.get(
@@ -466,8 +470,21 @@ class DatabaseOperations:
             else:
                 self.logger.warning(f"Index snapshot: индексы не найдены, db={db_name}, table={table_name}")
 
-    def log_pipeline_schema_snapshot(self, db_name: str, issues_table: str = "issues") -> None:
-        tables = [issues_table, "custom_values", "custom_fields", "asterisk_cdr", "group_employee_count", "users_active"]
+    def log_pipeline_schema_snapshot(
+        self,
+        db_name: str,
+        issues_table: str = "issues",
+        projects_table: str = "projects",
+    ) -> None:
+        tables = [
+            issues_table,
+            projects_table,
+            "custom_values",
+            "custom_fields",
+            "asterisk_cdr",
+            "group_employee_count",
+            "users_active",
+        ]
         self.logger.info(f"=== Schema Snapshot: db={db_name} ===")
         for table_name in tables:
             self.log_table_schema(table_name, db_name)
@@ -731,41 +748,55 @@ DROP TABLE temp_upsert;
         used_names.add(candidate)
         return candidate
 
-    def transform_custom_values(self, db_name: str, issues_table: str = "issues") -> Dict[str, object]:
-        issues_table = _validate_identifier(issues_table, "issues_table")
-        required_tables = [issues_table, "custom_values", "custom_fields"]
+    def _transform_custom_values_for_entity(
+        self,
+        db_name: str,
+        target_table: str,
+        customized_type: str,
+        entity_label: str,
+    ) -> Dict[str, object]:
+        target_table = _validate_identifier(target_table, f"{entity_label}_table")
+        required_tables = [target_table, "custom_values", "custom_fields"]
         if not all(self.table_exists(table_name, db_name) for table_name in required_tables):
-            self.logger.info("Таблицы для custom transform отсутствуют, шаг пропущен")
+            self.logger.info(
+                f"Таблицы для custom transform отсутствуют, шаг пропущен: db={db_name}, "
+                f"entity={entity_label}, table={target_table}"
+            )
             return {
                 "processed_count": 0,
                 "custom_fields_count": 0,
                 "columns_added": [],
                 "index_count": 0,
+                "entity": entity_label,
+                "target_table": target_table,
             }
 
         custom_fields = self.run_rows(
-            """
+            f"""
             SELECT DISTINCT cf.id, cf.name
             FROM custom_fields cf
             JOIN custom_values cv
               ON cv.custom_field_id = cf.id
-            WHERE cv.customized_type = 'Issue'
+            WHERE cv.customized_type = '{customized_type}'
             ORDER BY cf.id;
             """,
             db_name=db_name,
         )
         if not custom_fields:
             self.logger.warning(
-                f"Custom transform: не найдены issue custom fields через custom_values, db={db_name}"
+                f"Custom transform: не найдены custom fields через custom_values, db={db_name}, "
+                f"entity={entity_label}, customized_type={customized_type}"
             )
             return {
                 "processed_count": 0,
                 "custom_fields_count": 0,
                 "columns_added": [],
                 "index_count": len(self.list_indexes("custom_values", db_name)),
+                "entity": entity_label,
+                "target_table": target_table,
             }
 
-        existing_columns = set(self.get_table_columns(issues_table, db_name))
+        existing_columns = set(self.get_table_columns(target_table, db_name))
         used_names = set(existing_columns)
         field_mappings: List[Tuple[str, str, str]] = []
         added_columns: List[str] = []
@@ -774,12 +805,12 @@ DROP TABLE temp_upsert;
             column_name = self._sanitize_custom_column_name(field_name, field_id, used_names)
             field_mappings.append((field_id, field_name, column_name))
             if column_name not in existing_columns:
-                alter = f"ALTER TABLE {_quote_identifier(issues_table)} ADD COLUMN IF NOT EXISTS {_quote_identifier(column_name)} TEXT;"
+                alter = f"ALTER TABLE {_quote_identifier(target_table)} ADD COLUMN IF NOT EXISTS {_quote_identifier(column_name)} TEXT;"
                 if self._run_psql(alter, db_name=db_name, ignore_errors=True):
                     added_columns.append(column_name)
                     existing_columns.add(column_name)
         self.logger.info(
-            f"Custom transform mappings: db={db_name}, issues_table={issues_table}, "
+            f"Custom transform mappings: db={db_name}, entity={entity_label}, target_table={target_table}, "
             f"fields={len(field_mappings)}, added_columns={len(added_columns)}"
         )
         sample_mappings = ", ".join(
@@ -803,26 +834,26 @@ DROP TABLE temp_upsert;
         update_query = f"""
             WITH aggregated AS (
                 SELECT
-                    cv.customized_id AS issue_id,
+                    cv.customized_id AS entity_id,
                     {select_clauses}
                 FROM custom_values cv
-                WHERE cv.customized_type = 'Issue'
+                WHERE cv.customized_type = '{customized_type}'
                 GROUP BY cv.customized_id
             )
-            UPDATE {_quote_identifier(issues_table)} AS issues
+            UPDATE {_quote_identifier(target_table)} AS target
             SET
                 {set_clauses}
             FROM aggregated AS src
-            WHERE src.issue_id = issues.id;
+            WHERE src.entity_id = target.id;
         """
         self._run_psql(update_query, db_name=db_name, context_label="custom_transform:update")
 
         processed_count = int(
             self.run_scalar(
-                """
+                f"""
                 SELECT COUNT(DISTINCT customized_id)
                 FROM custom_values
-                WHERE customized_type = 'Issue';
+                WHERE customized_type = '{customized_type}';
                 """,
                 db_name=db_name,
             )
@@ -834,6 +865,37 @@ DROP TABLE temp_upsert;
             "custom_fields_count": len(field_mappings),
             "columns_added": added_columns,
             "index_count": len(indexes),
+            "entity": entity_label,
+            "target_table": target_table,
+        }
+
+    def transform_custom_values(
+        self,
+        db_name: str,
+        issues_table: str = "issues",
+        projects_table: str = "projects",
+    ) -> Dict[str, object]:
+        issue_result = self._transform_custom_values_for_entity(
+            db_name=db_name,
+            target_table=issues_table,
+            customized_type="Issue",
+            entity_label="issues",
+        )
+        project_result = self._transform_custom_values_for_entity(
+            db_name=db_name,
+            target_table=projects_table,
+            customized_type="Project",
+            entity_label="projects",
+        )
+        return {
+            "processed_count": issue_result["processed_count"] + project_result["processed_count"],
+            "custom_fields_count": issue_result["custom_fields_count"] + project_result["custom_fields_count"],
+            "columns_added": issue_result["columns_added"] + project_result["columns_added"],
+            "index_count": max(int(issue_result["index_count"]), int(project_result["index_count"])),
+            "entities": {
+                "issues": issue_result,
+                "projects": project_result,
+            },
         }
 
     def add_weekly_records(self, db_name: str, target_day: int) -> Dict[str, int | bool]:

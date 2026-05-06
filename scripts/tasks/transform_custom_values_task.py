@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Таск материализации custom_values в колонки таблицы issues.
+Таск материализации custom_values в колонки таблиц issues и projects.
 """
 
 from datetime import datetime
@@ -35,15 +35,27 @@ class TransformCustomValuesTask(BaseTask):
                     completed_at=datetime.now(),
                 )
 
-            result = self.db_ops.transform_custom_values(db_name, self.config.issues_table)
+            result = self.db_ops.transform_custom_values(
+                db_name,
+                self.config.issues_table,
+                self.config.projects_table,
+            )
+            issues_result = result.get('entities', {}).get('issues', {})
+            projects_result = result.get('entities', {}).get('projects', {})
             self.logger.info(
-                f"Custom transform завершен: fields={result['custom_fields_count']}, "
-                f"issues={result['processed_count']}, added_columns={len(result['columns_added'])}"
+                f"Custom transform завершен: total_fields={result['custom_fields_count']}, "
+                f"issues={issues_result.get('processed_count', 0)}, "
+                f"projects={projects_result.get('processed_count', 0)}, "
+                f"added_columns={len(result['columns_added'])}"
             )
 
             return self._create_result(
                 success=True,
-                message=f"Трансформация завершена, обработано issues: {result['processed_count']}",
+                message=(
+                    "Трансформация завершена: "
+                    f"issues={issues_result.get('processed_count', 0)}, "
+                    f"projects={projects_result.get('processed_count', 0)}"
+                ),
                 data={
                     'custom_transform': result,
                     'db_name': db_name,
