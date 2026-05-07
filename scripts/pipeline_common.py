@@ -942,29 +942,6 @@ DROP TABLE temp_upsert;
         group_filter = f"AND g.lastname ILIKE '{pattern_sql}'" if normalized_pattern else ""
         snapshot_date = str(today)
 
-        existing_group_rows = int(
-            self.run_scalar(
-                """
-                SELECT COUNT(*)
-                FROM group_employee_count
-                WHERE snapshot_date = CURRENT_DATE;
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
-        existing_users_row = int(
-            self.run_scalar(
-                """
-                SELECT COUNT(*)
-                FROM users_active
-                WHERE snapshot_date = CURRENT_DATE;
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
-
         group_source_count = int(
             self.run_scalar(
                 f"""
@@ -995,77 +972,64 @@ DROP TABLE temp_upsert;
             or 0
         )
 
-        group_upserted = int(
-            self.run_scalar(
-                f"""
-                WITH new_rows AS (
-                    SELECT
-                        g.id AS group_id,
-                        g.lastname AS group_name,
-                        COUNT(DISTINCT u.id) AS user_count
-                    FROM users u
-                    JOIN groups_users gu ON u.id = gu.user_id
-                    JOIN users g ON gu.group_id = g.id
-                    WHERE u.status = 1
-                    {group_filter}
-                    GROUP BY g.id, g.lastname
-                ),
-                upserted AS (
-                    INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
-                    SELECT group_id, group_name, CURRENT_DATE, user_count
-                    FROM new_rows
-                    ON CONFLICT (group_id, snapshot_date)
-                    DO UPDATE SET
-                        group_name = EXCLUDED.group_name,
-                        user_count = EXCLUDED.user_count
-                    RETURNING 1
-                )
-                SELECT COUNT(*) FROM upserted;
-                """,
-                db_name=db_name,
+        group_result_rows = self.run_rows(
+            f"""
+            WITH new_rows AS (
+                SELECT
+                    g.id AS group_id,
+                    g.lastname AS group_name,
+                    COUNT(DISTINCT u.id) AS user_count
+                FROM users u
+                JOIN groups_users gu ON u.id = gu.user_id
+                JOIN users g ON gu.group_id = g.id
+                WHERE u.status = 1
+                {group_filter}
+                GROUP BY g.id, g.lastname
+            ),
+            upserted AS (
+                INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
+                SELECT group_id, group_name, CURRENT_DATE, user_count
+                FROM new_rows
+                ON CONFLICT (group_id, snapshot_date)
+                DO UPDATE SET
+                    group_name = EXCLUDED.group_name,
+                    user_count = EXCLUDED.user_count
+                RETURNING (xmax = 0) AS inserted
             )
-            or 0
+            SELECT
+                COUNT(*)::text,
+                COUNT(*) FILTER (WHERE inserted)::text,
+                COUNT(*) FILTER (WHERE NOT inserted)::text
+            FROM upserted;
+            """,
+            db_name=db_name,
         )
-        users_upserted = int(
-            self.run_scalar(
-                """
-                WITH upserted AS (
-                    INSERT INTO users_active (snapshot_date, user_count)
-                    SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
-                    FROM users u
-                    WHERE u.status = 1
-                    ON CONFLICT (snapshot_date)
-                    DO UPDATE SET user_count = EXCLUDED.user_count
-                    RETURNING 1
-                )
-                SELECT COUNT(*) FROM upserted;
-                """,
-                db_name=db_name,
+        users_result_rows = self.run_rows(
+            """
+            WITH upserted AS (
+                INSERT INTO users_active (snapshot_date, user_count)
+                SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
+                FROM users u
+                WHERE u.status = 1
+                ON CONFLICT (snapshot_date)
+                DO UPDATE SET user_count = EXCLUDED.user_count
+                RETURNING (xmax = 0) AS inserted
             )
-            or 0
+            SELECT
+                COUNT(*)::text,
+                COUNT(*) FILTER (WHERE inserted)::text,
+                COUNT(*) FILTER (WHERE NOT inserted)::text
+            FROM upserted;
+            """,
+            db_name=db_name,
         )
-        final_group_rows = int(
-            self.run_scalar(
-                """
-                SELECT COUNT(*)
-                FROM group_employee_count
-                WHERE snapshot_date = CURRENT_DATE;
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
-        final_users_row = int(
-            self.run_scalar(
-                """
-                SELECT COUNT(*)
-                FROM users_active
-                WHERE snapshot_date = CURRENT_DATE;
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
+
+        group_upserted = int(group_result_rows[0][0]) if group_result_rows and len(group_result_rows[0]) >= 1 else 0
+        group_inserted = int(group_result_rows[0][1]) if group_result_rows and len(group_result_rows[0]) >= 2 else 0
+        group_updated = int(group_result_rows[0][2]) if group_result_rows and len(group_result_rows[0]) >= 3 else 0
+        users_upserted = int(users_result_rows[0][0]) if users_result_rows and len(users_result_rows[0]) >= 1 else 0
+        users_inserted = int(users_result_rows[0][1]) if users_result_rows and len(users_result_rows[0]) >= 2 else 0
+        users_updated = int(users_result_rows[0][2]) if users_result_rows and len(users_result_rows[0]) >= 3 else 0
 
         return {
             "skipped": False,
@@ -1074,16 +1038,12 @@ DROP TABLE temp_upsert;
             "snapshot_date": snapshot_date,
             "group_source_count": group_source_count,
             "group_upserted": group_upserted,
-            "group_existing_before": existing_group_rows,
-            "group_existing_after": final_group_rows,
-            "group_inserted": max(final_group_rows - existing_group_rows, 0),
-            "group_updated": max(group_upserted - max(final_group_rows - existing_group_rows, 0), 0),
+            "group_inserted": group_inserted,
+            "group_updated": group_updated,
             "users_active_count": active_users_count,
             "users_upserted": users_upserted,
-            "users_existing_before": existing_users_row,
-            "users_existing_after": final_users_row,
-            "users_inserted": 1 if existing_users_row == 0 and users_upserted > 0 else 0,
-            "users_updated": 1 if existing_users_row > 0 and users_upserted > 0 else 0,
+            "users_inserted": users_inserted,
+            "users_updated": users_updated,
             "weekly_group_name_pattern": normalized_pattern,
         }
 
