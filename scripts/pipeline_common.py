@@ -1061,6 +1061,7 @@ DROP TABLE temp_upsert;
             db_name=db_name,
         )
         group_upserted_rows: List[List[str]] = []
+        group_failures: List[str] = []
         next_group_id = self.count_rows("group_employee_count", db_name) + 1
         for group_id, group_name, user_count in group_rows:
             exists_query = f"""
@@ -1078,8 +1079,14 @@ DROP TABLE temp_upsert;
                     WHERE group_id = {int(group_id)}
                       AND snapshot_date = CURRENT_DATE;
                 """
-                if self._run_psql(update_query, db_name=db_name, context_label="weekly:group_update"):
+                if self._run_psql(
+                    update_query,
+                    db_name=db_name,
+                    context_label=f"weekly:group_update:{group_id}",
+                ):
                     group_upserted_rows.append([group_id, group_name, snapshot_date, user_count, "f"])
+                else:
+                    group_failures.append(f"update group_id={group_id}")
             else:
                 if group_id_default:
                     insert_query = f"""
@@ -1092,10 +1099,17 @@ DROP TABLE temp_upsert;
                         VALUES ({next_group_id}, {int(group_id)}, '{group_name.replace("'", "''")}', CURRENT_DATE, {int(user_count)});
                     """
                     next_group_id += 1
-                if self._run_psql(insert_query, db_name=db_name, context_label="weekly:group_insert"):
+                if self._run_psql(
+                    insert_query,
+                    db_name=db_name,
+                    context_label=f"weekly:group_insert:{group_id}",
+                ):
                     group_upserted_rows.append([group_id, group_name, snapshot_date, user_count, "t"])
+                else:
+                    group_failures.append(f"insert group_id={group_id}")
 
         users_upserted_rows: List[List[str]] = []
+        users_failures: List[str] = []
         users_exists = int(
             self.run_scalar(
                 """
@@ -1115,6 +1129,8 @@ DROP TABLE temp_upsert;
             """
             if self._run_psql(users_query, db_name=db_name, context_label="weekly:users_update"):
                 users_upserted_rows.append([snapshot_date, str(active_users_count), "f"])
+            else:
+                users_failures.append("update users_active")
         else:
             if users_id_default:
                 users_query = f"""
@@ -1129,6 +1145,8 @@ DROP TABLE temp_upsert;
                 """
             if self._run_psql(users_query, db_name=db_name, context_label="weekly:users_insert"):
                 users_upserted_rows.append([snapshot_date, str(active_users_count), "t"])
+            else:
+                users_failures.append("insert users_active")
 
         final_group_rows = int(
             self.run_scalar(
@@ -1172,6 +1190,10 @@ DROP TABLE temp_upsert;
             f"group_rows_after={final_group_rows}, users_rows_before={existing_users_row}, "
             f"users_rows_after={final_users_row}"
         )
+        if group_failures:
+            self.logger.error(f"Weekly group failures: db={db_name}, failures={group_failures}")
+        if users_failures:
+            self.logger.error(f"Weekly users failures: db={db_name}, failures={users_failures}")
 
         return {
             "skipped": False,
@@ -1187,6 +1209,8 @@ DROP TABLE temp_upsert;
             "users_inserted": users_inserted,
             "users_updated": users_updated,
             "weekly_group_name_pattern": normalized_pattern,
+            "group_failures": group_failures,
+            "users_failures": users_failures,
         }
 
 

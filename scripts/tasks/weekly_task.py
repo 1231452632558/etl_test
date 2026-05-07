@@ -62,6 +62,8 @@ class WeeklyTask(BaseTask):
                 )
             
             current_day = result['current_day']
+            group_failures = result.get('group_failures', [])
+            users_failures = result.get('users_failures', [])
             self.logger.info(
                 f"Еженедельные ручные таблицы обработаны: db={db_name}, day={current_day}, "
                 f"snapshot_date={result.get('snapshot_date', '')}, "
@@ -79,6 +81,33 @@ class WeeklyTask(BaseTask):
                 self.logger.warning(
                     "Еженедельный источник для group_employee_count вернул 0 групп; "
                     "проверьте weekly_group_name_pattern и данные users/groups_users"
+                )
+            if group_failures or users_failures:
+                return self._create_result(
+                    success=False,
+                    message=(
+                        f"Weekly завершился с ошибками: "
+                        f"group_failures={len(group_failures)}, users_failures={len(users_failures)}"
+                    ),
+                    data={
+                        'skipped': False,
+                        'db_name': db_name,
+                        'current_day': current_day,
+                        'target_day': target_day,
+                        'snapshot_date': result.get('snapshot_date', ''),
+                        'group_source_count': result.get('group_source_count', 0),
+                        'group_upserted': result.get('group_upserted', 0),
+                        'group_inserted': result.get('group_inserted', 0),
+                        'group_updated': result.get('group_updated', 0),
+                        'users_active_count': result.get('users_active_count', 0),
+                        'users_upserted': result.get('users_upserted', 0),
+                        'users_inserted': result.get('users_inserted', 0),
+                        'users_updated': result.get('users_updated', 0),
+                        'weekly_group_name_pattern': result.get('weekly_group_name_pattern', ''),
+                    },
+                    errors=group_failures + users_failures,
+                    started_at=started_at,
+                    completed_at=datetime.now()
                 )
             
             return self._create_result(
