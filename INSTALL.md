@@ -183,6 +183,40 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 
 Флаг `--cleanup` удаляет staging БД после завершения.
 
+## 8.1. Частичный запуск стадий
+
+Обе версии поддерживают одинаковые стадии:
+
+```text
+extract, restore, seed_asterisk, transform_custom_values, compare, load, weekly, cleanup
+```
+
+Примеры:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
+И те же команды для монолита:
+
+```bash
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
+Пояснения:
+- `--tasks` задаёт только нужные стадии
+- `--db-scope main|temp|auto` определяет, над какой БД выполнять `restore`, `seed_asterisk`, `transform_custom_values`
+- `--temp-db-name` нужен, если вы хотите запускать temp-стадии отдельно, без нового `restore`
+- `compare` и `load` работают только с `temp` scope
+- `restore` автоматически добавит `extract`, если он не указан
+- `load` автоматически добавит `compare`, если он не указан
+
 ## 9. Cron
 
 Пример для task-версии:

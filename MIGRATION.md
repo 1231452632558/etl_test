@@ -44,6 +44,11 @@
 
 Для rollout лучше выбрать одну как основную. Рекомендуемый вариант: `scripts/etl_pipeline.py`.
 
+При этом монолит и task-версия должны оставаться равноправными:
+- одинаковые стадии
+- одинаковая nightly-логика
+- одинаковые ключи `--tasks`, `--db-scope`, `--temp-db-name`, `--skip-weekly`
+
 ## Перед началом
 
 Подготовьте:
@@ -226,6 +231,14 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 3. Наполнение `cf_*` колонок
 4. Корректность `asterisk_cdr`
 5. Дубли в weekly-таблицах
+
+Для диагностики после переключения можно запускать отдельные стадии:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+```
 
 Проверки:
 

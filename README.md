@@ -43,7 +43,9 @@ repo/
 ├── config/
 │   └── etl_config.ini
 ├── docs/
-│   └── OPERATIONS.md
+│   ├── CODE_ARCHITECTURE.md
+│   ├── OPERATIONS.md
+│   └── TESTING.md
 ├── dumps/
 │   ├── test_dump_v1.sql
 │   └── test_dump_v2.sql
@@ -100,6 +102,7 @@ repo/
 - `ExtractTask`
 - `RestoreTask`
 - `TransformCustomValuesTask`
+- `SeedAsteriskTask`
 - `CompareTask`
 - `LoadTask`
 - `WeeklyTask`
@@ -204,6 +207,15 @@ Nightly run:
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
 ```
 
+Запуск отдельных стадий:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
 ### Монолитная версия
 
 Инициализация:
@@ -217,6 +229,39 @@ Nightly run:
 ```bash
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
 ```
+
+Запуск отдельных стадий:
+
+```bash
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
+### Стадии и частичный запуск
+
+Обе версии поддерживают одинаковый набор стадий:
+- `extract`
+- `restore`
+- `seed_asterisk`
+- `transform_custom_values`
+- `compare`
+- `load`
+- `weekly`
+- `cleanup`
+
+Полезные флаги:
+- `--tasks` — список стадий через запятую
+- `--db-scope main|temp|auto` — куда применять `restore`, `seed_asterisk`, `transform_custom_values`
+- `--temp-db-name` — имя уже существующей staging БД для частичного запуска без `restore`
+- `--skip-weekly` — исключить weekly из полного nightly-потока
+
+Практические правила:
+- `restore` автоматически подтягивает `extract`, если вы его не указали
+- `load` автоматически подтягивает `compare`, если вы его не указали
+- для `compare` и `load` нужен `temp` scope
+- для `transform_custom_values`, `weekly` и `seed_asterisk` dump не обязателен
 
 ## Как выбрать между версиями
 
@@ -238,6 +283,15 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 2. Наличие доступа `sudo -u postgres psql`.
 3. Что seed CSV для `asterisk_cdr`, `group_employee_count` и `users_active` лежат там, где ожидается логикой.
 4. Что weekly `ON CONFLICT` соответствует нужной бизнес-логике.
+
+## Документы
+
+- Общая схема: `README.md`
+- Установка и запуск: `INSTALL.md`
+- Эксплуатация: `docs/OPERATIONS.md`
+- Методика тестирования: `docs/TESTING.md`
+- Миграция с shell-скрипта: `MIGRATION.md`
+- Подробная документация по коду: `docs/CODE_ARCHITECTURE.md`
 5. Что индексы на `custom_values` в исходной схеме действительно существуют и достаточны.
 
 ## Дополнительные документы

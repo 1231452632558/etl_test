@@ -74,8 +74,6 @@ class RestoreTask(BaseTask):
                     )
             
             self.db_ops.create_required_tables(db_name)
-            asterisk_seeded = self.db_ops.seed_asterisk_cdr_if_needed(db_name)
-            self.db_ops.add_project_id_column(db_name)
             if self.target == 'main':
                 seed_results = self.db_ops.seed_manual_tables_if_needed(db_name, self.config.manual_seed_files)
             else:
@@ -95,7 +93,6 @@ class RestoreTask(BaseTask):
                 data={
                     'db_name': db_name,
                     'seed_results': seed_results,
-                    'asterisk_seeded': asterisk_seeded,
                     'main_db': db_name if self.target == 'main' else context.get('main_db'),
                     'temp_db': db_name if self.target == 'temp' else context.get('temp_db'),
                 },

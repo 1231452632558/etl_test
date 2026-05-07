@@ -300,6 +300,30 @@ tail -f /workspace/logs/etl_pipeline.log
 - weekly update
 - cleanup staging БД
 
+## 14.1. Проверка отдельных стадий
+
+Для targeted-проверок можно гонять только нужный шаг.
+
+Примеры:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+```
+
+Если нужно проверить temp-стадию на уже существующей staging БД:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values,compare --db-scope temp --temp-db-name temp_restore_20260507_123456
+```
+
+Что проверять:
+1. В начале лога печатается план стадий.
+2. Для `transform_custom_values` видны counts по `issues/projects`.
+3. Для `weekly` видны `snapshot_date`, counts и debug sample.
+4. Для `seed_asterisk` виден статус `seeded` или `skipped`.
+
 ## 15. Критерии успешного теста
 
 Тест считается успешным, если:
