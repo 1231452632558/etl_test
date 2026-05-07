@@ -431,6 +431,18 @@ class DatabaseOperations:
         """
         return [(row[0], row[1]) for row in self.run_rows(query, db_name=db_name) if len(row) >= 2]
 
+    def get_column_default(self, table_name: str, column_name: str, db_name: str) -> str:
+        table_name = _validate_identifier(table_name, "table_name")
+        column_name = _validate_identifier(column_name, "column")
+        query = f"""
+            SELECT COALESCE(column_default, '')
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = '{table_name}'
+              AND column_name = '{column_name}';
+        """
+        return self.run_scalar(query, db_name=db_name)
+
     def ensure_text_columns(self, table_name: str, columns: Sequence[str], db_name: str) -> List[str]:
         table_name = _validate_identifier(table_name, "table_name")
         existing_columns = set(self.get_table_columns(table_name, db_name))
@@ -950,6 +962,13 @@ DROP TABLE temp_upsert;
         )
         self.log_table_schema("group_employee_count", db_name, include_indexes=False)
         self.log_table_schema("users_active", db_name, include_indexes=False)
+        group_id_default = self.get_column_default("group_employee_count", "id", db_name)
+        users_id_default = self.get_column_default("users_active", "id", db_name)
+        self.logger.info(
+            f"Weekly debug defaults: db={db_name}, "
+            f"group_employee_count.id_default={group_id_default!r}, "
+            f"users_active.id_default={users_id_default!r}"
+        )
 
         group_source_count = int(
             self.run_scalar(
@@ -1025,49 +1044,91 @@ DROP TABLE temp_upsert;
             or 0
         )
 
-        group_result_rows = self.run_rows(
+        group_rows = self.run_rows(
             f"""
-            WITH new_rows AS (
-                SELECT
-                    g.id AS group_id,
-                    g.lastname AS group_name,
-                    COUNT(DISTINCT u.id) AS user_count
-                FROM users u
-                JOIN groups_users gu ON u.id = gu.user_id
-                JOIN users g ON gu.group_id = g.id
-                WHERE u.status = 1
-                {group_filter}
-                GROUP BY g.id, g.lastname
-            )
-            , upserted AS (
-                INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
-                SELECT group_id, group_name, CURRENT_DATE, user_count
-                FROM new_rows
-                ON CONFLICT (group_id, snapshot_date)
-                DO UPDATE SET
-                    group_name = EXCLUDED.group_name,
-                    user_count = EXCLUDED.user_count
-                RETURNING group_id::text, group_name, snapshot_date::text, user_count::text, (xmax = 0)::text
-            )
-            SELECT * FROM upserted;
+            SELECT
+                g.id::text,
+                g.lastname,
+                COUNT(DISTINCT u.id)::text
+            FROM users u
+            JOIN groups_users gu ON u.id = gu.user_id
+            JOIN users g ON gu.group_id = g.id
+            WHERE u.status = 1
+            {group_filter}
+            GROUP BY g.id, g.lastname
+            ORDER BY g.id;
             """,
             db_name=db_name,
         )
-        users_result_rows = self.run_rows(
+        group_upserted_rows: List[List[str]] = []
+        next_group_id = self.count_rows("group_employee_count", db_name) + 1
+        for group_id, group_name, user_count in group_rows:
+            exists_query = f"""
+                SELECT COUNT(*)
+                FROM group_employee_count
+                WHERE group_id = {int(group_id)}
+                  AND snapshot_date = CURRENT_DATE;
             """
-            WITH upserted AS (
-                INSERT INTO users_active (snapshot_date, user_count)
-                SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
-                FROM users u
-                WHERE u.status = 1
-                ON CONFLICT (snapshot_date)
-                DO UPDATE SET user_count = EXCLUDED.user_count
-                RETURNING snapshot_date::text, user_count::text, (xmax = 0)::text
+            exists = int(self.run_scalar(exists_query, db_name=db_name) or 0) > 0
+            if exists:
+                update_query = f"""
+                    UPDATE group_employee_count
+                    SET group_name = '{group_name.replace("'", "''")}',
+                        user_count = {int(user_count)}
+                    WHERE group_id = {int(group_id)}
+                      AND snapshot_date = CURRENT_DATE;
+                """
+                if self._run_psql(update_query, db_name=db_name, context_label="weekly:group_update"):
+                    group_upserted_rows.append([group_id, group_name, snapshot_date, user_count, "f"])
+            else:
+                if group_id_default:
+                    insert_query = f"""
+                        INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
+                        VALUES ({int(group_id)}, '{group_name.replace("'", "''")}', CURRENT_DATE, {int(user_count)});
+                    """
+                else:
+                    insert_query = f"""
+                        INSERT INTO group_employee_count (id, group_id, group_name, snapshot_date, user_count)
+                        VALUES ({next_group_id}, {int(group_id)}, '{group_name.replace("'", "''")}', CURRENT_DATE, {int(user_count)});
+                    """
+                    next_group_id += 1
+                if self._run_psql(insert_query, db_name=db_name, context_label="weekly:group_insert"):
+                    group_upserted_rows.append([group_id, group_name, snapshot_date, user_count, "t"])
+
+        users_upserted_rows: List[List[str]] = []
+        users_exists = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(*)
+                FROM users_active
+                WHERE snapshot_date = CURRENT_DATE;
+                """,
+                db_name=db_name,
             )
-            SELECT * FROM upserted;
-            """,
-            db_name=db_name,
-        )
+            or 0
+        ) > 0
+        if users_exists:
+            users_query = f"""
+                UPDATE users_active
+                SET user_count = {active_users_count}
+                WHERE snapshot_date = CURRENT_DATE;
+            """
+            if self._run_psql(users_query, db_name=db_name, context_label="weekly:users_update"):
+                users_upserted_rows.append([snapshot_date, str(active_users_count), "f"])
+        else:
+            if users_id_default:
+                users_query = f"""
+                    INSERT INTO users_active (snapshot_date, user_count)
+                    VALUES (CURRENT_DATE, {active_users_count});
+                """
+            else:
+                next_users_id = self.count_rows("users_active", db_name) + 1
+                users_query = f"""
+                    INSERT INTO users_active (id, snapshot_date, user_count)
+                    VALUES ({next_users_id}, CURRENT_DATE, {active_users_count});
+                """
+            if self._run_psql(users_query, db_name=db_name, context_label="weekly:users_insert"):
+                users_upserted_rows.append([snapshot_date, str(active_users_count), "t"])
 
         final_group_rows = int(
             self.run_scalar(
@@ -1092,19 +1153,19 @@ DROP TABLE temp_upsert;
             or 0
         )
 
-        group_upserted = len(group_result_rows)
-        group_inserted = sum(1 for row in group_result_rows if len(row) >= 5 and row[4].lower() == "t")
+        group_upserted = len(group_upserted_rows)
+        group_inserted = sum(1 for row in group_upserted_rows if len(row) >= 5 and row[4].lower() == "t")
         group_updated = max(group_upserted - group_inserted, 0)
-        users_upserted = len(users_result_rows)
-        users_inserted = sum(1 for row in users_result_rows if len(row) >= 3 and row[2].lower() == "t")
+        users_upserted = len(users_upserted_rows)
+        users_inserted = sum(1 for row in users_upserted_rows if len(row) >= 3 and row[2].lower() == "t")
         users_updated = max(users_upserted - users_inserted, 0)
-        if group_result_rows:
+        if group_upserted_rows:
             self.logger.info(
-                f"Weekly debug upserted groups sample: db={db_name}, sample={group_result_rows[:5]}"
+                f"Weekly debug upserted groups sample: db={db_name}, sample={group_upserted_rows[:5]}"
             )
-        if users_result_rows:
+        if users_upserted_rows:
             self.logger.info(
-                f"Weekly debug upserted users_active rows: db={db_name}, rows={users_result_rows}"
+                f"Weekly debug upserted users_active rows: db={db_name}, rows={users_upserted_rows}"
             )
         self.logger.info(
             f"Weekly debug after upsert: db={db_name}, group_rows_before={existing_group_rows}, "
