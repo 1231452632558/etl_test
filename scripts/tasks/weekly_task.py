@@ -61,15 +61,36 @@ class WeeklyTask(BaseTask):
                 )
             
             current_day = result['current_day']
-            self.logger.info(f"Еженедельные ручные таблицы обновлены для дня {current_day}")
+            self.logger.info(
+                f"Еженедельные ручные таблицы обработаны для дня {current_day}: "
+                f"group_source_count={result.get('group_source_count', 0)}, "
+                f"group_upserted={result.get('group_upserted', 0)}, "
+                f"users_active_count={result.get('users_active_count', 0)}, "
+                f"users_upserted={result.get('users_upserted', 0)}, "
+                f"group_name_pattern={result.get('weekly_group_name_pattern', '')}"
+            )
+            if result.get('group_source_count', 0) == 0:
+                self.logger.warning(
+                    "Еженедельный источник для group_employee_count вернул 0 групп; "
+                    "проверьте weekly_group_name_pattern и данные users/groups_users"
+                )
             
             return self._create_result(
                 success=True,
-                message="Еженедельные записи добавлены успешно",
+                message=(
+                    "Еженедельные записи обработаны: "
+                    f"group_upserted={result.get('group_upserted', 0)}, "
+                    f"users_upserted={result.get('users_upserted', 0)}"
+                ),
                 data={
                     'skipped': False,
                     'current_day': current_day,
-                    'target_day': target_day
+                    'target_day': target_day,
+                    'group_source_count': result.get('group_source_count', 0),
+                    'group_upserted': result.get('group_upserted', 0),
+                    'users_active_count': result.get('users_active_count', 0),
+                    'users_upserted': result.get('users_upserted', 0),
+                    'weekly_group_name_pattern': result.get('weekly_group_name_pattern', ''),
                 },
                 started_at=started_at,
                 completed_at=datetime.now()

@@ -71,6 +71,7 @@ class PipelineSettings:
     max_backups: int
     cleanup_temp_db: bool
     target_day: int
+    weekly_group_name_pattern: str
     remote_user: str
     remote_host: str
     remote_path: str
@@ -122,6 +123,7 @@ class PipelineSettings:
             max_backups=parser.getint("retention", "max_backups", fallback=3),
             cleanup_temp_db=parser.getboolean("retention", "cleanup_temp_db", fallback=True),
             target_day=parser.getint("schedule", "target_day", fallback=1),
+            weekly_group_name_pattern=parser.get("schedule", "weekly_group_name_pattern", fallback="masked"),
             remote_user=parser.get("remote", "remote_user", fallback=""),
             remote_host=parser.get("remote", "remote_host", fallback=""),
             remote_path=parser.get("remote", "remote_path", fallback=""),
@@ -934,38 +936,99 @@ DROP TABLE temp_upsert;
         if current_day != target_day:
             return {"skipped": True, "current_day": current_day, "target_day": target_day}
 
-        group_query = """
-            WITH new_rows AS (
-                SELECT
-                    g.id AS group_id,
-                    g.lastname AS group_name,
-                    COUNT(DISTINCT u.id) AS user_count
-                FROM users u
-                JOIN groups_users gu ON u.id = gu.user_id
-                JOIN users g ON gu.group_id = g.id
-                WHERE u.status = 1
-                  AND g.lastname ILIKE 'masked'
-                GROUP BY g.id, g.lastname
+        pattern = self.settings.weekly_group_name_pattern.replace("'", "''").strip()
+        group_filter = f"AND g.lastname ILIKE '{pattern}'" if pattern else ""
+
+        group_source_count = int(
+            self.run_scalar(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT g.id
+                    FROM users u
+                    JOIN groups_users gu ON u.id = gu.user_id
+                    JOIN users g ON gu.group_id = g.id
+                    WHERE u.status = 1
+                    {group_filter}
+                    GROUP BY g.id, g.lastname
+                ) src;
+                """,
+                db_name=db_name,
             )
-            INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
-            SELECT group_id, group_name, CURRENT_DATE, user_count
-            FROM new_rows
-            ON CONFLICT (group_id, snapshot_date)
-            DO UPDATE SET
-                group_name = EXCLUDED.group_name,
-                user_count = EXCLUDED.user_count;
-        """
-        users_query = """
-            INSERT INTO users_active (snapshot_date, user_count)
-            SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
-            FROM users u
-            WHERE u.status = 1
-            ON CONFLICT (snapshot_date)
-            DO UPDATE SET user_count = EXCLUDED.user_count;
-        """
-        self._run_psql(group_query, db_name=db_name, ignore_errors=True)
-        self._run_psql(users_query, db_name=db_name, ignore_errors=True)
-        return {"skipped": False, "current_day": current_day, "target_day": target_day}
+            or 0
+        )
+        active_users_count = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(DISTINCT u.id)
+                FROM users u
+                WHERE u.status = 1;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
+
+        group_upserted = int(
+            self.run_scalar(
+                f"""
+                WITH new_rows AS (
+                    SELECT
+                        g.id AS group_id,
+                        g.lastname AS group_name,
+                        COUNT(DISTINCT u.id) AS user_count
+                    FROM users u
+                    JOIN groups_users gu ON u.id = gu.user_id
+                    JOIN users g ON gu.group_id = g.id
+                    WHERE u.status = 1
+                    {group_filter}
+                    GROUP BY g.id, g.lastname
+                ),
+                upserted AS (
+                    INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
+                    SELECT group_id, group_name, CURRENT_DATE, user_count
+                    FROM new_rows
+                    ON CONFLICT (group_id, snapshot_date)
+                    DO UPDATE SET
+                        group_name = EXCLUDED.group_name,
+                        user_count = EXCLUDED.user_count
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM upserted;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
+        users_upserted = int(
+            self.run_scalar(
+                """
+                WITH upserted AS (
+                    INSERT INTO users_active (snapshot_date, user_count)
+                    SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
+                    FROM users u
+                    WHERE u.status = 1
+                    ON CONFLICT (snapshot_date)
+                    DO UPDATE SET user_count = EXCLUDED.user_count
+                    RETURNING 1
+                )
+                SELECT COUNT(*) FROM upserted;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
+
+        return {
+            "skipped": False,
+            "current_day": current_day,
+            "target_day": target_day,
+            "group_source_count": group_source_count,
+            "group_upserted": group_upserted,
+            "users_active_count": active_users_count,
+            "users_upserted": users_upserted,
+            "weekly_group_name_pattern": self.settings.weekly_group_name_pattern,
+        }
 
 
 def copy_from_remote_or_local(settings: PipelineSettings, logger: ETLLogger, dump_file: str) -> Optional[str]:
