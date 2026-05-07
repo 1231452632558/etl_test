@@ -443,6 +443,27 @@ class DatabaseOperations:
         """
         return self.run_scalar(query, db_name=db_name)
 
+    def sync_sequence_with_max_id(self, table_name: str, db_name: str, column_name: str = "id") -> bool:
+        table_name = _validate_identifier(table_name, "table_name")
+        column_name = _validate_identifier(column_name, "column")
+        default_expr = self.get_column_default(table_name, column_name, db_name)
+        if "nextval(" not in default_expr:
+            return False
+
+        query = f"""
+            SELECT setval(
+                pg_get_serial_sequence('public.{table_name}', '{column_name}'),
+                COALESCE((SELECT MAX({_quote_identifier(column_name)}) FROM {_quote_identifier(table_name)}), 0),
+                true
+            )::text;
+        """
+        result = self.run_scalar(query, db_name=db_name)
+        self.logger.info(
+            f"Sequence synchronized: db={db_name}, table={table_name}, column={column_name}, "
+            f"default={default_expr!r}, setval_result={result}"
+        )
+        return True
+
     def ensure_text_columns(self, table_name: str, columns: Sequence[str], db_name: str) -> List[str]:
         table_name = _validate_identifier(table_name, "table_name")
         existing_columns = set(self.get_table_columns(table_name, db_name))
@@ -748,6 +769,7 @@ DROP TABLE temp_upsert;
             )
         )
         if result:
+            self.sync_sequence_with_max_id(table_name, db_name)
             self.logger.info(f"Seed import выполнен: db={db_name}, table={table_name}, csv={csv_file}")
         return result
 
@@ -962,6 +984,10 @@ DROP TABLE temp_upsert;
         )
         self.log_table_schema("group_employee_count", db_name, include_indexes=False)
         self.log_table_schema("users_active", db_name, include_indexes=False)
+        group_id_default = self.get_column_default("group_employee_count", "id", db_name)
+        users_id_default = self.get_column_default("users_active", "id", db_name)
+        self.sync_sequence_with_max_id("group_employee_count", db_name)
+        self.sync_sequence_with_max_id("users_active", db_name)
         group_id_default = self.get_column_default("group_employee_count", "id", db_name)
         users_id_default = self.get_column_default("users_active", "id", db_name)
         self.logger.info(
