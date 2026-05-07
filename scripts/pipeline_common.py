@@ -84,7 +84,7 @@ class PipelineSettings:
 
     @classmethod
     def from_file(cls, config_path: str) -> "PipelineSettings":
-        parser = configparser.ConfigParser()
+        parser = configparser.ConfigParser(interpolation=None)
         parser.read(config_path, encoding="utf-8")
 
         log_file = parser.get("paths", "log_file", fallback="/workspace/logs/etl_pipeline.log")
