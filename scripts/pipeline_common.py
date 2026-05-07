@@ -941,6 +941,15 @@ DROP TABLE temp_upsert;
         pattern_sql = normalized_pattern.replace("'", "''")
         group_filter = f"AND g.lastname ILIKE '{pattern_sql}'" if normalized_pattern else ""
         snapshot_date = str(today)
+        db_current_date = self.run_scalar("SELECT CURRENT_DATE::text;", db_name=db_name)
+        db_current_timestamp = self.run_scalar("SELECT CURRENT_TIMESTAMP::text;", db_name=db_name)
+        self.logger.info(
+            f"Weekly debug: db={db_name}, python_snapshot_date={snapshot_date}, "
+            f"db_current_date={db_current_date}, db_current_timestamp={db_current_timestamp}, "
+            f"group_name_pattern={normalized_pattern}"
+        )
+        self.log_table_schema("group_employee_count", db_name, include_indexes=False)
+        self.log_table_schema("users_active", db_name, include_indexes=False)
 
         group_source_count = int(
             self.run_scalar(
@@ -960,6 +969,27 @@ DROP TABLE temp_upsert;
             )
             or 0
         )
+        group_source_sample = self.run_rows(
+            f"""
+            SELECT
+                g.id::text,
+                g.lastname,
+                COUNT(DISTINCT u.id)::text
+            FROM users u
+            JOIN groups_users gu ON u.id = gu.user_id
+            JOIN users g ON gu.group_id = g.id
+            WHERE u.status = 1
+            {group_filter}
+            GROUP BY g.id, g.lastname
+            ORDER BY g.id
+            LIMIT 5;
+            """,
+            db_name=db_name,
+        )
+        if group_source_sample:
+            self.logger.info(
+                f"Weekly debug source sample: db={db_name}, sample={group_source_sample}"
+            )
         active_users_count = int(
             self.run_scalar(
                 """
@@ -995,7 +1025,8 @@ DROP TABLE temp_upsert;
             or 0
         )
 
-        group_query = f"""
+        group_result_rows = self.run_rows(
+            f"""
             WITH new_rows AS (
                 SELECT
                     g.id AS group_id,
@@ -1008,27 +1039,34 @@ DROP TABLE temp_upsert;
                 {group_filter}
                 GROUP BY g.id, g.lastname
             )
-            INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
-            SELECT group_id, group_name, CURRENT_DATE, user_count
-            FROM new_rows
-            ON CONFLICT (group_id, snapshot_date)
-            DO UPDATE SET
-                group_name = EXCLUDED.group_name,
-                user_count = EXCLUDED.user_count;
-        """
-        users_query = """
-            INSERT INTO users_active (snapshot_date, user_count)
-            SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
-            FROM users u
-            WHERE u.status = 1
-            ON CONFLICT (snapshot_date)
-            DO UPDATE SET user_count = EXCLUDED.user_count;
-        """
-        group_success = bool(
-            self._run_psql(group_query, db_name=db_name, context_label="weekly:group_upsert")
+            , upserted AS (
+                INSERT INTO group_employee_count (group_id, group_name, snapshot_date, user_count)
+                SELECT group_id, group_name, CURRENT_DATE, user_count
+                FROM new_rows
+                ON CONFLICT (group_id, snapshot_date)
+                DO UPDATE SET
+                    group_name = EXCLUDED.group_name,
+                    user_count = EXCLUDED.user_count
+                RETURNING group_id::text, group_name, snapshot_date::text, user_count::text, (xmax = 0)::text
+            )
+            SELECT * FROM upserted;
+            """,
+            db_name=db_name,
         )
-        users_success = bool(
-            self._run_psql(users_query, db_name=db_name, context_label="weekly:users_upsert")
+        users_result_rows = self.run_rows(
+            """
+            WITH upserted AS (
+                INSERT INTO users_active (snapshot_date, user_count)
+                SELECT CURRENT_DATE, COUNT(DISTINCT u.id)
+                FROM users u
+                WHERE u.status = 1
+                ON CONFLICT (snapshot_date)
+                DO UPDATE SET user_count = EXCLUDED.user_count
+                RETURNING snapshot_date::text, user_count::text, (xmax = 0)::text
+            )
+            SELECT * FROM upserted;
+            """,
+            db_name=db_name,
         )
 
         final_group_rows = int(
@@ -1054,12 +1092,25 @@ DROP TABLE temp_upsert;
             or 0
         )
 
-        group_inserted = max(final_group_rows - existing_group_rows, 0) if group_success else 0
-        group_upserted = group_source_count if group_success else 0
+        group_upserted = len(group_result_rows)
+        group_inserted = sum(1 for row in group_result_rows if len(row) >= 5 and row[4].lower() == "t")
         group_updated = max(group_upserted - group_inserted, 0)
-        users_inserted = max(final_users_row - existing_users_row, 0) if users_success else 0
-        users_upserted = 1 if users_success and active_users_count >= 0 else 0
+        users_upserted = len(users_result_rows)
+        users_inserted = sum(1 for row in users_result_rows if len(row) >= 3 and row[2].lower() == "t")
         users_updated = max(users_upserted - users_inserted, 0)
+        if group_result_rows:
+            self.logger.info(
+                f"Weekly debug upserted groups sample: db={db_name}, sample={group_result_rows[:5]}"
+            )
+        if users_result_rows:
+            self.logger.info(
+                f"Weekly debug upserted users_active rows: db={db_name}, rows={users_result_rows}"
+            )
+        self.logger.info(
+            f"Weekly debug after upsert: db={db_name}, group_rows_before={existing_group_rows}, "
+            f"group_rows_after={final_group_rows}, users_rows_before={existing_users_row}, "
+            f"users_rows_after={final_users_row}"
+        )
 
         return {
             "skipped": False,
