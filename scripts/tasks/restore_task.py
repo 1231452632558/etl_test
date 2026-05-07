@@ -80,6 +80,10 @@ class RestoreTask(BaseTask):
                 seed_results = self.db_ops.seed_manual_tables_if_needed(db_name, self.config.manual_seed_files)
             else:
                 seed_results = {}
+                self.logger.info(
+                    "Seed для group_employee_count/users_active в nightly staging не выполняется; "
+                    "эти таблицы обновляются только weekly-шагом в main БД"
+                )
             self.db_ops.log_pipeline_schema_snapshot(db_name, self.config.issues_table, self.config.projects_table)
             self.db_ops.grant_privileges(db_name)
             

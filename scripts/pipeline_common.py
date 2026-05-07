@@ -429,6 +429,28 @@ class DatabaseOperations:
         """
         return [(row[0], row[1]) for row in self.run_rows(query, db_name=db_name) if len(row) >= 2]
 
+    def ensure_text_columns(self, table_name: str, columns: Sequence[str], db_name: str) -> List[str]:
+        table_name = _validate_identifier(table_name, "table_name")
+        existing_columns = set(self.get_table_columns(table_name, db_name))
+        added_columns: List[str] = []
+        for column in columns:
+            column = _validate_identifier(column, "column")
+            if column in existing_columns:
+                continue
+            alter = (
+                f"ALTER TABLE {_quote_identifier(table_name)} "
+                f"ADD COLUMN IF NOT EXISTS {_quote_identifier(column)} TEXT;"
+            )
+            if self._run_psql(alter, db_name=db_name, ignore_errors=True):
+                added_columns.append(column)
+                existing_columns.add(column)
+        if added_columns:
+            self.logger.info(
+                f"Добавлены недостающие TEXT-колонки перед UPSERT: db={db_name}, "
+                f"table={table_name}, columns={added_columns}"
+            )
+        return added_columns
+
     def table_exists(self, table_name: str, db_name: str) -> bool:
         table_name = _validate_identifier(table_name, "table_name")
         query = f"""
@@ -527,14 +549,22 @@ class DatabaseOperations:
         pk_cols = [_validate_identifier(pk, "primary_key") for pk in pk_cols]
 
         csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file)]
+        missing_cf_columns = [col for col in csv_columns if col.startswith("cf_")]
+        self.ensure_text_columns(table_name, missing_cf_columns, db_name)
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]
+        skipped_columns = [col for col in csv_columns if col not in table_columns]
         if not columns:
             self.logger.error(
                 f"В CSV нет совпадающих колонок для UPSERT: table={table_name}, csv={csv_file}, "
                 f"csv_columns={csv_columns}, table_columns={sorted(table_columns)}"
             )
             return False
+        if skipped_columns:
+            self.logger.warning(
+                f"При UPSERT будут пропущены колонки, которых нет в целевой таблице: "
+                f"db={db_name}, table={table_name}, skipped_columns={skipped_columns}"
+            )
 
         quoted_columns = ", ".join(_quote_identifier(col) for col in columns)
         update_columns = [col for col in columns if col not in pk_cols]

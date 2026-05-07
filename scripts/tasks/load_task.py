@@ -77,10 +77,10 @@ class LoadTask(BaseTask):
                     self.logger.error(error_msg)
                     errors.append(error_msg)
             
-            success = len(errors) == 0 and applied_count > 0
-            
+            success = len(errors) == 0
+
             return self._create_result(
-                    success=success or (applied_count > 0 or not modifications),
+                    success=success,
                     message=f"Применено {applied_count} модификаций",
                 data={
                     'applied_count': applied_count,
