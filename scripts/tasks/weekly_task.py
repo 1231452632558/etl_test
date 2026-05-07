@@ -34,7 +34,7 @@ class WeeklyTask(BaseTask):
         self.logger.info("=== Задача: Еженедельные записи ===")
         
         try:
-            db_name = context.get('db_name')
+            db_name = context.get('main_db') or context.get('db_name')
             target_day = context.get('target_day', 1)
             
             if not db_name:
@@ -50,9 +50,10 @@ class WeeklyTask(BaseTask):
                 current_day = result['current_day']
                 return self._create_result(
                     success=True,
-                    message=f"Пропущено: сегодня день {current_day}, целевой {target_day}",
+                    message=f"Пропущено: db={db_name}, сегодня день {current_day}, целевой {target_day}",
                     data={
                         'skipped': True,
+                        'db_name': db_name,
                         'current_day': current_day,
                         'target_day': target_day
                     },
@@ -62,7 +63,7 @@ class WeeklyTask(BaseTask):
             
             current_day = result['current_day']
             self.logger.info(
-                f"Еженедельные ручные таблицы обработаны для дня {current_day}: "
+                f"Еженедельные ручные таблицы обработаны: db={db_name}, day={current_day}, "
                 f"snapshot_date={result.get('snapshot_date', '')}, "
                 f"group_source_count={result.get('group_source_count', 0)}, "
                 f"group_upserted={result.get('group_upserted', 0)}, "
@@ -83,13 +84,14 @@ class WeeklyTask(BaseTask):
             return self._create_result(
                 success=True,
                 message=(
-                    "Еженедельные записи обработаны: "
+                    f"Еженедельные записи обработаны в db={db_name}: "
                     f"group_upserted={result.get('group_upserted', 0)}, "
                     f"users_upserted={result.get('users_upserted', 0)}, "
                     f"snapshot_date={result.get('snapshot_date', '')}"
                 ),
                 data={
                     'skipped': False,
+                    'db_name': db_name,
                     'current_day': current_day,
                     'target_day': target_day,
                     'snapshot_date': result.get('snapshot_date', ''),
