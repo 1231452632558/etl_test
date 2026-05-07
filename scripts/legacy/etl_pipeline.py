@@ -101,7 +101,7 @@ class ETLPipeline:
             if extract_dir:
                 shutil.rmtree(extract_dir, ignore_errors=True)
 
-    def run_nightly(self, dump_file: str, cleanup: bool = True) -> bool:
+    def run_nightly(self, dump_file: str, cleanup: bool = True, skip_weekly: bool = False) -> bool:
         self.logger.info("=== ЗАПУСК НОЧНОЙ ОБРАБОТКИ ===")
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
@@ -178,13 +178,23 @@ class ETLPipeline:
                     return False
 
             self.db_ops.create_required_tables(main_db)
-            weekly_result = self.db_ops.add_weekly_records(main_db, self.settings.target_day)
-            if weekly_result["skipped"]:
-                self.logger.info(
-                    f"Weekly insert пропущен: сегодня {weekly_result['current_day']}, целевой день {weekly_result['target_day']}"
-                )
+            if skip_weekly:
+                self.logger.info("Weekly insert пропущен по флагу --skip-weekly")
             else:
-                self.logger.info("Weekly insert выполнен с upsert-поведением для ручных таблиц")
+                weekly_result = self.db_ops.add_weekly_records(main_db, self.settings.target_day)
+                if weekly_result["skipped"]:
+                    self.logger.info(
+                        f"Weekly insert пропущен: сегодня {weekly_result['current_day']}, целевой день {weekly_result['target_day']}"
+                    )
+                else:
+                    self.logger.info(
+                        "Weekly insert обработан: "
+                        f"snapshot_date={weekly_result.get('snapshot_date', '')}, "
+                        f"group_upserted={weekly_result.get('group_upserted', 0)}, "
+                        f"group_inserted={weekly_result.get('group_inserted', 0)}, "
+                        f"users_upserted={weekly_result.get('users_upserted', 0)}, "
+                        f"users_inserted={weekly_result.get('users_inserted', 0)}"
+                    )
 
             self.db_ops.grant_privileges(main_db)
             self.logger.info("=== НОЧНАЯ ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО ===")
@@ -193,13 +203,13 @@ class ETLPipeline:
             self._cleanup(temp_db, extract_dir, export_dir, cleanup)
             cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
 
-    def run(self, dump_file: str, init_mode: bool = False, cleanup: bool = True) -> bool:
+    def run(self, dump_file: str, init_mode: bool = False, cleanup: bool = True, skip_weekly: bool = False) -> bool:
         self.logger.info(f"Дата запуска: {datetime.now()}")
         self.logger.info(f"Пользователь запуска: {os.getenv('USER', 'unknown')}")
         self.logger.info(f"Хост: {os.uname().nodename}")
         if init_mode:
             return self.run_init(dump_file)
-        return self.run_nightly(dump_file, cleanup)
+        return self.run_nightly(dump_file, cleanup, skip_weekly=skip_weekly)
 
 
 def main() -> None:
@@ -210,6 +220,7 @@ def main() -> None:
     parser.add_argument("dump_file", help="Путь к .tar.gz или .sql дампу")
     parser.add_argument("--init", action="store_true", help="Первичная инициализация основной БД")
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
+    parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
         "--config",
         default="/workspace/config/etl_config.ini",
@@ -222,7 +233,12 @@ def main() -> None:
         sys.exit(1)
 
     pipeline = ETLPipeline(args.config)
-    success = pipeline.run(args.dump_file, init_mode=args.init, cleanup=args.cleanup)
+    success = pipeline.run(
+        args.dump_file,
+        init_mode=args.init,
+        cleanup=args.cleanup,
+        skip_weekly=args.skip_weekly,
+    )
     sys.exit(0 if success else 1)
 
 

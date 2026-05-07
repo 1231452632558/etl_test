@@ -936,8 +936,34 @@ DROP TABLE temp_upsert;
         if current_day != target_day:
             return {"skipped": True, "current_day": current_day, "target_day": target_day}
 
-        pattern = self.settings.weekly_group_name_pattern.replace("'", "''").strip()
-        group_filter = f"AND g.lastname ILIKE '{pattern}'" if pattern else ""
+        raw_pattern = self.settings.weekly_group_name_pattern.strip()
+        normalized_pattern = raw_pattern.strip("\"'").strip()
+        pattern_sql = normalized_pattern.replace("'", "''")
+        group_filter = f"AND g.lastname ILIKE '{pattern_sql}'" if normalized_pattern else ""
+        snapshot_date = str(today)
+
+        existing_group_rows = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(*)
+                FROM group_employee_count
+                WHERE snapshot_date = CURRENT_DATE;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
+        existing_users_row = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(*)
+                FROM users_active
+                WHERE snapshot_date = CURRENT_DATE;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
 
         group_source_count = int(
             self.run_scalar(
@@ -1018,16 +1044,47 @@ DROP TABLE temp_upsert;
             )
             or 0
         )
+        final_group_rows = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(*)
+                FROM group_employee_count
+                WHERE snapshot_date = CURRENT_DATE;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
+        final_users_row = int(
+            self.run_scalar(
+                """
+                SELECT COUNT(*)
+                FROM users_active
+                WHERE snapshot_date = CURRENT_DATE;
+                """,
+                db_name=db_name,
+            )
+            or 0
+        )
 
         return {
             "skipped": False,
             "current_day": current_day,
             "target_day": target_day,
+            "snapshot_date": snapshot_date,
             "group_source_count": group_source_count,
             "group_upserted": group_upserted,
+            "group_existing_before": existing_group_rows,
+            "group_existing_after": final_group_rows,
+            "group_inserted": max(final_group_rows - existing_group_rows, 0),
+            "group_updated": max(group_upserted - max(final_group_rows - existing_group_rows, 0), 0),
             "users_active_count": active_users_count,
             "users_upserted": users_upserted,
-            "weekly_group_name_pattern": self.settings.weekly_group_name_pattern,
+            "users_existing_before": existing_users_row,
+            "users_existing_after": final_users_row,
+            "users_inserted": 1 if existing_users_row == 0 and users_upserted > 0 else 0,
+            "users_updated": 1 if existing_users_row > 0 and users_upserted > 0 else 0,
+            "weekly_group_name_pattern": normalized_pattern,
         }
 
 

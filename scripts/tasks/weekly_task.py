@@ -63,10 +63,15 @@ class WeeklyTask(BaseTask):
             current_day = result['current_day']
             self.logger.info(
                 f"Еженедельные ручные таблицы обработаны для дня {current_day}: "
+                f"snapshot_date={result.get('snapshot_date', '')}, "
                 f"group_source_count={result.get('group_source_count', 0)}, "
                 f"group_upserted={result.get('group_upserted', 0)}, "
+                f"group_inserted={result.get('group_inserted', 0)}, "
+                f"group_updated={result.get('group_updated', 0)}, "
                 f"users_active_count={result.get('users_active_count', 0)}, "
                 f"users_upserted={result.get('users_upserted', 0)}, "
+                f"users_inserted={result.get('users_inserted', 0)}, "
+                f"users_updated={result.get('users_updated', 0)}, "
                 f"group_name_pattern={result.get('weekly_group_name_pattern', '')}"
             )
             if result.get('group_source_count', 0) == 0:
@@ -80,16 +85,22 @@ class WeeklyTask(BaseTask):
                 message=(
                     "Еженедельные записи обработаны: "
                     f"group_upserted={result.get('group_upserted', 0)}, "
-                    f"users_upserted={result.get('users_upserted', 0)}"
+                    f"users_upserted={result.get('users_upserted', 0)}, "
+                    f"snapshot_date={result.get('snapshot_date', '')}"
                 ),
                 data={
                     'skipped': False,
                     'current_day': current_day,
                     'target_day': target_day,
+                    'snapshot_date': result.get('snapshot_date', ''),
                     'group_source_count': result.get('group_source_count', 0),
                     'group_upserted': result.get('group_upserted', 0),
+                    'group_inserted': result.get('group_inserted', 0),
+                    'group_updated': result.get('group_updated', 0),
                     'users_active_count': result.get('users_active_count', 0),
                     'users_upserted': result.get('users_upserted', 0),
+                    'users_inserted': result.get('users_inserted', 0),
+                    'users_updated': result.get('users_updated', 0),
                     'weekly_group_name_pattern': result.get('weekly_group_name_pattern', ''),
                 },
                 started_at=started_at,

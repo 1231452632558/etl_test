@@ -41,7 +41,13 @@ def build_temp_db_name(settings: PipelineSettings) -> str:
     return f"{settings.temp_db_prefix}{timestamp}"
 
 
-def build_runner(settings: PipelineSettings, logger: ETLLogger, db_ops: DatabaseOperations, init_mode: bool) -> TaskRunner:
+def build_runner(
+    settings: PipelineSettings,
+    logger: ETLLogger,
+    db_ops: DatabaseOperations,
+    init_mode: bool,
+    skip_weekly: bool = False,
+) -> TaskRunner:
     runner = TaskRunner(settings, logger, db_ops)
     runner.add_task(ExtractTask(settings, logger, db_ops))
 
@@ -53,7 +59,8 @@ def build_runner(settings: PipelineSettings, logger: ETLLogger, db_ops: Database
         runner.add_task(TransformCustomValuesTask(settings, logger, db_ops, db_key="temp_db"))
         runner.add_task(CompareTask(settings, logger, db_ops))
         runner.add_task(LoadTask(settings, logger, db_ops))
-        runner.add_task(WeeklyTask(settings, logger, db_ops))
+        if not skip_weekly:
+            runner.add_task(WeeklyTask(settings, logger, db_ops))
 
     runner.add_task(CleanupTask(settings, logger, db_ops))
     return runner
@@ -64,6 +71,7 @@ def main() -> None:
     parser.add_argument("dump_file", help="Путь к .tar.gz или .sql дампу")
     parser.add_argument("--init", action="store_true", help="Первичная инициализация основной БД")
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
+    parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
         "--config",
         default="/workspace/config/etl_config.ini",
@@ -98,7 +106,7 @@ def main() -> None:
         sys.exit(1)
 
     temp_db = None if args.init else build_temp_db_name(settings)
-    runner = build_runner(settings, logger, db_ops, args.init)
+    runner = build_runner(settings, logger, db_ops, args.init, skip_weekly=args.skip_weekly)
     runner.update_context(
         {
             "dump_file": actual_file,
