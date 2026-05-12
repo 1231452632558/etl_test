@@ -5,12 +5,11 @@
 """
 
 import os
-import shutil
-import tarfile
 from datetime import datetime
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any
 
 from .base import BaseTask, TaskResult
+from pipeline_common import extract_dump
 
 
 class ExtractTask(BaseTask):
@@ -51,28 +50,11 @@ class ExtractTask(BaseTask):
                     completed_at=datetime.now()
                 )
             
-            # Создаем директорию для распаковки
-            temp_dir = context.get('temp_dir', '/tmp/pg_etl_temp')
-            extract_dir = os.path.join(
-                temp_dir, 
-                f"extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
-            os.makedirs(extract_dir, exist_ok=True)
-            
-            # Распаковываем архив
-            self.logger.info(f"Распаковка архива: {dump_file}")
-            with tarfile.open(dump_file, 'r:gz') as tar:
-                tar.extractall(path=extract_dir)
-            
-            # Находим все SQL файлы
-            sql_files = []
-            for root, dirs, files in os.walk(extract_dir):
-                for file in files:
-                    if file.endswith('.sql'):
-                        sql_files.append(os.path.join(root, file))
-            
+            temp_dir = context.get('temp_dir', self.config.temp_dir)
+            self.logger.info(f"Подготовка дампа: {dump_file}")
+            extract_dir, sql_files = extract_dump(dump_file, temp_dir, self.logger)
             if not sql_files:
-                self.logger.warning("SQL файлы не найдены в архиве")
+                self.logger.warning("SQL файлы не найдены в дампе")
             
             self.logger.info(f"Архив успешно распакован в {extract_dir}")
             self.logger.info(f"Найдено SQL файлов: {len(sql_files)}")
@@ -84,7 +66,7 @@ class ExtractTask(BaseTask):
             
             return self._create_result(
                 success=True,
-                message=f"Извлечено {len(sql_files)} SQL файлов",
+                message=f"Подготовлено SQL файлов: {len(sql_files)}",
                 data=result_data,
                 started_at=started_at,
                 completed_at=datetime.now()

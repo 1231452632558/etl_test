@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Таск материализации custom_values в колонки таблиц issues и projects.
+Отдельная задача ручной загрузки asterisk_cdr из CSV.
 """
 
 from datetime import datetime
@@ -10,8 +10,8 @@ from typing import Any, Dict
 from .base import BaseTask, TaskResult
 
 
-class TransformCustomValuesTask(BaseTask):
-    """Трансформация custom values в staging или main БД."""
+class SeedAsteriskTask(BaseTask):
+    """Задача загрузки asterisk_cdr в main или staging БД."""
 
     def __init__(self, config, logger, db_ops, db_key: str):
         super().__init__(config, logger, db_ops)
@@ -19,11 +19,11 @@ class TransformCustomValuesTask(BaseTask):
 
     @property
     def name(self) -> str:
-        return "transform_custom_values"
+        return "seed_asterisk"
 
     def execute(self, context: Dict[str, Any]) -> TaskResult:
         started_at = datetime.now()
-        self.logger.info("=== Задача: Трансформация Custom Values ===")
+        self.logger.info("=== Задача: Загрузка asterisk_cdr ===")
 
         try:
             db_name = context.get(self.db_key)
@@ -35,39 +35,32 @@ class TransformCustomValuesTask(BaseTask):
                     completed_at=datetime.now(),
                 )
 
-            result = self.db_ops.transform_custom_values(
+            seeded = self.db_ops.seed_asterisk_cdr_if_needed(db_name)
+            self.db_ops.add_project_id_column(db_name)
+            self.db_ops.log_pipeline_schema_snapshot(
                 db_name,
                 self.config.issues_table,
                 self.config.projects_table,
-            )
-            issues_result = result.get('entities', {}).get('issues', {})
-            projects_result = result.get('entities', {}).get('projects', {})
-            self.logger.info(
-                f"Custom transform завершен: total_fields={result['custom_fields_count']}, "
-                f"issues={issues_result.get('processed_count', 0)}, "
-                f"projects={projects_result.get('processed_count', 0)}, "
-                f"added_columns={len(result['columns_added'])}"
             )
 
             return self._create_result(
                 success=True,
                 message=(
-                    "Трансформация завершена: "
-                    f"issues={issues_result.get('processed_count', 0)}, "
-                    f"projects={projects_result.get('processed_count', 0)}"
+                    f"asterisk_cdr обработана для db={db_name}: "
+                    f"{'seeded' if seeded else 'skipped'}"
                 ),
                 data={
-                    'custom_transform': result,
-                    'db_name': db_name,
+                    "db_name": db_name,
+                    "asterisk_seeded": seeded,
                 },
                 started_at=started_at,
                 completed_at=datetime.now(),
             )
         except Exception as exc:
-            self.logger.error(f"Ошибка при трансформации custom values: {exc}")
+            self.logger.error(f"Ошибка при загрузке asterisk_cdr: {exc}")
             return self._create_result(
                 success=False,
-                message=f"Ошибка трансформации: {exc}",
+                message=f"Ошибка seed asterisk: {exc}",
                 errors=[str(exc)],
                 started_at=started_at,
                 completed_at=datetime.now(),

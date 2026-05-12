@@ -7,16 +7,21 @@
 import os
 from datetime import datetime
 from typing import Dict, Any
+from pathlib import Path
 
 from .base import BaseTask, TaskResult
 
 
 class RestoreTask(BaseTask):
     """Задача восстановления SQL-дампа в базу данных"""
+
+    def __init__(self, config, logger, db_ops, target: str):
+        super().__init__(config, logger, db_ops)
+        self.target = target
     
     @property
     def name(self) -> str:
-        return "restore"
+        return f"restore_{self.target}"
     
     def execute(self, context: Dict[str, Any]) -> TaskResult:
         """
@@ -35,9 +40,8 @@ class RestoreTask(BaseTask):
         self.logger.info("=== Задача: Восстановление дампа ===")
         
         try:
-            db_name = context.get('db_name')
+            db_name = context.get('main_db') if self.target == 'main' else context.get('temp_db')
             sql_files = context.get('sql_files', [])
-            create_tables = context.get('create_tables', False)
             
             if not db_name:
                 return self._create_result(
@@ -47,10 +51,11 @@ class RestoreTask(BaseTask):
                     completed_at=datetime.now()
                 )
             
-            # Создаем базу данных если нужно (для новой БД)
-            if context.get('create_database', False):
+            create_database = self.target == 'temp' or context.get('create_database', False)
+            if create_database:
                 self.logger.info(f"Создание базы данных {db_name}...")
-                if not self.db_ops.create_database(db_name):
+                recreate = self.target == 'temp'
+                if not self.db_ops.create_database(db_name, recreate=recreate):
                     return self._create_result(
                         success=False,
                         message=f"Ошибка создания базы данных {db_name}",
@@ -68,15 +73,16 @@ class RestoreTask(BaseTask):
                         completed_at=datetime.now()
                     )
             
-            # Создаем необходимые таблицы если требуется
-            if create_tables:
-                self.logger.info("Создание необходимых таблиц...")
-                self.db_ops.create_required_tables(db_name)
-                
-                # Добавляем project_id в asterisk_cdr
-                self.db_ops.add_project_id_column(db_name)
-            
-            # Предоставляем права
+            self.db_ops.create_required_tables(db_name)
+            if self.target == 'main':
+                seed_results = self.db_ops.seed_manual_tables_if_needed(db_name, self.config.manual_seed_files)
+            else:
+                seed_results = {}
+                self.logger.info(
+                    "Seed для group_employee_count/users_active в nightly staging не выполняется; "
+                    "эти таблицы обновляются только weekly-шагом в main БД"
+                )
+            self.db_ops.log_pipeline_schema_snapshot(db_name, self.config.issues_table, self.config.projects_table)
             self.db_ops.grant_privileges(db_name)
             
             self.logger.info(f"Восстановление в базу {db_name} завершено успешно")
@@ -84,7 +90,12 @@ class RestoreTask(BaseTask):
             return self._create_result(
                 success=True,
                 message=f"База {db_name} успешно восстановлена",
-                data={'db_name': db_name},
+                data={
+                    'db_name': db_name,
+                    'seed_results': seed_results,
+                    'main_db': db_name if self.target == 'main' else context.get('main_db'),
+                    'temp_db': db_name if self.target == 'temp' else context.get('temp_db'),
+                },
                 started_at=started_at,
                 completed_at=datetime.now()
             )

@@ -1,407 +1,308 @@
-# ETL Pipeline для PostgreSQL (Модульная версия)
+# ETL Pipeline for PostgreSQL
 
-Python-скрипт для обработки nightly SQL-дампов PostgreSQL с инкрементальным обновлением данных.
-**Версия 2.0**: Рефакторинг с модульной архитектурой на основе задач (tasks).
+Python-реализация nightly ETL-процесса для PostgreSQL, которая заменяет текущий `dump_restore.sh`, но не пересоздает рабочую базу каждую ночь.
 
-## Особенности
+В репозитории есть две равноправные версии pipeline:
+- `scripts/legacy/etl_pipeline.py` — монолитная версия
+- `scripts/etl_pipeline.py` — версия, разбитая на tasks
 
-### Архитектура на основе задач (Task-Based)
+Обе версии выполняют один и тот же процесс и используют общий код из `scripts/pipeline_common.py`.
 
-ETL pipeline разделен на независимые модульные задачи:
+## Что делает pipeline
 
-1. **ExtractTask** - Извлечение и подготовка дампа
-2. **RestoreTask** - Восстановление дампа во временную базу
-3. **CompareTask** - Сравнение данных и поиск новых/измененных строк
-4. **TransformCustomValuesTask** - Трансформация custom values в столбцы таблицы issues
-5. **LoadTask** - Загрузка изменений в основную базу
-6. **WeeklyTask** - Еженедельные задачи (добавление агрегированных записей)
-7. **CleanupTask** - Очистка временных ресурсов
+### Цель
 
-### Ключевые возможности
+Входящий дамп менять нельзя: он по-прежнему разворачивается только в новую временную базу.
 
-- **Инкрементальное обновление**: Сохраняет основную базу, добавляет только изменения
-- **Трансформация custom fields**: Автоматическое создание колонок и заполнение данными из custom_values
-- **Умное сравнение**: Находит новые и измененные строки по первичным ключам
-- **Еженедельная агрегация**: Добавление записей в group_employee_count и users_active
-- **Ротация бэкапов**: Хранение последних N бэкапов
-- **Детальное логирование**: Все операции логируются с временными метками
+Поэтому nightly-сценарий такой:
+1. Получить nightly dump.
+2. Развернуть его во временную staging БД.
+3. Выполнить в staging БД трансформацию custom fields.
+4. Выгрузить snapshot нужных таблиц из staging.
+5. Влить snapshot в стабильную main БД через `UPSERT`.
+6. Обновить ручные weekly-таблицы.
+7. Очистить staging БД и временные файлы.
 
-### Что делает новый скрипт:
+Главное отличие от `dump_restore.sh`: основная база больше не удаляется и не создается заново каждую ночь.
 
-#### Первый запуск (--init):
-- Создает основную базу данных
-- Загружает начальный дамп полностью
-- Создает необходимые таблицы и индексы
+## Ключевые особенности
 
-#### Ночная обработка:
-1. Разворачивает новый дамп во временной базе
-2. Сравнивает данные по таблицам из `incremental_tables`
-3. Находит **новые строки** (есть во временной, нет в основной)
-4. Находит **измененные строки** (есть в обеих, но значения отличаются)
-5. **Трансформирует custom values**: 
-   - Для каждой задачи из `issues` находит соответствующие записи в `custom_values`
-   - Получает имена полей из `custom_fields` по `custom_field_id`
-   - Транспонирует строки custom_values в столбцы таблицы issues
-6. Применяет изменения в основную базу через UPSERT
-7. Выполняет еженедельные задачи (если сегодня целевой день)
-8. Удаляет временную базу после завершения
+- Стабильная main БД без nightly `DROP DATABASE`
+- Обязательная staging БД для каждого входящего дампа
+- Одинаковая бизнес-логика в монолите и task-версии
+- Трансформация `custom_values -> issues.cf_*` и `custom_values -> projects.cf_*` до загрузки в main
+- `UPSERT` по snapshot-таблицам
+- Отдельная обработка CSV/manual таблиц `asterisk_cdr`, `group_employee_count` и `users_active`
+- Ротация архивов и подробное логирование
+- Только стандартная библиотека Python и `psql`
 
-## Требования
+## Структура проекта
 
-- **ОС**: Ubuntu 22.04
-- **PostgreSQL**: 14
-- **Python**: 3.x (стандартная библиотека, без внешних зависимостей)
-- **Доступ**: права на выполнение команд от имени пользователя postgres
-
-## Установка
-
-### Структура проекта
-
-```bash
-/workspace/
-├── scripts/
-│   ├── legacy/                   # Старая монолитная версия (для справки)
-│   │   ├── etl_pipeline.py      # Монолитный скрипт (устаревший)
-│   │   └── etl_pipeline_tasks.py # Пустой файл-заглушка
-│   ├── tasks/                    # Модульная версия (текущая)
-│   │   ├── __init__.py          # Инициализация модуля задач
-│   │   ├── base.py              # Базовый класс BaseTask
-│   │   ├── task_runner.py       # Оркестратор задач (TaskRunner)
-│   │   ├── extract_task.py      # Задача извлечения дампа
-│   │   ├── restore_task.py      # Задача восстановления во временную базу
-│   │   ├── compare_task.py      # Задача сравнения данных
-│   │   ├── transform_custom_values_task.py  # Трансформация custom values
-│   │   ├── load_task.py         # Загрузка изменений в основную базу
-│   │   ├── weekly_task.py       # Еженедельные задачи
-│   │   └── cleanup_task.py      # Очистка временных ресурсов
-│   └── etl_pipeline.py          # Основной скрипт-обертка для запуска модульной версии
+```text
+repo/
 ├── config/
-│   └── etl_config.ini           # Конфигурация
-├── logs/                         # Логи (создается автоматически)
-└── dumps/                        # Тестовые дампы (опционально)
+│   └── etl_config.ini
+├── docs/
+│   ├── CODE_ARCHITECTURE.md
+│   ├── OPERATIONS.md
+│   └── TESTING.md
+├── dumps/
+│   ├── test_dump_v1.sql
+│   └── test_dump_v2.sql
+├── scripts/
+│   ├── etl_pipeline.py
+│   ├── pipeline_common.py
+│   ├── legacy/
+│   │   ├── etl_pipeline.py
+│   │   └── etl_pipeline_tasks.py
+│   └── tasks/
+│       ├── __init__.py
+│       ├── base.py
+│       ├── cleanup_task.py
+│       ├── compare_task.py
+│       ├── extract_task.py
+│       ├── load_task.py
+│       ├── restore_task.py
+│       ├── task_runner.py
+│       ├── transform_custom_values_task.py
+│       └── weekly_task.py
+├── dump_restore.sh
+├── INSTALL.md
+└── README.md
 ```
 
-### Шаги установки
+## Архитектура
 
-1. Скопируйте файлы в нужные директории (см. структуру выше)
+### Общий слой
 
-2. Отредактируйте конфигурационный файл `/workspace/config/etl_config.ini`:
+`scripts/pipeline_common.py` содержит:
+- загрузку конфигурации
+- логгер
+- PostgreSQL-операции
+- restore дампа
+- export/import CSV
+- `UPSERT`
+- custom transform
+- seed ручных таблиц
+- weekly-upsert логику
 
-```ini
-[database]
-db_name = ваше_имя_базы
-db_user = ваш_пользователь
-db_host = localhost
-db_port = 5432
-temp_db_prefix = temp_restore_
+Это нужно для того, чтобы монолит и task-версия оставались эквивалентными.
 
-[paths]
-backup_storage_dir = /var/backups/postgres
-temp_dir = /tmp/pg_etl_temp
-log_dir = /workspace/logs
-log_file = /workspace/logs/etl_pipeline.log
+### Монолитная версия
 
-[remote]
-remote_user = пользователь_remote
-remote_host = host.remote.com
-remote_path = /path/to/dumps/
-backup_tar = backup.tar.gz
-backup_sql = backup.sql
+Файл: `scripts/legacy/etl_pipeline.py`
 
-[tables]
-# Таблицы для инкрементального обновления
-incremental_tables = group_employee_count:id,users_active:id,asterisk_cdr:id
+Подходит, если нужен один исполняемый сценарий без orchestration-слоя.
 
-# Таблица для трансформации custom values
-issues_table = issues
+### Task-версия
 
-[retention]
-max_backups = 5
-cleanup_temp_db = true
+Файл: `scripts/etl_pipeline.py`
 
-[schedule]
-target_day = 1  # 1-понедельник, 7-воскресенье
-```
+Подходит, если хочется явную последовательность шагов и независимые задачи:
+- `ExtractTask`
+- `RestoreTask`
+- `TransformCustomValuesTask`
+- `SeedAsteriskTask`
+- `CompareTask`
+- `LoadTask`
+- `WeeklyTask`
+- `CleanupTask`
 
-3. Создайте директорию для логов:
-```bash
-sudo mkdir -p /workspace/logs
-sudo chown $USER:$USER /workspace/logs
-```
+## Как работает nightly run
 
-4. Создайте директорию для бэкапов:
-```bash
-sudo mkdir -p /var/backups/postgres
-sudo chown $USER:$USER /var/backups/postgres
-```
+### Инициализация (`--init`)
 
-## Использование
+Используется один раз:
+1. Создается main БД.
+2. Дамп разворачивается сразу в main.
+3. Создаются служебные таблицы, которых нет в дампе.
+4. Если ручные CSV/manual таблицы пустые, они заполняются из seed CSV.
+5. Выполняется custom transform в main для `issues` и `projects`.
 
-### Запуск модульной версии (рекомендуется)
+### Ежедневный запуск
 
-#### Первый запуск (инициализация)
+Используется каждый день:
+1. Nightly dump разворачивается в новую staging БД.
+2. Во staging создаются служебные таблицы и патчится `asterisk_cdr.project_id`.
+3. Во staging выполняется custom transform для `issues` и `projects`.
+4. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
+5. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
+6. В main БД выполняется weekly-update ручных таблиц.
+7. Staging БД удаляется.
 
-```bash
-python3 /workspace/scripts/etl_pipeline.py --init /path/to/initial_dump.tar.gz
-```
+## Ручные таблицы
 
-Этот режим:
-- Создает основную базу данных
-- Загружает дамп полностью
-- Создает необходимые таблицы и индексы
-- Предоставляет права пользователю
+Речь про:
+- `asterisk_cdr`
+- `group_employee_count`
+- `users_active`
 
-#### Ночная обработка (ежедневный запуск)
+Эти таблицы не приходят во входящем dump и исторически создавались вручную.
 
-```bash
-python3 /workspace/scripts/etl_pipeline.py /path/to/nightly_dump.tar.gz
-```
+Новая логика такая:
+- `asterisk_cdr` может подхватываться из отдельного CSV-файла `asterisk_csv_file`, если таблица в целевой БД пустая
+- на `--init` они создаются, если отсутствуют
+- если они пустые, данные можно подхватить из seed CSV рядом с логами
+- дальше они живут в main БД постоянно
+- nightly pipeline не перезаливает каждый день `group_employee_count` и `users_active`
+- `asterisk_cdr` может подгружаться в staging из CSV, если во входящем dump этой таблицы нет
+- weekly-обновление идет идемпотентно через `ON CONFLICT` только для `group_employee_count` и `users_active`
 
-Или с явной очисткой временной базы:
-```bash
-python3 /workspace/scripts/etl_pipeline.py --cleanup /path/to/nightly_dump.tar.gz
-```
+То есть старые данные из CSV сохраняются как стартовая точка, а дальнейшая жизнь таблиц становится инкрементальной.
 
-Этот режим выполняет последовательность задач:
-1. **ExtractTask**: Копирует дамп с удаленного сервера (если настроено)
-2. **RestoreTask**: 
-   - Выполняет ротацию старых бэкапов
-   - Создает временную базу и разворачивает дамп в ней
-3. **CompareTask**: 
-   - Выгружает текущие данные в CSV (для безопасности)
-   - **Находит новые строки** по каждой таблице из incremental_tables
-   - **Находит измененные строки** сравнивая значения
-4. **TransformCustomValuesTask**:
-   - Получает список custom fields для Issue из таблицы custom_fields
-   - Добавляет новые колонки в таблицу issues (если их нет)
-   - Транспонирует custom_values в столбцы issues
-5. **LoadTask**:
-   - Применяет изменения в основную базу через UPSERT
-   - Загружает обратно сохраненные CSV
-   - Предоставляет права пользователю
-6. **WeeklyTask**: Добавляет еженедельные записи (если сегодня целевой день)
-7. **CleanupTask**: Удаляет временную базу
+## Custom transform
 
-### Запуск монолитной версии (legacy, не рекомендуется)
+Цель шага:
+- взять `issues` и `projects`
+- найти связанные строки в `custom_values`
+- получить названия полей из `custom_fields`
+- материализовать их в отдельные колонки `cf_*`
 
-Старый монолитный скрипт сохранен в директории `scripts/legacy/` для справки или отката:
+Текущая реализация:
+- проверяет наличие таблиц `issues`, `projects`, `custom_values`, `custom_fields`
+- получает все custom fields для `customized_type = 'Issue'` и `customized_type = 'Project'`
+- создает недостающие колонки `cf_*`
+- агрегирует значения по `customized_id`
+- обновляет `issues` и `projects` set-based SQL
 
-```bash
-# Первый запуск
-python3 /workspace/scripts/legacy/etl_pipeline.py --init /path/to/initial_dump.tar.gz
-
-# Ночная обработка
-python3 /workspace/scripts/legacy/etl_pipeline.py /path/to/nightly_dump.tar.gz
-```
-
-**Важно**: Монолитная версия устарела и не поддерживается. Рекомендуется использовать модульную версию.
-
-### Настройка автоматического запуска (cron)
-
-#### Для модульной версии (рекомендуется)
-
-Для ежедневного запуска в 2:00 ночи:
-
-```bash
-crontab -e
-```
-
-Добавьте строку:
-```cron
-0 2 * * * /usr/bin/python3 /workspace/scripts/etl_pipeline.py /path/to/nightly_dump.tar.gz --cleanup >> /workspace/logs/cron.log 2>&1
-```
-
-#### Для монолитной версии (legacy, не рекомендуется)
-
-```cron
-0 2 * * * /usr/bin/python3 /workspace/scripts/legacy/etl_pipeline.py /path/to/nightly_dump.tar.gz --cleanup >> /workspace/logs/cron_legacy.log 2>&1
-```
+Почему это важно:
+- именно `issues` и `projects` в уже преобразованном виде попадают в snapshot и затем в main БД
+- это убирает зависимость от последующего JOIN при аналитике
 
 ## Конфигурация
 
-### Основные параметры
+Основной файл: `config/etl_config.ini`
 
-#### [database]
-- `db_name` - имя основной базы данных
-- `db_user` - пользователь базы данных
-- `db_host` - хост PostgreSQL (по умолчанию localhost)
-- `db_port` - порт PostgreSQL (по умолчанию 5432)
-- `temp_db_prefix` - префикс для временных баз (по умолчанию temp_restore_)
+Ключевые параметры:
+- `[database].db_name` — имя стабильной main БД
+- `[database].temp_db_prefix` — префикс staging БД
+- `[paths].backup_storage_dir` — куда складывать архивы
+- `[paths].temp_dir` — где хранить временные каталоги
+- `[paths].log_file` — основной лог
+- `[paths].asterisk_csv_file` — CSV-файл для ручной загрузки `asterisk_cdr`
+- `[paths].group_employee_count_csv_file` — CSV-файл для начального наполнения `group_employee_count`
+- `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
+- `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
+- `[tables].issues_table` — таблица для custom transform
+- `[tables].projects_table` — таблица `projects` для custom transform
+- `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
+- `[schedule].target_day` — день weekly-обновления
 
-#### [paths]
-- `backup_storage_dir` - директория для хранения бэкапов
-- `temp_dir` - директория для временных файлов
-- `log_file` - путь к файлу лога
+Важно: `issues_table` и `projects_table` автоматически добавляются в snapshot-список, даже если их забыли явно указать.
+Важно: `group_employee_count` и `users_active` не должны попадать в `incremental_tables`, потому что они обновляются отдельным weekly-процессом.
 
-#### [remote]
-- `remote_user` - пользователь удаленного сервера
-- `remote_host` - хост удаленного сервера
-- `remote_path` - путь к дампу на удаленном сервере
-- `backup_tar` - имя файла архива
+## Запуск
 
-#### [tables]
-- `incremental_tables` - таблицы для инкрементального обновления
-  - Формат: `table_name:primary_key`
-  - Пример: `group_employee_count:id,users_active:id,asterisk_cdr:id`
-- `issues_table` - таблица для трансформации custom values (по умолчанию `issues`)
+### Task-версия
 
-#### [retention]
-- `max_backups` - максимальное количество хранимых бэкапов (по умолчанию 5)
-- `cleanup_temp_db` - очищать ли временную базу после завершения (true/false)
-
-#### [schedule]
-- `target_day` - день недели для еженедельных задач (1-понедельник, 7-воскресенье)
-
-## Логирование
-
-Все операции логируются в файл, указанный в конфиге (по умолчанию `/workspace/logs/etl_pipeline.log`).
-
-Лог содержит:
-- Временные метки
-- Уровень сообщения (INFO, WARNING, ERROR)
-- Описание операций
-- Количество найденных новых/измененных строк
-
-Сообщения "already exists" автоматически фильтруются.
-
-## Как работает поиск изменений
-
-### Новые строки
-Находятся через LEFT JOIN:
-```sql
-SELECT t.*
-FROM temp_db.table t
-LEFT JOIN main_db.table m ON t.id = m.id
-WHERE m.id IS NULL
-```
-
-### Измененные строки
-Находятся через INNER JOIN с сравнением полей:
-```sql
-SELECT t.*
-FROM temp_db.table t
-INNER JOIN main_db.table m ON t.id = m.id
-WHERE t.field1 IS DISTINCT FROM m.field1
-   OR t.field2 IS DISTINCT FROM m.field2
-   ...
-```
-
-### Применение изменений (UPSERT)
-```sql
-INSERT INTO main_db.table (columns...)
-SELECT columns FROM temp_import
-ON CONFLICT (id) 
-DO UPDATE SET field1 = EXCLUDED.field1, field2 = EXCLUDED.field2, ...
-```
-
-## Отличия в обработке таблиц
-
-### group_employee_count и users_active
-- Выгружаются в CSV перед обновлением
-- Загружаются обратно после применения изменений
-- В целевой день недели добавляются новые записи с агрегированными данными
-
-### asterisk_cdr
-- Добавляется столбец project_id если отсутствует
-- Устанавливается значение project_id = 3840 для всех записей
-
-### issues (Трансформация custom values)
-- Для каждого custom field типа Issue создается отдельная колонка в таблице issues
-- Имя колонки формируется как `cf_{sanitized_name}` где sanitized_name - имя поля из custom_fields с заменой спецсимволов на подчеркивания
-- Значения берутся из таблицы custom_values где:
-  - `customized_id` = `issues.id`
-  - `customized_type` = 'Issue'
-  - `custom_field_id` соответствует полю в custom_fields
-- Трансформация происходит после загрузки данных во временную базу и перед применением изменений
-
-## Как работает трансформация custom values
-
-### Шаг 1: Получение списка custom fields
-```sql
-SELECT id, name
-FROM custom_fields
-WHERE type = 1  -- Type 1 = Issue custom field
-ORDER BY id;
-```
-
-### Шаг 2: Добавление колонок в issues
-Для каждого custom field создается колонка:
-```sql
-ALTER TABLE issues 
-ADD COLUMN IF NOT EXISTS cf_{field_name} TEXT;
-```
-
-### Шаг 3: Транспонирование и обновление
-Для каждого custom field выполняется UPDATE:
-```sql
-UPDATE issues
-SET cf_{field_name} = cv.value
-FROM custom_values cv
-WHERE cv.customized_id = issues.id
-  AND cv.customized_type = 'Issue'
-  AND cv.custom_field_id = {custom_field_id};
-```
-
-## Решение проблем
-
-### Ошибка доступа к PostgreSQL
-Убедитесь что у пользователя есть права на выполнение команд от имени postgres:
-```bash
-sudo -u postgres psql -c "SELECT 1;"
-```
-
-### Ошибка копирования с remote сервера
-Проверьте SSH ключи:
-```bash
-ssh remote_user@remote_host
-```
-
-### Временная база не удаляется
-Запустите с флагом --cleanup или удалите вручную:
-```bash
-sudo -u postgres psql -c "DROP DATABASE IF EXISTS temp_restore_*;"
-```
-
-### Мало места на диске
-Очистите временные файлы:
-```bash
-rm -rf /tmp/pg_etl_temp/*
-```
-
-## Миграция со старого скрипта
-
-### Вариант 1: Переход на модульную версию (рекомендуется)
-
-1. Сделайте полный бэкап текущей базы:
-```bash
-pg_dump -U postgres db_name > backup_before_migration.sql
-```
-
-2. Запустите новый скрипт в режиме инициализации с последним дампом:
-```bash
-python3 /workspace/scripts/etl_pipeline.py --init latest_dump.tar.gz
-```
-
-3. Проверьте что данные корректно загружены
-
-4. Обновите crontab для использования нового скрипта
-
-5. Оставьте старый скрипт как резервный вариант на первую неделю
-
-### Вариант 2: Использование монолитной версии (legacy)
-
-Если по каким-то причинам требуется использовать старую монолитную версию:
+Инициализация:
 
 ```bash
-# Инициализация
-python3 /workspace/scripts/legacy/etl_pipeline.py --init latest_dump.tar.gz
-
-# Ежедневный запуск
-python3 /workspace/scripts/legacy/etl_pipeline.py nightly_dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --init /path/to/dump.tar.gz
 ```
 
-**Внимание**: Монолитная версия не получает обновлений и может содержать устаревшую логику.
+Nightly run:
 
-## Лицензия
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
+```
 
-Внутренний инструмент компании.
+Запуск отдельных стадий:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
+### Монолитная версия
+
+Инициализация:
+
+```bash
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --init /path/to/dump.tar.gz
+```
+
+Nightly run:
+
+```bash
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
+```
+
+Запуск отдельных стадий:
+
+```bash
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+```
+
+### Стадии и частичный запуск
+
+Обе версии поддерживают одинаковый набор стадий:
+- `extract`
+- `restore`
+- `seed_asterisk`
+- `transform_custom_values`
+- `compare`
+- `load`
+- `weekly`
+- `cleanup`
+
+Полезные флаги:
+- `--tasks` — список стадий через запятую
+- `--db-scope main|temp|auto` — куда применять `restore`, `seed_asterisk`, `transform_custom_values`
+- `--temp-db-name` — имя уже существующей staging БД для частичного запуска без `restore`
+- `--skip-weekly` — исключить weekly из полного nightly-потока
+
+Практические правила:
+- `restore` автоматически подтягивает `extract`, если вы его не указали
+- `load` автоматически подтягивает `compare`, если вы его не указали
+- для `compare` и `load` нужен `temp` scope
+- для `transform_custom_values`, `weekly` и `seed_asterisk` dump не обязателен
+
+## Как выбрать между версиями
+
+- Берите `scripts/etl_pipeline.py`, если нужна явная task-структура и удобство дальнейшего расширения.
+- Берите `scripts/legacy/etl_pipeline.py`, если удобнее поддерживать один большой исполняемый сценарий.
+
+С точки зрения nightly-логики они должны вести себя одинаково.
+
+## Ограничения и допущения
+
+- Входящий dump по-прежнему не меняется и всегда восстанавливается только в новую БД.
+- Snapshot-режим означает, что для таблиц из `incremental_tables` в main БД подтягивается текущее состояние строк из staging.
+- Удаления строк из dump сейчас не синхронизируются автоматически.
+- Производительность custom transform зависит от объема `custom_values` и индексов в исходной базе.
+
+## Что проверить перед prod rollout
+
+1. Корректность `incremental_tables` в конфиге.
+2. Наличие доступа `sudo -u postgres psql`.
+3. Что seed CSV для `asterisk_cdr`, `group_employee_count` и `users_active` лежат там, где ожидается логикой.
+4. Что weekly `ON CONFLICT` соответствует нужной бизнес-логике.
+
+## Документы
+
+- Общая схема: `README.md`
+- Установка и запуск: `INSTALL.md`
+- Эксплуатация: `docs/OPERATIONS.md`
+- Методика тестирования: `docs/TESTING.md`
+- Миграция с shell-скрипта: `MIGRATION.md`
+- Подробная документация по коду: `docs/CODE_ARCHITECTURE.md`
+5. Что индексы на `custom_values` в исходной схеме действительно существуют и достаточны.
+
+## Дополнительные документы
+
+- Установка и окружение: `INSTALL.md`
+- Пошаговая миграция с `dump_restore.sh`: `MIGRATION.md`
+- Операционный процесс и runbook: `docs/OPERATIONS.md`
+- Методика тестирования на ВМ: `docs/TESTING.md`
+
+## Статус
+
+`dump_restore.sh` остается в репозитории как описание текущего prod-процесса и точка сравнения.
+
+Python-версии ориентированы на замену этого сценария новым инкрементальным nightly-flow.

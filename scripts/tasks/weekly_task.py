@@ -5,7 +5,7 @@
 Добавляет строки в group_employee_count и users_active
 """
 
-from datetime import datetime, date
+from datetime import datetime
 from typing import Dict, Any
 
 from .base import BaseTask, TaskResult
@@ -34,7 +34,7 @@ class WeeklyTask(BaseTask):
         self.logger.info("=== Задача: Еженедельные записи ===")
         
         try:
-            db_name = context.get('db_name')
+            db_name = context.get('main_db') or context.get('db_name')
             target_day = context.get('target_day', 1)
             
             if not db_name:
@@ -45,20 +45,15 @@ class WeeklyTask(BaseTask):
                     completed_at=datetime.now()
                 )
             
-            # Проверяем текущий день недели
-            today = date.today()
-            current_day = today.isocalendar()[2]  # 1-7 (понедельник-воскресенье)
-            
-            if current_day != target_day:
-                self.logger.info(
-                    f"Сегодня не целевой день ({current_day} != {target_day}), "
-                    f"пропускаем добавление недельных записей"
-                )
+            result = self.db_ops.add_weekly_records(db_name, target_day)
+            if result['skipped']:
+                current_day = result['current_day']
                 return self._create_result(
                     success=True,
-                    message=f"Пропущено: сегодня день {current_day}, целевой {target_day}",
+                    message=f"Пропущено: db={db_name}, сегодня день {current_day}, целевой {target_day}",
                     data={
                         'skipped': True,
+                        'db_name': db_name,
                         'current_day': current_day,
                         'target_day': target_day
                     },
@@ -66,60 +61,78 @@ class WeeklyTask(BaseTask):
                     completed_at=datetime.now()
                 )
             
-            self.logger.info(f"Еженедельный день ({target_day}). Добавление строк...")
-            
-            # Добавляем запись в group_employee_count
-            command = """
-            WITH max_id AS (
-                SELECT COALESCE(MAX(id), 0) AS val FROM group_employee_count
-            ),
-            new_rows AS (
-                SELECT
-                    m.val + ROW_NUMBER() OVER() AS new_id,
-                    g.id as gid, 
-                    g.lastname as gname, 
-                    COUNT(DISTINCT u.id) as u_count
-                FROM users u, max_id m
-                JOIN groups_users gu ON u.id = gu.user_id
-                JOIN users g ON gu.group_id = g.id
-                WHERE u.status = 1 and g.lastname ILIKE 'masked'
-                GROUP BY gid, gname
+            current_day = result['current_day']
+            group_failures = result.get('group_failures', [])
+            users_failures = result.get('users_failures', [])
+            self.logger.info(
+                f"Еженедельные ручные таблицы обработаны: db={db_name}, day={current_day}, "
+                f"snapshot_date={result.get('snapshot_date', '')}, "
+                f"group_source_count={result.get('group_source_count', 0)}, "
+                f"group_upserted={result.get('group_upserted', 0)}, "
+                f"group_inserted={result.get('group_inserted', 0)}, "
+                f"group_updated={result.get('group_updated', 0)}, "
+                f"users_active_count={result.get('users_active_count', 0)}, "
+                f"users_upserted={result.get('users_upserted', 0)}, "
+                f"users_inserted={result.get('users_inserted', 0)}, "
+                f"users_updated={result.get('users_updated', 0)}, "
+                f"group_name_pattern={result.get('weekly_group_name_pattern', '')}"
             )
-            INSERT INTO group_employee_count (id, group_id, group_name, snapshot_date, user_count)
-            SELECT new_id, gid, gname, CURRENT_DATE, u_count
-            FROM new_rows
-            WHERE NOT EXISTS (
-                SELECT 1 FROM group_employee_count gec 
-                WHERE gec.group_id = new_rows.gid 
-                AND gec.snapshot_date = CURRENT_DATE
-            );
-            """
-            
-            self.db_ops._run_psql(command, db_name=db_name, ignore_errors=True)
-            self.logger.info("Добавлена запись в group_employee_count")
-            
-            # Добавляем запись в users_active
-            command = """
-            INSERT INTO users_active (snapshot_date, user_count) 
-            SELECT CURRENT_DATE, COUNT(DISTINCT u.id) 
-            FROM users u 
-            WHERE u.status = 1
-            AND NOT EXISTS (
-                SELECT 1 FROM users_active ua 
-                WHERE ua.snapshot_date = CURRENT_DATE
-            );
-            """
-            
-            self.db_ops._run_psql(command, db_name=db_name, ignore_errors=True)
-            self.logger.info("Добавлена запись в users_active")
+            if result.get('group_source_count', 0) == 0:
+                self.logger.warning(
+                    "Еженедельный источник для group_employee_count вернул 0 групп; "
+                    "проверьте weekly_group_name_pattern и данные users/groups_users"
+                )
+            if group_failures or users_failures:
+                return self._create_result(
+                    success=False,
+                    message=(
+                        f"Weekly завершился с ошибками: "
+                        f"group_failures={len(group_failures)}, users_failures={len(users_failures)}"
+                    ),
+                    data={
+                        'skipped': False,
+                        'db_name': db_name,
+                        'current_day': current_day,
+                        'target_day': target_day,
+                        'snapshot_date': result.get('snapshot_date', ''),
+                        'group_source_count': result.get('group_source_count', 0),
+                        'group_upserted': result.get('group_upserted', 0),
+                        'group_inserted': result.get('group_inserted', 0),
+                        'group_updated': result.get('group_updated', 0),
+                        'users_active_count': result.get('users_active_count', 0),
+                        'users_upserted': result.get('users_upserted', 0),
+                        'users_inserted': result.get('users_inserted', 0),
+                        'users_updated': result.get('users_updated', 0),
+                        'weekly_group_name_pattern': result.get('weekly_group_name_pattern', ''),
+                    },
+                    errors=group_failures + users_failures,
+                    started_at=started_at,
+                    completed_at=datetime.now()
+                )
             
             return self._create_result(
                 success=True,
-                message="Еженедельные записи добавлены успешно",
+                message=(
+                    f"Еженедельные записи обработаны в db={db_name}: "
+                    f"group_upserted={result.get('group_upserted', 0)}, "
+                    f"users_upserted={result.get('users_upserted', 0)}, "
+                    f"snapshot_date={result.get('snapshot_date', '')}"
+                ),
                 data={
                     'skipped': False,
+                    'db_name': db_name,
                     'current_day': current_day,
-                    'target_day': target_day
+                    'target_day': target_day,
+                    'snapshot_date': result.get('snapshot_date', ''),
+                    'group_source_count': result.get('group_source_count', 0),
+                    'group_upserted': result.get('group_upserted', 0),
+                    'group_inserted': result.get('group_inserted', 0),
+                    'group_updated': result.get('group_updated', 0),
+                    'users_active_count': result.get('users_active_count', 0),
+                    'users_upserted': result.get('users_upserted', 0),
+                    'users_inserted': result.get('users_inserted', 0),
+                    'users_updated': result.get('users_updated', 0),
+                    'weekly_group_name_pattern': result.get('weekly_group_name_pattern', ''),
                 },
                 started_at=started_at,
                 completed_at=datetime.now()

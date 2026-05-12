@@ -38,6 +38,7 @@ class CleanupTask(BaseTask):
         try:
             temp_db = context.get('temp_db')
             extract_dir = context.get('extract_dir')
+            export_dir = context.get('export_dir')
             cleanup_temp_db = context.get('cleanup_temp_db', True)
             
             cleaned_items = []
@@ -52,16 +53,18 @@ class CleanupTask(BaseTask):
                 else:
                     warnings.append(f"Не удалось удалить базу {temp_db}")
             
-            # Очищаем директорию распаковки
-            if extract_dir:
-                self.logger.info(f"Удаление директории {extract_dir}...")
+            # Очищаем временные директории
+            for directory in (extract_dir, export_dir):
+                if not directory:
+                    continue
+                self.logger.info(f"Удаление директории {directory}...")
                 try:
-                    shutil.rmtree(extract_dir)
-                    cleaned_items.append(f"directory:{extract_dir}")
-                    self.logger.info(f"Директория {extract_dir} удалена")
+                    shutil.rmtree(directory)
+                    cleaned_items.append(f"directory:{directory}")
+                    self.logger.info(f"Директория {directory} удалена")
                 except Exception as e:
                     warnings.append(f"Ошибка удаления директории: {str(e)}")
-                    self.logger.warning(f"Ошибка удаления {extract_dir}: {e}")
+                    self.logger.warning(f"Ошибка удаления {directory}: {e}")
             
             return self._create_result(
                 success=True,

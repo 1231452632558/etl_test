@@ -33,10 +33,11 @@ class TaskResult:
 class BaseTask(ABC):
     """Базовый класс для всех задач ETL"""
     
-    def __init__(self, config, logger, db_ops):
+    def __init__(self, config, logger, db_ops, task_label: Optional[str] = None):
         self.config = config
         self.logger = logger
         self.db_ops = db_ops
+        self.task_label = task_label or self.__class__.__name__
     
     @property
     @abstractmethod
@@ -59,7 +60,9 @@ class BaseTask(ABC):
     
     def _create_result(self, success: bool, message: str = "", 
                        data: Any = None, errors: List[str] = None,
-                       warnings: List[str] = None) -> TaskResult:
+                       warnings: List[str] = None,
+                       started_at: Optional[datetime] = None,
+                       completed_at: Optional[datetime] = None) -> TaskResult:
         """Создание результата выполнения задачи"""
         return TaskResult(
             success=success,
@@ -67,5 +70,7 @@ class BaseTask(ABC):
             message=message,
             data=data,
             errors=errors or [],
-            warnings=warnings or []
+            warnings=warnings or [],
+            started_at=started_at,
+            completed_at=completed_at
         )

@@ -7,6 +7,7 @@ ETL Pipeline Tasks - Модульная система задач
 from .base import BaseTask, TaskResult
 from .extract_task import ExtractTask
 from .restore_task import RestoreTask
+from .seed_asterisk_task import SeedAsteriskTask
 from .compare_task import CompareTask
 from .load_task import LoadTask
 from .transform_custom_values_task import TransformCustomValuesTask
@@ -19,6 +20,7 @@ __all__ = [
     'TaskResult',
     'ExtractTask',
     'RestoreTask',
+    'SeedAsteriskTask',
     'CompareTask',
     'LoadTask',
     'TransformCustomValuesTask',
