@@ -238,7 +238,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
 4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
-6. На тестовом прогоне нужно вручную сравнить `issues`, `projects` и их `cf_*` колонки после custom transform.
+6. Если ручной custom transform используется, его нужно тестировать отдельной командой; обычный init/nightly его не выполняет.
 
 ## 11. Диагностика
 
@@ -261,6 +261,12 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 ```
 
 ### Проверка custom transform
+
+Custom transform отключён в стандартном init/nightly-потоке. Перед проверкой запустите его явно:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+```
 
 ```bash
 sudo -u postgres psql -d your_main_db -c "\d issues"
@@ -298,6 +304,8 @@ sudo -u postgres psql -c "SELECT 1;"
 ```
 
 ### Не создаются `cf_*` колонки
+
+В стандартном запуске это ожидаемое поведение: custom transform отключён. Для ручного запуска используйте `--tasks transform_custom_values`.
 
 Проверьте наличие:
 - `issues`

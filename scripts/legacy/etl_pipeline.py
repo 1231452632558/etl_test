@@ -69,7 +69,7 @@ def parse_stage_selection(raw_value: str | None) -> list[str]:
 
 
 def default_stages(init_mode: bool, skip_weekly: bool) -> list[str]:
-    stages = ["extract", "restore", "seed_asterisk", "transform_custom_values"]
+    stages = ["extract", "restore", "seed_asterisk"]
     if not init_mode:
         stages.extend(["compare", "load"])
         if not skip_weekly:
@@ -162,7 +162,6 @@ class ETLPipeline:
             self.db_ops.create_required_tables(main_db)
             self.db_ops.seed_manual_tables_if_needed(main_db, self.settings.manual_seed_files)
             self._seed_asterisk(main_db)
-            self._transform_custom_values(main_db, "в main")
 
             self.db_ops.grant_privileges(main_db)
             self.logger.info("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА УСПЕШНО ===")
@@ -211,7 +210,6 @@ class ETLPipeline:
 
             self.db_ops.create_required_tables(temp_db)
             self._seed_asterisk(temp_db)
-            self._transform_custom_values(temp_db, "в staging")
 
             modifications = build_snapshot_exports(
                 self.db_ops,

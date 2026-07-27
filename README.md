@@ -17,11 +17,10 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 Поэтому nightly-сценарий такой:
 1. Получить nightly dump.
 2. Развернуть его во временную staging БД.
-3. Выполнить в staging БД трансформацию custom fields.
-4. Выгрузить snapshot нужных таблиц из staging.
-5. Влить snapshot в стабильную main БД через `UPSERT`.
-6. Обновить ручные weekly-таблицы.
-7. Очистить staging БД и временные файлы.
+3. Выгрузить snapshot нужных таблиц из staging.
+4. Влить snapshot в стабильную main БД через `UPSERT`.
+5. Обновить ручные weekly-таблицы.
+6. Очистить staging БД и временные файлы.
 
 Главное отличие от `dump_restore.sh`: основная база больше не удаляется и не создается заново каждую ночь.
 
@@ -30,7 +29,7 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 - Стабильная main БД без nightly `DROP DATABASE`
 - Обязательная staging БД для каждого входящего дампа
 - Одинаковая бизнес-логика в монолите и task-версии
-- Трансформация `custom_values -> issues.cf_*` и `custom_values -> projects.cf_*` до загрузки в main
+- Опциональная ручная трансформация `custom_values -> issues.cf_*` и `custom_values -> projects.cf_*`
 - `UPSERT` по snapshot-таблицам
 - Отдельная обработка CSV/manual таблиц `asterisk_cdr`, `group_employee_count` и `users_active`
 - Ротация архивов и подробное логирование
@@ -117,18 +116,17 @@ repo/
 2. Дамп разворачивается сразу в main.
 3. Создаются служебные таблицы, которых нет в дампе.
 4. Если ручные CSV/manual таблицы пустые, они заполняются из seed CSV.
-5. Выполняется custom transform в main для `issues` и `projects`.
+5. Custom transform автоматически не выполняется.
 
 ### Ежедневный запуск
 
 Используется каждый день:
 1. Nightly dump разворачивается в новую staging БД.
 2. Во staging создаются служебные таблицы и патчится `asterisk_cdr.project_id`.
-3. Во staging выполняется custom transform для `issues` и `projects`.
-4. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
-5. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
-6. В main БД выполняется weekly-update ручных таблиц.
-7. Staging БД удаляется.
+3. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
+4. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
+5. В main БД выполняется weekly-update ручных таблиц.
+6. Staging БД удаляется.
 
 ## Ручные таблицы
 
@@ -152,6 +150,14 @@ repo/
 
 ## Custom transform
 
+Custom transform отключён в дефолтных `--init` и nightly-запусках. Он выполняется только при явном указании стадии:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+```
+
+Существующие `cf_*`-колонки не удаляются, но обычный запуск pipeline их не пересчитывает и не актуализирует.
+
 Цель шага:
 - взять `issues` и `projects`
 - найти связанные строки в `custom_values`
@@ -166,8 +172,8 @@ repo/
 - обновляет `issues` и `projects` set-based SQL
 
 Почему это важно:
-- именно `issues` и `projects` в уже преобразованном виде попадают в snapshot и затем в main БД
-- это убирает зависимость от последующего JOIN при аналитике
+- стадия сохранена для контролируемого ручного применения
+- её результат попадёт в snapshot только если transform явно выполнен в staging перед `compare/load`
 
 ## Конфигурация
 
@@ -275,7 +281,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 - Входящий dump по-прежнему не меняется и всегда восстанавливается только в новую БД.
 - Snapshot-режим означает, что для таблиц из `incremental_tables` в main БД подтягивается текущее состояние строк из staging.
 - Удаления строк из dump сейчас не синхронизируются автоматически.
-- Производительность custom transform зависит от объема `custom_values` и индексов в исходной базе.
+- Производительность ручного custom transform зависит от объема `custom_values` и индексов в исходной базе.
 
 ## Что проверить перед prod rollout
 

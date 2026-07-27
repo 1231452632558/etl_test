@@ -14,7 +14,7 @@
 Это значит, что:
 - SQL-логика
 - restore
-- custom transform
+- опциональный ручной custom transform
 - snapshot export/import
 - weekly-логика
 - seed ручных таблиц
@@ -128,6 +128,8 @@ cleanup
 Назначение:
 - материализовать `custom_values` в `issues.cf_*` и `projects.cf_*`
 
+Стадия отключена в дефолтных планах init/nightly и добавляется только через явный `--tasks transform_custom_values`.
+
 Работает:
 - по `main_db`
 - или по `temp_db`
@@ -195,6 +197,7 @@ Task-версия передаёт между шагами словарь `conte
 
 Практический смысл:
 - если стадия запускается отдельно, нужные ей ключи должны уже существовать или задаваться через CLI-режим
+- отсутствие `transform_custom_values` в стандартном плане является ожидаемым поведением
 
 Пример:
 - `transform_custom_values --db-scope main` не требует dump
@@ -248,6 +251,8 @@ python3 scripts/etl_pipeline.py \
 CLI автоматически дополняет план:
 - `restore` -> добавляет `extract`, если его нет
 - `load` -> добавляет `compare`, если его нет
+
+`transform_custom_values` автоматически не добавляется ни одной зависимостью.
 
 Это сделано только для удобства запуска.
 

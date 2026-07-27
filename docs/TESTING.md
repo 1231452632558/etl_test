@@ -6,7 +6,7 @@
 - убедиться, что main БД больше не пересоздается nightly
 - проверить restore в staging БД
 - проверить загрузку `asterisk_cdr` из CSV при необходимости
-- проверить custom transform
+- проверить, что custom transform не запускается автоматически
 - проверить `UPSERT` snapshot-таблиц
 - проверить weekly/manual таблицы
 - проверить очистку staging БД
@@ -156,7 +156,15 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM users_active;"
 - `group_employee_count` и `users_active` существуют как таблицы даже если соответствующие CSV не найдены
 - `group_employee_count` и `users_active` могут остаться пустыми, если seed CSV отсутствуют
 
-## 8. Тест 3. Проверка custom transform после init
+## 8. Тест 3. Проверка отключения custom transform
+
+После обычного `--init` в логе не должно быть задачи `transform_custom_values`, а pipeline не должен автоматически добавлять или пересчитывать `cf_*`.
+
+Если нужно отдельно проверить сохранённую ручную стадию, сначала выполните:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+```
 
 Если dump содержит `issues/projects/custom_values/custom_fields`, проверьте:
 
@@ -167,7 +175,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHE
 sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHERE customized_type = 'Project';"
 ```
 
-Проверить вручную:
+После ручного запуска проверить:
 1. В `issues` появились колонки `cf_*`.
 2. В `projects` появились колонки `cf_*`, если в dump есть project custom values.
 3. Значения в `cf_*` не пустые там, где есть данные в `custom_values`.
@@ -269,8 +277,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
 4. Сравнить:
    - набор таблиц
    - row count в snapshot-таблицах
-   - `cf_*` колонки в `issues`
-   - `cf_*` колонки в `projects`
+   - отсутствие автоматического запуска transform в обоих вариантах
+   - `cf_*` колонки только после отдельного ручного transform
    - `group_employee_count`
    - `users_active`
 
@@ -294,7 +302,7 @@ tail -f /workspace/logs/etl_pipeline.log
 Ищите:
 - создание staging БД
 - restore dump
-- custom transform
+- отсутствие custom transform в стандартном плане стадий
 - snapshot export
 - upsert в main
 - weekly update
@@ -329,7 +337,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. `issues` и `projects` получают `cf_*` колонки и значения.
+3. Стандартный init/nightly не запускает custom transform; ручной запуск работает отдельно.
 4. `asterisk_cdr` присутствует после прогона.
 5. `group_employee_count` и `users_active` не теряют историю.
 6. Нет дублей в weekly-таблицах.

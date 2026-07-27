@@ -16,7 +16,6 @@
 
 на процесс:
 - restore dump во временную staging БД
-- custom transform в staging
 - `UPSERT` snapshot-таблиц в стабильную main БД
 - weekly-обновление ручных таблиц
 
@@ -30,7 +29,7 @@
 ## Что меняется
 
 - Main БД становится долгоживущей
-- `issues` и `projects` загружаются в main уже после materialized custom transform
+- `issues` и `projects` загружаются в main без автоматической материализации custom values
 - `asterisk_cdr` и другие snapshot-таблицы вливаются через `UPSERT`
 - `group_employee_count` и `users_active` больше не живут через nightly export/import
 
@@ -140,8 +139,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 ```
 
 Что проверить:
-- `issues` содержит `cf_*`
-- `projects` содержит `cf_*`
+- `issues` и `projects` обновились через snapshot-поток
 - `asterisk_cdr` загружена корректно
 - `group_employee_count` и `users_active` не потеряли исторические данные
 - staging БД очищается после завершения
@@ -175,9 +173,8 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 Что произойдет:
 1. dump поднимется во staging
 2. `asterisk_cdr` при необходимости догрузится из CSV
-3. custom transform выполнится в staging для `issues` и `projects`
-4. snapshot-таблицы будут влиты в main через `UPSERT`
-5. weekly-таблицы обновятся отдельным шагом
+3. snapshot-таблицы будут влиты в main через `UPSERT`
+4. weekly-таблицы обновятся отдельным шагом
 
 ### Вариант B. Нужна новая инициализация новой main БД
 
@@ -204,10 +201,9 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 ```
 
 Дополнительно:
-1. Визуально проверить несколько `issues` и `projects` с custom fields.
-2. Проверить, что `cf_*` колонки заполнились.
-3. Проверить, что `project_id` в `asterisk_cdr` задан.
-4. Проверить, что weekly-таблицы не задублировались.
+1. Визуально проверить несколько `issues` и `projects`.
+2. Проверить, что `project_id` в `asterisk_cdr` задан.
+3. Проверить, что weekly-таблицы не задублировались.
 
 ## Этап 8. Переключение cron
 
@@ -228,9 +224,8 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 В первые 3-7 дней отслеживайте:
 1. Ошибки в `etl_pipeline.log`
 2. Появление неожиданных staging БД
-3. Наполнение `cf_*` колонок
-4. Корректность `asterisk_cdr`
-5. Дубли в weekly-таблицах
+3. Корректность `asterisk_cdr`
+4. Дубли в weekly-таблицах
 
 Для диагностики после переключения можно запускать отдельные стадии:
 
@@ -271,7 +266,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues.cf_*` и `projects.cf_*` появились и заполнены
+- `issues` и `projects` обновлены; custom transform не запускался автоматически
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

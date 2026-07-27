@@ -83,7 +83,7 @@ def parse_stage_selection(raw_value: str | None, init_mode: bool) -> list[str]:
 
 
 def default_stages(init_mode: bool, skip_weekly: bool) -> list[str]:
-    stages = ["extract", "restore", "seed_asterisk", "transform_custom_values"]
+    stages = ["extract", "restore", "seed_asterisk"]
     if not init_mode:
         stages.extend(["compare", "load"])
         if not skip_weekly:
