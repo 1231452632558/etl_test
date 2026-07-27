@@ -536,28 +536,6 @@ class DatabaseOperations:
         )
         return True
 
-    def ensure_text_columns(self, table_name: str, columns: Sequence[str], db_name: str) -> List[str]:
-        table_name = _validate_identifier(table_name, "table_name")
-        existing_columns = set(self.get_table_columns(table_name, db_name))
-        added_columns: List[str] = []
-        for column in columns:
-            column = _validate_identifier(column, "column")
-            if column in existing_columns:
-                continue
-            alter = (
-                f"ALTER TABLE {_quote_identifier(table_name)} "
-                f"ADD COLUMN IF NOT EXISTS {_quote_identifier(column)} TEXT;"
-            )
-            if self._run_psql(alter, db_name=db_name, ignore_errors=True):
-                added_columns.append(column)
-                existing_columns.add(column)
-        if added_columns:
-            self.logger.info(
-                f"Добавлены недостающие TEXT-колонки перед UPSERT: db={db_name}, "
-                f"table={table_name}, columns={added_columns}"
-            )
-        return added_columns
-
     def table_exists(self, table_name: str, db_name: str) -> bool:
         table_name = _validate_identifier(table_name, "table_name")
         query = f"""
@@ -643,7 +621,27 @@ class DatabaseOperations:
 
     def export_table_to_csv(self, table_name: str, csv_file: str, db_name: str) -> int:
         table_name = _validate_identifier(table_name, "table_name")
-        query = f"SELECT * FROM {_quote_identifier(table_name)}"
+        columns = self.get_table_columns(table_name, db_name)
+        protected_tables = {self.settings.issues_table, self.settings.projects_table}
+        blocked_columns = [
+            column
+            for column in columns
+            if table_name in protected_tables and column.startswith("cf_")
+        ]
+        export_columns = [column for column in columns if column not in blocked_columns]
+        if not export_columns:
+            self.logger.error(
+                f"Экспорт невозможен: после исключения cf_* не осталось колонок, "
+                f"db={db_name}, table={table_name}"
+            )
+            return 0
+        if blocked_columns:
+            self.logger.info(
+                f"Custom value columns исключены из snapshot: db={db_name}, "
+                f"table={table_name}, columns={blocked_columns}"
+            )
+        quoted_columns = ", ".join(_quote_identifier(column) for column in export_columns)
+        query = f"SELECT {quoted_columns} FROM {_quote_identifier(table_name)}"
         return self.export_query_to_csv(query, csv_file, db_name)
 
     def upsert_from_csv(self, table_name: str, primary_key: Sequence[str] | str, csv_file: str, db_name: str) -> bool:
@@ -656,8 +654,18 @@ class DatabaseOperations:
         pk_cols = [_validate_identifier(pk, "primary_key") for pk in pk_cols]
 
         csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file)]
-        missing_cf_columns = [col for col in csv_columns if col.startswith("cf_")]
-        self.ensure_text_columns(table_name, missing_cf_columns, db_name)
+        protected_tables = {self.settings.issues_table, self.settings.projects_table}
+        blocked_columns = [
+            column
+            for column in csv_columns
+            if table_name in protected_tables and column.startswith("cf_")
+        ]
+        if blocked_columns:
+            self.logger.error(
+                f"UPSERT остановлен: snapshot для {table_name} содержит запрещенные "
+                f"custom value columns: {blocked_columns}"
+            )
+            return False
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]
         skipped_columns = [col for col in csv_columns if col not in table_columns]
@@ -871,170 +879,6 @@ DROP TABLE temp_upsert;
             ORDER BY indexname;
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
-
-    def _sanitize_custom_column_name(self, name: str, field_id: str, used_names: set[str]) -> str:
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-        sanitized = re.sub(r"_+", "_", sanitized).strip("_").lower()
-        generic_names = {"field", "custom_field", "customfield", "custom_value", "customvalue", "value"}
-        if not sanitized or sanitized in generic_names:
-            base = f"cf_{field_id}"
-        else:
-            base = f"cf_{sanitized[:45]}"
-        candidate = base
-        if candidate in used_names:
-            candidate = f"{base}_{field_id}"
-        used_names.add(candidate)
-        return candidate
-
-    def _transform_custom_values_for_entity(
-        self,
-        db_name: str,
-        target_table: str,
-        customized_type: str,
-        entity_label: str,
-    ) -> Dict[str, object]:
-        target_table = _validate_identifier(target_table, f"{entity_label}_table")
-        required_tables = [target_table, "custom_values", "custom_fields"]
-        if not all(self.table_exists(table_name, db_name) for table_name in required_tables):
-            self.logger.info(
-                f"Таблицы для custom transform отсутствуют, шаг пропущен: db={db_name}, "
-                f"entity={entity_label}, table={target_table}"
-            )
-            return {
-                "processed_count": 0,
-                "custom_fields_count": 0,
-                "columns_added": [],
-                "index_count": 0,
-                "entity": entity_label,
-                "target_table": target_table,
-            }
-
-        custom_fields = self.run_rows(
-            f"""
-            SELECT DISTINCT cf.id, cf.name
-            FROM custom_fields cf
-            JOIN custom_values cv
-              ON cv.custom_field_id = cf.id
-            WHERE cv.customized_type = '{customized_type}'
-            ORDER BY cf.id;
-            """,
-            db_name=db_name,
-        )
-        if not custom_fields:
-            self.logger.warning(
-                f"Custom transform: не найдены custom fields через custom_values, db={db_name}, "
-                f"entity={entity_label}, customized_type={customized_type}"
-            )
-            return {
-                "processed_count": 0,
-                "custom_fields_count": 0,
-                "columns_added": [],
-                "index_count": len(self.list_indexes("custom_values", db_name)),
-                "entity": entity_label,
-                "target_table": target_table,
-            }
-
-        existing_columns = set(self.get_table_columns(target_table, db_name))
-        used_names = set(existing_columns)
-        field_mappings: List[Tuple[str, str, str]] = []
-        added_columns: List[str] = []
-
-        for field_id, field_name in custom_fields:
-            column_name = self._sanitize_custom_column_name(field_name, field_id, used_names)
-            field_mappings.append((field_id, field_name, column_name))
-            if column_name not in existing_columns:
-                alter = f"ALTER TABLE {_quote_identifier(target_table)} ADD COLUMN IF NOT EXISTS {_quote_identifier(column_name)} TEXT;"
-                if self._run_psql(alter, db_name=db_name, ignore_errors=True):
-                    added_columns.append(column_name)
-                    existing_columns.add(column_name)
-        self.logger.info(
-            f"Custom transform mappings: db={db_name}, entity={entity_label}, target_table={target_table}, "
-            f"fields={len(field_mappings)}, added_columns={len(added_columns)}"
-        )
-        sample_mappings = ", ".join(
-            f"{field_id}:{field_name}->{column_name}" for field_id, field_name, column_name in field_mappings[:10]
-        )
-        if sample_mappings:
-            self.logger.info(f"Custom transform sample mappings: db={db_name}, {sample_mappings}")
-
-        set_clauses = ",\n                ".join(
-            f'{_quote_identifier(column_name)} = src.{_quote_identifier(column_name)}'
-            for _, _, column_name in field_mappings
-        )
-        select_clauses = ",\n                    ".join(
-            (
-                "STRING_AGG(NULLIF(cv.value, ''), ', ' ORDER BY cv.id) "
-                f"FILTER (WHERE cv.custom_field_id = {int(field_id)}) AS {_quote_identifier(column_name)}"
-            )
-            for field_id, _, column_name in field_mappings
-        )
-
-        update_query = f"""
-            WITH aggregated AS (
-                SELECT
-                    cv.customized_id AS entity_id,
-                    {select_clauses}
-                FROM custom_values cv
-                WHERE cv.customized_type = '{customized_type}'
-                GROUP BY cv.customized_id
-            )
-            UPDATE {_quote_identifier(target_table)} AS target
-            SET
-                {set_clauses}
-            FROM aggregated AS src
-            WHERE src.entity_id = target.id;
-        """
-        self._run_psql(update_query, db_name=db_name, context_label="custom_transform:update")
-
-        processed_count = int(
-            self.run_scalar(
-                f"""
-                SELECT COUNT(DISTINCT customized_id)
-                FROM custom_values
-                WHERE customized_type = '{customized_type}';
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
-        indexes = self.list_indexes("custom_values", db_name)
-        return {
-            "processed_count": processed_count,
-            "custom_fields_count": len(field_mappings),
-            "columns_added": added_columns,
-            "index_count": len(indexes),
-            "entity": entity_label,
-            "target_table": target_table,
-        }
-
-    def transform_custom_values(
-        self,
-        db_name: str,
-        issues_table: str = "issues",
-        projects_table: str = "projects",
-    ) -> Dict[str, object]:
-        issue_result = self._transform_custom_values_for_entity(
-            db_name=db_name,
-            target_table=issues_table,
-            customized_type="Issue",
-            entity_label="issues",
-        )
-        project_result = self._transform_custom_values_for_entity(
-            db_name=db_name,
-            target_table=projects_table,
-            customized_type="Project",
-            entity_label="projects",
-        )
-        return {
-            "processed_count": issue_result["processed_count"] + project_result["processed_count"],
-            "custom_fields_count": issue_result["custom_fields_count"] + project_result["custom_fields_count"],
-            "columns_added": issue_result["columns_added"] + project_result["columns_added"],
-            "index_count": max(int(issue_result["index_count"]), int(project_result["index_count"])),
-            "entities": {
-                "issues": issue_result,
-                "projects": project_result,
-            },
-        }
 
     def add_weekly_records(self, db_name: str, target_day: int) -> Dict[str, int | bool]:
         today = date.today()

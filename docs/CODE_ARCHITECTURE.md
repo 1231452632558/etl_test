@@ -14,7 +14,7 @@
 Это значит, что:
 - SQL-логика
 - restore
-- опциональный ручной custom transform
+- блокировка материализованных `cf_*`
 - snapshot export/import
 - weekly-логика
 - seed ручных таблиц
@@ -62,7 +62,6 @@ Task-entrypoint.
 - `extract_task.py`
 - `restore_task.py`
 - `seed_asterisk_task.py`
-- `transform_custom_values_task.py`
 - `compare_task.py`
 - `load_task.py`
 - `weekly_task.py`
@@ -84,7 +83,6 @@ Task-entrypoint.
 extract
 restore
 seed_asterisk
-transform_custom_values
 compare
 load
 weekly
@@ -123,23 +121,11 @@ cleanup
 - пользователь может запускать её отдельно
 - restore больше не скрывает внутри себя `asterisk`-seed
 
-### `transform_custom_values`
-
-Назначение:
-- материализовать `custom_values` в `issues.cf_*` и `projects.cf_*`
-
-Стадия отключена в дефолтных планах init/nightly и добавляется только через явный `--tasks transform_custom_values`.
-
-Работает:
-- по `main_db`
-- или по `temp_db`
-
-в зависимости от `db_scope`.
-
 ### `compare`
 
 Назначение:
 - экспортировать snapshot-CSV из staging
+- исключить `cf_*` из `issues/projects`
 
 Работает только по `temp_db`.
 
@@ -197,11 +183,7 @@ Task-версия передаёт между шагами словарь `conte
 
 Практический смысл:
 - если стадия запускается отдельно, нужные ей ключи должны уже существовать или задаваться через CLI-режим
-- отсутствие `transform_custom_values` в стандартном плане является ожидаемым поведением
-
-Пример:
-- `transform_custom_values --db-scope main` не требует dump
-- `transform_custom_values --db-scope temp` без `restore` требует `--temp-db-name`
+- `cf_*` никогда не должны присутствовать в `modifications`
 
 ## 5. CLI-контракт
 
@@ -218,7 +200,7 @@ Task-версия передаёт между шагами словарь `conte
 Пример:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 ```
 
 ### `--db-scope`
@@ -226,7 +208,6 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform
 Используется для стадий:
 - `restore`
 - `seed_asterisk`
-- `transform_custom_values`
 
 Правила:
 - `auto` = `main` для `--init`
@@ -241,7 +222,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform
 ```bash
 python3 scripts/etl_pipeline.py \
   --config config/etl_config.ini \
-  --tasks transform_custom_values,compare \
+  --tasks compare \
   --db-scope temp \
   --temp-db-name temp_restore_20260507_123456
 ```
@@ -251,8 +232,6 @@ python3 scripts/etl_pipeline.py \
 CLI автоматически дополняет план:
 - `restore` -> добавляет `extract`, если его нет
 - `load` -> добавляет `compare`, если его нет
-
-`transform_custom_values` автоматически не добавляется ни одной зависимостью.
 
 Это сделано только для удобства запуска.
 
@@ -294,13 +273,13 @@ CLI автоматически дополняет план:
 - какой набор стадий выбран
 - какая БД является target
 - какие таблицы и индексы реально существуют
-- какие sample данные были выбраны weekly/custom transform
+- какие sample данные были выбраны weekly
 
 Особенно важные отладочные блоки:
 - `Версия репозитория`
 - `План стадий ...`
 - `Schema snapshot`
-- `Custom transform sample mappings`
+- `Custom value columns исключены из snapshot`
 - `Weekly debug ...`
 
 ## 9. Почему важна эквивалентность монолита и tasks

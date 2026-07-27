@@ -6,7 +6,7 @@
 - убедиться, что main БД больше не пересоздается nightly
 - проверить restore в staging БД
 - проверить загрузку `asterisk_cdr` из CSV при необходимости
-- проверить, что custom transform не запускается автоматически
+- проверить, что materialized `cf_*` не попадают в `issues/projects`
 - проверить `UPSERT` snapshot-таблиц
 - проверить weekly/manual таблицы
 - проверить очистку staging БД
@@ -38,7 +38,8 @@ sudo -u postgres psql -c "SELECT 1;"
 
 ### Желательные
 
-1. Дамп, содержащий `issues`, `projects`, `custom_values`, `custom_fields`.
+1. Дамп, содержащий `issues` и `projects`; желательно с тестовыми `cf_*`,
+   чтобы проверить их исключение из snapshot.
 2. CSV для `asterisk_cdr`, если `asterisk_cdr` не приходит во входящем dump.
 3. CSV:
    - `group_employee_count_backup.csv`
@@ -117,8 +118,7 @@ sudo -u postgres psql -c \"SELECT datname FROM pg_database WHERE datname LIKE 't
 - работоспособность task-entrypoint
 
 Что он не проверяет полноценно:
-- `custom_values -> issues`
-- `custom_values -> projects`
+- блокировку `cf_*` для `issues/projects`
 - `asterisk_cdr` CSV-source
 - weekly/manual таблицы
 - продовую схему данных
@@ -157,30 +157,26 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM users_active;"
 - `group_employee_count` и `users_active` существуют как таблицы даже если соответствующие CSV не найдены
 - `group_employee_count` и `users_active` могут остаться пустыми, если seed CSV отсутствуют
 
-## 8. Тест 3. Проверка отключения custom transform
+## 8. Тест 3. Проверка блокировки custom values
 
-После обычного `--init` в логе не должно быть задачи `transform_custom_values`, а pipeline не должен автоматически добавлять или пересчитывать `cf_*`.
+После `compare/load` pipeline не должен создавать, обновлять или переносить
+колонки `cf_*` в `issues/projects`.
 
-Если нужно отдельно проверить сохранённую ручную стадию, сначала выполните:
-
-```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
-```
-
-Если dump содержит `issues/projects/custom_values/custom_fields`, проверьте:
+Проверьте:
 
 ```bash
 sudo -u postgres psql -d test_main_db -c "\d issues"
 sudo -u postgres psql -d test_main_db -c "\d projects"
-sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHERE customized_type = 'Issue';"
-sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM custom_values WHERE customized_type = 'Project';"
 ```
 
-После ручного запуска проверить:
-1. В `issues` появились колонки `cf_*`.
-2. В `projects` появились колонки `cf_*`, если в dump есть project custom values.
-3. Значения в `cf_*` не пустые там, где есть данные в `custom_values`.
-4. Количество обработанных `issues` и `projects` выглядит правдоподобно по логу.
+Ожидаемый результат:
+1. В плане стадий нет `transform_custom_values`.
+2. В логах snapshot для `issues/projects` колонки `cf_*` отсутствуют.
+3. Если staging уже содержит `cf_*`, появляется сообщение об их исключении.
+4. Если в ручной CSV для UPSERT подмешаны `cf_*`, загрузка останавливается.
+
+Существующие старые `cf_*` в main БД могут оставаться неизменными. Их удаление
+не является частью pipeline и тестируется как отдельная миграция.
 
 ## 9. Тест 4. Nightly run без удаления main БД
 
@@ -278,8 +274,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
 4. Сравнить:
    - набор таблиц
    - row count в snapshot-таблицах
-   - отсутствие автоматического запуска transform в обоих вариантах
-   - `cf_*` колонки только после отдельного ручного transform
+   - отсутствие стадии transform в обоих вариантах
+   - отсутствие `cf_*` в snapshot и UPSERT
    - `group_employee_count`
    - `users_active`
 
@@ -304,7 +300,8 @@ tail -f /workspace/logs/etl_pipeline.log
 - автоматическую очистку старых staging-БД
 - создание staging БД
 - restore dump
-- отсутствие custom transform в стандартном плане стадий
+- отсутствие стадии `transform_custom_values`
+- исключение `cf_*` из snapshot `issues/projects`
 - snapshot export
 - upsert в main
 - weekly update
@@ -317,20 +314,19 @@ tail -f /workspace/logs/etl_pipeline.log
 Примеры:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
 ```
 
-Если нужно проверить temp-стадию на уже существующей staging БД:
+Если нужно проверить snapshot на уже существующей staging БД:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values,compare --db-scope temp --temp-db-name temp_restore_20260507_123456
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare --db-scope temp --temp-db-name temp_restore_20260507_123456
 ```
 
 Что проверять:
 1. В начале лога печатается план стадий.
-2. Для `transform_custom_values` видны counts по `issues/projects`.
+2. Для `compare` видно исключение `cf_*`, если такие колонки есть.
 3. Для `weekly` видны `snapshot_date`, counts и debug sample.
 4. Для `seed_asterisk` виден статус `seeded` или `skipped`.
 
@@ -339,7 +335,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. Стандартный init/nightly не запускает custom transform; ручной запуск работает отдельно.
+3. Стадии custom transform нет, а `cf_*` не попадают в snapshot/UPSERT.
 4. `asterisk_cdr` присутствует после прогона.
 5. `group_employee_count` и `users_active` не теряют историю.
 6. Нет дублей в weekly-таблицах.

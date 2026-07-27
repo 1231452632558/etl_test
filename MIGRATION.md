@@ -67,13 +67,13 @@
 2. Какие таблицы реально должны идти через snapshot nightly-поток.
 3. Где сейчас лежит CSV для `asterisk_cdr`.
 4. Где лежат CSV для `group_employee_count` и `users_active`.
-5. Какие индексы уже есть на `custom_values`, `issues` и `projects`.
+5. Какие индексы уже есть на `issues` и `projects`.
 
 Проверки:
 
 ```bash
 sudo -u postgres psql -d <main_db> -c "\dt"
-sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('custom_values', 'issues', 'projects');"
+sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('issues', 'projects');"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM asterisk_cdr;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM group_employee_count;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
@@ -230,7 +230,6 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 Для диагностики после переключения можно запускать отдельные стадии:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
 ```
@@ -266,7 +265,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues` и `projects` обновлены; custom transform не запускался автоматически
+- `issues` и `projects` обновлены; `cf_*` не переносились из staging
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

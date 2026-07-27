@@ -33,7 +33,6 @@ STAGE_NAMES = (
     "extract",
     "restore",
     "seed_asterisk",
-    "transform_custom_values",
     "compare",
     "load",
     "weekly",
@@ -115,22 +114,6 @@ class ETLPipeline:
         )
         self.logger.info(
             f"asterisk_cdr обработана для db={db_name}: {'seeded' if seeded else 'skipped'}"
-        )
-        return True
-
-    def _transform_custom_values(self, db_name: str, label: str) -> bool:
-        transform_result = self.db_ops.transform_custom_values(
-            db_name,
-            self.settings.issues_table,
-            self.settings.projects_table,
-        )
-        issues_result = transform_result.get("entities", {}).get("issues", {})
-        projects_result = transform_result.get("entities", {}).get("projects", {})
-        self.logger.info(
-            f"Custom transform {label}: fields={transform_result['custom_fields_count']}, "
-            f"issues={issues_result.get('processed_count', 0)}, "
-            f"projects={projects_result.get('processed_count', 0)}, "
-            f"indexes={transform_result['index_count']}"
         )
         return True
 
@@ -326,7 +309,7 @@ class ETLPipeline:
 
             if effective_scope == "temp" and "restore" in stages:
                 temp_db = self._build_temp_db_name()
-            if effective_scope == "temp" and not temp_db and any(stage in {"seed_asterisk", "transform_custom_values", "compare", "load", "cleanup"} for stage in stages):
+            if effective_scope == "temp" and not temp_db and any(stage in {"seed_asterisk", "compare", "load", "cleanup"} for stage in stages):
                 self.logger.error("Для temp-стадий без restore нужно указать --temp-db-name")
                 return False
 
@@ -351,12 +334,6 @@ class ETLPipeline:
                 elif stage == "seed_asterisk":
                     target_db = main_db if effective_scope == "main" else temp_db
                     self._seed_asterisk(target_db)
-                elif stage == "transform_custom_values":
-                    target_db = main_db if effective_scope == "main" else temp_db
-                    self._transform_custom_values(
-                        target_db,
-                        "в main" if effective_scope == "main" else "в staging",
-                    )
                 elif stage == "compare":
                     export_dir = os.path.join(
                         self.settings.temp_dir,
@@ -442,14 +419,14 @@ def main() -> None:
         "--tasks",
         help=(
             "Список стадий через запятую: "
-            "extract,restore,seed_asterisk,transform_custom_values,compare,load,weekly,cleanup"
+            "extract,restore,seed_asterisk,compare,load,weekly,cleanup"
         ),
     )
     parser.add_argument(
         "--db-scope",
         choices=("auto", "main", "temp"),
         default="auto",
-        help="Для restore/seed_asterisk/transform_custom_values: main, temp или auto",
+        help="Для restore/seed_asterisk: main, temp или auto",
     )
     parser.add_argument(
         "--temp-db-name",

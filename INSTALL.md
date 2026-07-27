@@ -191,30 +191,28 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 Обе версии поддерживают одинаковые стадии:
 
 ```text
-extract, restore, seed_asterisk, transform_custom_values, compare, load, weekly, cleanup
+extract, restore, seed_asterisk, compare, load, weekly, cleanup
 ```
 
 Примеры:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
 ```
 
 И те же команды для монолита:
 
 ```bash
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
 ```
 
 Пояснения:
 - `--tasks` задаёт только нужные стадии
-- `--db-scope main|temp|auto` определяет, над какой БД выполнять `restore`, `seed_asterisk`, `transform_custom_values`
+- `--db-scope main|temp|auto` определяет, над какой БД выполнять `restore` и `seed_asterisk`
 - `--temp-db-name` нужен, если вы хотите запускать temp-стадии отдельно, без нового `restore`
 - `compare` и `load` работают только с `temp` scope
 - `restore` автоматически добавит `extract`, если он не указан
@@ -241,7 +239,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
 4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
-6. Если ручной custom transform используется, его нужно тестировать отдельной командой; обычный init/nightly его не выполняет.
+6. Snapshot `issues/projects` не должен содержать колонки `cf_*`.
 
 ## 11. Диагностика
 
@@ -263,26 +261,15 @@ sudo -u postgres psql -c "\l"
 sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'temp_restore_%';"
 ```
 
-### Проверка custom transform
-
-Custom transform отключён в стандартном init/nightly-потоке. Перед проверкой запустите его явно:
-
-```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
-```
+### Проверка блокировки custom values
 
 ```bash
 sudo -u postgres psql -d your_main_db -c "\d issues"
 sudo -u postgres psql -d your_main_db -c "\d projects"
-sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM issues LIMIT 5;"
-sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM projects LIMIT 5;"
 ```
 
-### Проверка индексов на custom_values
-
-```bash
-sudo -u postgres psql -d your_main_db -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'custom_values';"
-```
+Ранее созданные `cf_*` могут оставаться в main БД, но pipeline больше не
+создает, не пересчитывает и не переносит их из staging.
 
 ## 12. Частые проблемы
 
@@ -306,14 +293,8 @@ ssh your_remote_user@your_remote_host
 sudo -u postgres psql -c "SELECT 1;"
 ```
 
-### Не создаются `cf_*` колонки
+### В snapshot обнаружены `cf_*`
 
-В стандартном запуске это ожидаемое поведение: custom transform отключён. Для ручного запуска используйте `--tasks transform_custom_values`.
-
-Проверьте наличие:
-- `issues`
-- `projects`
-- `custom_values`
-- `custom_fields`
-
-И посмотрите индексы на `custom_values`.
+Pipeline намеренно остановит UPSERT `issues/projects`, если входной snapshot
+содержит `cf_*`. Проверьте, что используется актуальный код и snapshot создан
+новой стадией `compare`.

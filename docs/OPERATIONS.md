@@ -6,7 +6,7 @@
 - фактический nightly-процесс
 - роль main и staging БД
 - поведение ручных таблиц
-- смысл custom transform
+- запрет материализации custom values
 - что проверять при rollout и поддержке
 
 ## 1. Модель данных и поток
@@ -19,7 +19,7 @@
 - не удаляется каждый день
 - накапливает актуальное состояние snapshot-таблиц
 - хранит ручные таблицы
-- хранит материализованные `cf_*` колонки в `issues` и `projects`
+- не получает новые материализованные `cf_*` из pipeline
 
 ### Staging database
 
@@ -55,7 +55,6 @@ Staging нужна потому, что входящий dump нельзя ме�
 - `extract`
 - `restore`
 - `seed_asterisk`
-- `transform_custom_values`
 - `compare`
 - `load`
 - `weekly`
@@ -64,10 +63,9 @@ Staging нужна потому, что входящий dump нельзя ме�
 Это позволяет запускать не только полный nightly-поток, но и отдельные шаги для диагностики или ручного обслуживания.
 
 Типовые сценарии:
-- пересчитать `cf_*` в основной БД: `--tasks transform_custom_values --db-scope main`
 - принудительно выполнить weekly-логику: `--tasks weekly`
 - отдельно догрузить `asterisk_cdr`: `--tasks seed_asterisk --db-scope main`
-- поднять staging и остановиться после transform: `--tasks restore,seed_asterisk,transform_custom_values --db-scope temp <dump>`
+- поднять staging и обработать asterisk: `--tasks restore,seed_asterisk --db-scope temp <dump>`
 
 ## 3. Snapshot-таблицы
 
@@ -166,44 +164,19 @@ Seed CSV нужны только как стартовая точка, если 
 - weekly всегда должен выполняться после `load`, если нужен полный nightly-сценарий
 - weekly можно запускать отдельно, без dump, потому что источник данных уже находится в `main_db`
 
-## 6. Custom transform
+## 6. Custom values
 
-Custom transform не входит в стандартный `--init` или nightly-поток. Стадия сохранена только для явного ручного запуска через `--tasks transform_custom_values`.
+Материализация `custom_values` в `issues/projects` полностью удалена:
+- стадии transform нет в CLI обеих версий
+- snapshot-экспорт исключает `cf_*`
+- UPSERT отклоняет snapshot с `cf_*`
 
-### Что трансформируется
-
-Из:
-- `issues`
-- `projects`
-- `custom_values`
-- `custom_fields`
-
-В:
-- `issues.cf_*`
-- `projects.cf_*`
-
-### Зачем это нужно
-
-Чтобы аналитика читала уже материализованные custom-поля напрямую из `issues` и `projects`, без постоянных JOIN к `custom_values`.
-
-### Текущий подход
-
-1. Получить все custom fields для `Issue` и `Project`.
-2. Сгенерировать для них имена `cf_*`.
-3. Создать недостающие колонки.
-4. Агрегировать значения по `customized_id`.
-5. Обновить `issues` и `projects` отдельными set-based SQL.
-
-### Если шаг запускается в staging
-
-Чтобы результат попал в main, после ручного transform в staging нужно выполнить `compare,load`. Без явного transform стандартный nightly не создаёт и не обновляет `cf_*`.
+Старые `cf_*` в main БД не удаляются автоматически. Их удаление выполняется
+отдельной контролируемой миграцией после проверки списка колонок.
 
 ## 7. Индексы и производительность
 
-`custom transform` потенциально самое дорогое место.
-
 Перед rollout стоит проверить индексы на:
-- `custom_values`
 - `issues`
 - `projects`
 - PK таблиц из `incremental_tables`
@@ -213,14 +186,8 @@ Custom transform не входит в стандартный `--init` или nig
 ```sql
 SELECT indexname, indexdef
 FROM pg_indexes
-WHERE tablename IN ('custom_values', 'issues');
--- при необходимости добавьте 'projects'
+WHERE tablename IN ('issues', 'projects');
 ```
-
-Особенно полезны индексы, покрывающие:
-- `customized_type`
-- `customized_id`
-- `custom_field_id`
 
 ## 8. Что смотреть при первом rollout
 
@@ -229,7 +196,7 @@ WHERE tablename IN ('custom_values', 'issues');
 Проверить:
 - main БД создана
 - ручные таблицы существуют
-- `cf_*` проверяются только если custom transform был запущен вручную
+- pipeline не создал и не обновил `cf_*`
 - seed CSV импортировались, если таблицы были пусты
 
 ### После первого nightly
@@ -253,7 +220,7 @@ WHERE tablename IN ('custom_values', 'issues');
 - в логе есть итог `Staging cleanup завершен`
 - нет ошибок в `etl_pipeline.log`
 - размеры экспортов выглядят ожидаемо
-- `issues` и `projects` визуально корректны; `cf_*` проверяются только для ручного transform
+- `issues` и `projects` визуально корректны; в UPSERT-логе нет `cf_*`
 
 ## 10. Когда использовать монолит, когда tasks
 

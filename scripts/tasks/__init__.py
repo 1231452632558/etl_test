@@ -10,7 +10,6 @@ from .restore_task import RestoreTask
 from .seed_asterisk_task import SeedAsteriskTask
 from .compare_task import CompareTask
 from .load_task import LoadTask
-from .transform_custom_values_task import TransformCustomValuesTask
 from .weekly_task import WeeklyTask
 from .cleanup_task import CleanupTask
 from .task_runner import TaskRunner
@@ -23,7 +22,6 @@ __all__ = [
     'SeedAsteriskTask',
     'CompareTask',
     'LoadTask',
-    'TransformCustomValuesTask',
     'WeeklyTask',
     'CleanupTask',
     'TaskRunner',

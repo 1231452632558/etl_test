@@ -32,7 +32,6 @@ from tasks import (  # noqa: E402
     RestoreTask,
     SeedAsteriskTask,
     TaskRunner,
-    TransformCustomValuesTask,
     WeeklyTask,
 )
 
@@ -41,7 +40,6 @@ STAGE_NAMES = (
     "extract",
     "restore",
     "seed_asterisk",
-    "transform_custom_values",
     "compare",
     "load",
     "weekly",
@@ -124,15 +122,6 @@ def build_runner(
                     db_key="main_db" if effective_scope == "main" else "temp_db",
                 )
             )
-        elif stage == "transform_custom_values":
-            runner.add_task(
-                TransformCustomValuesTask(
-                    settings,
-                    logger,
-                    db_ops,
-                    db_key="main_db" if effective_scope == "main" else "temp_db",
-                )
-            )
         elif stage == "compare":
             runner.add_task(CompareTask(settings, logger, db_ops))
         elif stage == "load":
@@ -157,14 +146,14 @@ def main() -> None:
         "--tasks",
         help=(
             "Список стадий через запятую: "
-            "extract,restore,seed_asterisk,transform_custom_values,compare,load,weekly,cleanup"
+            "extract,restore,seed_asterisk,compare,load,weekly,cleanup"
         ),
     )
     parser.add_argument(
         "--db-scope",
         choices=("auto", "main", "temp"),
         default="auto",
-        help="Для restore/seed_asterisk/transform_custom_values: main, temp или auto",
+        help="Для restore/seed_asterisk: main, temp или auto",
     )
     parser.add_argument(
         "--temp-db-name",
@@ -234,7 +223,7 @@ def main() -> None:
     temp_db = None
     if effective_scope == "temp":
         temp_db = build_temp_db_name(settings) if "restore" in planned_stages else args.temp_db_name
-        if not temp_db and any(stage in {"seed_asterisk", "transform_custom_values", "compare", "load", "cleanup"} for stage in planned_stages):
+        if not temp_db and any(stage in {"seed_asterisk", "compare", "load", "cleanup"} for stage in planned_stages):
             logger.error("Для temp-стадий без restore нужно указать --temp-db-name")
             sys.exit(1)
 
