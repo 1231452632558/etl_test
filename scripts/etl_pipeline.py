@@ -209,6 +209,7 @@ def main() -> None:
         logger.error("Стадия load предполагает snapshot из temp scope")
         sys.exit(1)
 
+    db_ops.cleanup_stale_databases(exclude_names=[args.temp_db_name] if args.temp_db_name else [])
     cleanup_temp_artifacts(settings.temp_dir, logger)
 
     if (

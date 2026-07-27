@@ -398,6 +398,78 @@ class DatabaseOperations:
             )
         )
 
+    def cleanup_stale_databases(
+        self,
+        exclude_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """Удаляет осиротевшие staging-БД предыдущих запусков."""
+        prefix = _validate_identifier(self.settings.temp_db_prefix, "temp_db_prefix")
+        protected = {name for name in (exclude_names or []) if name}
+        generated_name_pattern = re.compile(
+            rf"^{re.escape(prefix)}\d{{8}}_\d{{6}}$"
+        )
+        rows = self.run_rows(
+            """
+            SELECT
+                d.datname,
+                COUNT(a.pid)::text
+            FROM pg_database d
+            LEFT JOIN pg_stat_activity a ON a.datname = d.datname
+            GROUP BY d.datname
+            ORDER BY d.datname;
+            """,
+            db_name="postgres",
+        )
+
+        removed: List[str] = []
+        skipped_active: List[str] = []
+        skipped_protected: List[str] = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            db_name, active_connections_raw = row[0], row[1]
+            if not generated_name_pattern.fullmatch(db_name):
+                continue
+            if db_name in protected:
+                skipped_protected.append(db_name)
+                self.logger.info(
+                    f"Staging cleanup: база защищена текущим запуском, db={db_name}"
+                )
+                continue
+
+            active_connections = int(active_connections_raw or 0)
+            if active_connections > 0:
+                skipped_active.append(db_name)
+                self.logger.warning(
+                    f"Staging cleanup: база пропущена из-за активных подключений, "
+                    f"db={db_name}, connections={active_connections}"
+                )
+                continue
+
+            self.logger.info(f"Staging cleanup: удаление осиротевшей базы {db_name}")
+            if self._run_psql(
+                f'DROP DATABASE IF EXISTS "{db_name}";',
+                db_name="postgres",
+                context_label=f"staging-cleanup:{db_name}",
+            ):
+                removed.append(db_name)
+            else:
+                self.logger.error(
+                    f"Staging cleanup: не удалось безопасно удалить базу {db_name}; "
+                    "возможно, появилось активное подключение"
+                )
+
+        self.logger.info(
+            "Staging cleanup завершен: "
+            f"removed={len(removed)}, active_skipped={len(skipped_active)}, "
+            f"protected={len(skipped_protected)}"
+        )
+        return {
+            "removed": removed,
+            "skipped_active": skipped_active,
+            "skipped_protected": skipped_protected,
+        }
+
     def restore_dump(self, db_name: str, sql_files: Sequence[str]) -> bool:
         self.logger.info(f"Восстановление дампа в базу {db_name}...")
         for sql_file in sql_files:

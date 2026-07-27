@@ -183,6 +183,9 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 
 Флаг `--cleanup` удаляет staging БД после завершения.
 
+Перед каждым запуском pipeline дополнительно ищет и удаляет осиротевшие staging-БД
+предыдущих запусков. В логе это отражается строкой `Staging cleanup завершен`.
+
 ## 8.1. Частичный запуск стадий
 
 Обе версии поддерживают одинаковые стадии:

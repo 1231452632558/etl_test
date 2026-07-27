@@ -473,6 +473,10 @@ def main() -> None:
         print(f"Ошибка: {exc}")
         sys.exit(1)
 
+    pipeline.db_ops.cleanup_stale_databases(
+        exclude_names=[args.temp_db_name] if args.temp_db_name else []
+    )
+
     if selected_stages:
         success = pipeline.run_selected(
             selected_stages,

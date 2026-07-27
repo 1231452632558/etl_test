@@ -91,14 +91,15 @@ sudo mkdir -p /tmp/pg_etl_temp
 
 ## 5. Очистка тестового окружения
 
-Перед прогоном очистите старые тестовые БД:
+Перед прогоном зафиксируйте старые тестовые БД:
 
 ```bash
-sudo -u postgres psql -c "DROP DATABASE IF EXISTS test_main_db;"
 sudo -u postgres psql -c \"SELECT datname FROM pg_database WHERE datname LIKE 'temp_restore_%';\"
 ```
 
-Если остались staging БД, удалите их вручную.
+После старта pipeline проверьте, что осиротевшие staging-БД удалены автоматически.
+База с активным подключением должна быть пропущена с предупреждением, а
+`--temp-db-name` должна быть защищена от удаления.
 
 ## 6. Тест 1. Smoke-check на простых дампах
 
@@ -300,6 +301,7 @@ tail -f /workspace/logs/etl_pipeline.log
 ```
 
 Ищите:
+- автоматическую очистку старых staging-БД
 - создание staging БД
 - restore dump
 - отсутствие custom transform в стандартном плане стадий

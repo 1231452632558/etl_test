@@ -32,6 +32,7 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 - Опциональная ручная трансформация `custom_values -> issues.cf_*` и `custom_values -> projects.cf_*`
 - `UPSERT` по snapshot-таблицам
 - Отдельная обработка CSV/manual таблиц `asterisk_cdr`, `group_employee_count` и `users_active`
+- Автоматическое удаление осиротевших staging-БД предыдущих запусков
 - Ротация архивов и подробное логирование
 - Только стандартная библиотека Python и `psql`
 
@@ -127,6 +128,10 @@ repo/
 4. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
 5. В main БД выполняется weekly-update ручных таблиц.
 6. Staging БД удаляется.
+
+Перед началом обе версии также удаляют оставшиеся staging-БД с именами вида
+`<temp_db_prefix>YYYYMMDD_HHMMSS`. Базы с активными подключениями и база,
+явно переданная через `--temp-db-name`, не удаляются.
 
 ## Ручные таблицы
 
