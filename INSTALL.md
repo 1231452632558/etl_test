@@ -268,8 +268,8 @@ sudo -u postgres psql -d your_main_db -c "\d issues"
 sudo -u postgres psql -d your_main_db -c "\d projects"
 ```
 
-Ранее созданные `cf_*` могут оставаться в main БД, но pipeline больше не
-создает, не пересчитывает и не переносит их из staging.
+Ранее созданные `cf_*` удаляются из main БД перед UPSERT `issues/projects`.
+Удаление выполняется без `CASCADE`: при зависимостях pipeline завершится ошибкой.
 
 ## 12. Частые проблемы
 
@@ -298,3 +298,9 @@ sudo -u postgres psql -c "SELECT 1;"
 Pipeline намеренно остановит UPSERT `issues/projects`, если входной snapshot
 содержит `cf_*`. Проверьте, что используется актуальный код и snapshot создан
 новой стадией `compare`.
+
+### Не удаляются старые `cf_*`
+
+Проверьте лог `drop-custom-columns:<table>`. Если PostgreSQL сообщает о
+зависимостях, сначала перенастройте зависимые представления или отчеты.
+Pipeline намеренно не использует `CASCADE`.

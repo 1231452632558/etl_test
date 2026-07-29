@@ -265,7 +265,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues` и `projects` обновлены; `cf_*` не переносились из staging
+- `issues` и `projects` обновлены; legacy `cf_*` удалены из main БД
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

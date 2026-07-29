@@ -174,9 +174,8 @@ sudo -u postgres psql -d test_main_db -c "\d projects"
 2. В логах snapshot для `issues/projects` колонки `cf_*` отсутствуют.
 3. Если staging уже содержит `cf_*`, появляется сообщение об их исключении.
 4. Если в ручной CSV для UPSERT подмешаны `cf_*`, загрузка останавливается.
-
-Существующие старые `cf_*` в main БД могут оставаться неизменными. Их удаление
-не является частью pipeline и тестируется как отдельная миграция.
+5. Ранее созданные `cf_*` удаляются из main БД перед UPSERT.
+6. При зависимостях от `cf_*` загрузка останавливается; `CASCADE` не используется.
 
 ## 9. Тест 4. Nightly run без удаления main БД
 
@@ -275,7 +274,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
    - набор таблиц
    - row count в snapshot-таблицах
    - отсутствие стадии transform в обоих вариантах
-   - отсутствие `cf_*` в snapshot и UPSERT
+   - отсутствие `cf_*` в snapshot, UPSERT и целевой схеме
    - `group_employee_count`
    - `users_active`
 
@@ -302,6 +301,7 @@ tail -f /workspace/logs/etl_pipeline.log
 - restore dump
 - отсутствие стадии `transform_custom_values`
 - исключение `cf_*` из snapshot `issues/projects`
+- удаление legacy `cf_*` перед UPSERT
 - snapshot export
 - upsert в main
 - weekly update
@@ -335,7 +335,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare -
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. Стадии custom transform нет, а `cf_*` не попадают в snapshot/UPSERT.
+3. Стадии custom transform нет, а `cf_*` отсутствуют в snapshot и main БД.
 4. `asterisk_cdr` присутствует после прогона.
 5. `group_employee_count` и `users_active` не теряют историю.
 6. Нет дублей в weekly-таблицах.

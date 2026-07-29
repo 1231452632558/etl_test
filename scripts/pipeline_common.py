@@ -492,6 +492,45 @@ class DatabaseOperations:
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
 
+    def drop_materialized_custom_value_columns(self, table_name: str, db_name: str) -> bool:
+        """Удаляет legacy cf_* из issues/projects перед snapshot UPSERT."""
+        table_name = _validate_identifier(table_name, "table_name")
+        protected_tables = {self.settings.issues_table, self.settings.projects_table}
+        if table_name not in protected_tables:
+            return True
+
+        custom_columns = [
+            column
+            for column in self.get_table_columns(table_name, db_name)
+            if column.startswith("cf_")
+        ]
+        if not custom_columns:
+            return True
+
+        drop_clauses = ", ".join(
+            f"DROP COLUMN IF EXISTS {_quote_identifier(column)}"
+            for column in custom_columns
+        )
+        self.logger.warning(
+            f"Удаление legacy custom value columns перед UPSERT: db={db_name}, "
+            f"table={table_name}, columns={custom_columns}"
+        )
+        if not self._run_psql(
+            f"ALTER TABLE {_quote_identifier(table_name)} {drop_clauses};",
+            db_name=db_name,
+            context_label=f"drop-custom-columns:{table_name}",
+        ):
+            self.logger.error(
+                f"Не удалось удалить legacy cf_* из {table_name}. "
+                "Проверьте зависимости представлений и отчетов; CASCADE не используется."
+            )
+            return False
+        self.logger.info(
+            f"Legacy custom value columns удалены: db={db_name}, "
+            f"table={table_name}, removed={len(custom_columns)}"
+        )
+        return True
+
     def get_table_column_details(self, table_name: str, db_name: str) -> List[Tuple[str, str]]:
         table_name = _validate_identifier(table_name, "table_name")
         query = f"""
@@ -665,6 +704,8 @@ class DatabaseOperations:
                 f"UPSERT остановлен: snapshot для {table_name} содержит запрещенные "
                 f"custom value columns: {blocked_columns}"
             )
+            return False
+        if not self.drop_materialized_custom_value_columns(table_name, db_name):
             return False
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]

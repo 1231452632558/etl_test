@@ -137,6 +137,7 @@ cleanup
 
 Назначение:
 - применить snapshot-CSV в `main_db` через `UPSERT`
+- удалить legacy `cf_*` из `issues/projects` перед UPSERT без `CASCADE`
 
 Работает только по staging-derived данным.
 
