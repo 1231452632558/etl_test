@@ -61,13 +61,17 @@ group_employee_count_csv_file = /workspace/logs/group_employee_count_backup.csv
 users_active_csv_file = /workspace/logs/users_active_backup.csv
 
 [tables]
-incremental_tables = asterisk_cdr:id
+incremental_tables =
 issues_table = issues
 projects_table = projects
+
+[schedule]
+weekly_enabled = true
+weekly_days = 1
 ```
 
 Важно:
-- `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
+- `asterisk_cdr`, `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
 - `issues` и `projects` можно не добавлять руками, если заданы `issues_table` и `projects_table`
 
 ## 4. Подготовка директорий и seed CSV
@@ -174,8 +178,7 @@ sudo -u postgres psql -d test_main_db -c "\d projects"
 2. В логах snapshot для `issues/projects` колонки `cf_*` отсутствуют.
 3. Если staging уже содержит `cf_*`, появляется сообщение об их исключении.
 4. Если в ручной CSV для UPSERT подмешаны `cf_*`, загрузка останавливается.
-5. Ранее созданные `cf_*` удаляются из main БД перед UPSERT.
-6. При зависимостях от `cf_*` загрузка останавливается; `CASCADE` не используется.
+5. Ранее созданные `cf_*` остаются без изменений: pipeline не выполняет `DROP COLUMN`.
 
 ## 9. Тест 4. Nightly run без удаления main БД
 
@@ -207,7 +210,8 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 
 ## 10. Тест 5. Проверка snapshot-upsert
 
-Если в nightly dump есть обновления по snapshot-таблицам:
+Для обычных snapshot-таблиц проверьте новые и измененные строки. Для
+`asterisk_cdr` проверяется отдельная append-only стадия:
 
 ```bash
 sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM asterisk_cdr;"
@@ -215,8 +219,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 ```
 
 Проверить:
-1. Новые строки появились.
-2. Измененные строки обновились.
+1. Новые строки обычных snapshot-таблиц появились, измененные обновились.
+2. В `asterisk_cdr` добавились только новые `id`; существующие строки не перезаписались.
 3. Main БД не пересоздавалась.
 
 Если в конфиге есть другие snapshot-таблицы, проверьте их так же.
@@ -228,10 +232,11 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 - есть `asterisk_cdr.csv`
 
 Проверить:
-1. Очистить `asterisk_cdr` в тестовой БД или взять пустую цель.
-2. Запустить pipeline.
-3. Убедиться, что `asterisk_cdr` наполнилась из CSV.
-4. Проверить, что `project_id` проставлен.
+1. Запомнить число строк и значение одной существующей строки.
+2. Добавить в CSV одну строку с новым `id` и одну строку с уже существующим `id`, но измененными данными.
+3. Запустить `--tasks seed_asterisk`.
+4. Убедиться, что добавилась только новая строка, а существующая не перезаписалась.
+5. Проверить, что `project_id` проставлен.
 
 Проверки:
 
@@ -250,6 +255,12 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM asterisk_cdr WHER
 - сохранение старых данных
 - отсутствие дублей
 - корректный upsert за текущую дату
+
+Для независимого от дня недели теста:
+
+```bash
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+```
 
 Проверки:
 
@@ -274,7 +285,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
    - набор таблиц
    - row count в snapshot-таблицах
    - отсутствие стадии transform в обоих вариантах
-   - отсутствие `cf_*` в snapshot, UPSERT и целевой схеме
+   - отсутствие `cf_*` в snapshot и UPSERT при неизменной целевой схеме
    - `group_employee_count`
    - `users_active`
 
@@ -301,7 +312,7 @@ tail -f /workspace/logs/etl_pipeline.log
 - restore dump
 - отсутствие стадии `transform_custom_values`
 - исключение `cf_*` из snapshot `issues/projects`
-- удаление legacy `cf_*` перед UPSERT
+- отсутствие операций удаления legacy `cf_*`
 - snapshot export
 - upsert в main
 - weekly update
@@ -315,7 +326,8 @@ tail -f /workspace/logs/etl_pipeline.log
 
 ```bash
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 Если нужно проверить snapshot на уже существующей staging БД:
@@ -328,14 +340,14 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare -
 1. В начале лога печатается план стадий.
 2. Для `compare` видно исключение `cf_*`, если такие колонки есть.
 3. Для `weekly` видны `snapshot_date`, counts и debug sample.
-4. Для `seed_asterisk` виден статус `seeded` или `skipped`.
+4. Для `seed_asterisk` видны `source_rows`, `inserted_rows` и `skipped`.
 
 ## 15. Критерии успешного теста
 
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. Стадии custom transform нет, а `cf_*` отсутствуют в snapshot и main БД.
+3. Стадии custom transform нет, `cf_*` отсутствуют в snapshot, а схема main не изменяется.
 4. `asterisk_cdr` присутствует после прогона.
 5. `group_employee_count` и `users_active` не теряют историю.
 6. Нет дублей в weekly-таблицах.

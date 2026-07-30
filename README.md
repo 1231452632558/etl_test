@@ -121,11 +121,12 @@ repo/
 
 Используется каждый день:
 1. Nightly dump разворачивается в новую staging БД.
-2. Во staging создаются служебные таблицы и патчится `asterisk_cdr.project_id`.
+2. Во staging создаются только служебные объекты, необходимые для snapshot.
 3. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
 4. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
-5. В main БД выполняется weekly-update ручных таблиц.
-6. Staging БД удаляется.
+5. CSV `asterisk_cdr` напрямую дополняет стабильную main БД по отсутствующим `id`.
+6. После загрузки основных таблиц в main выполняется weekly-update исторических таблиц.
+7. Staging БД удаляется.
 
 Перед началом обе версии также удаляют оставшиеся staging-БД с именами вида
 `<temp_db_prefix>YYYYMMDD_HHMMSS`. Базы с активными подключениями и база,
@@ -141,13 +142,12 @@ repo/
 Эти таблицы не приходят во входящем dump и исторически создавались вручную.
 
 Новая логика такая:
-- `asterisk_cdr` может подхватываться из отдельного CSV-файла `asterisk_csv_file`, если таблица в целевой БД пустая
-- на `--init` они создаются, если отсутствуют
-- если они пустые, данные можно подхватить из seed CSV рядом с логами
-- дальше они живут в main БД постоянно
-- nightly pipeline не перезаливает каждый день `group_employee_count` и `users_active`
-- `asterisk_cdr` может подгружаться в staging из CSV, если во входящем dump этой таблицы нет
-- weekly-обновление идет идемпотентно через `ON CONFLICT` только для `group_employee_count` и `users_active`
+- на `--init` таблицы создаются, если отсутствуют
+- CSV для `group_employee_count` и `users_active` используются только для начального наполнения пустых таблиц
+- nightly pipeline не выгружает и не перезаливает `group_employee_count` и `users_active`
+- weekly формирует срез из актуальных `users`/`groups_users` непосредственно в main БД
+- `asterisk_cdr` не участвует в staging snapshot; CSV напрямую добавляет в main только отсутствующие строки через `ON CONFLICT (id) DO NOTHING`
+- повторный запуск за ту же дату идемпотентно обновляет weekly-срез, а не создает дубли
 
 То есть старые данные из CSV сохраняются как стартовая точка, а дальнейшая жизнь таблиц становится инкрементальной.
 
@@ -158,10 +158,9 @@ repo/
 - pipeline не создает колонки `cf_*`
 - `cf_*` исключаются из snapshot-экспорта `issues` и `projects`
 - загрузчик отклоняет snapshot этих таблиц, если в нем обнаружены `cf_*`
-- перед UPSERT загрузчик удаляет ранее созданные `cf_*` из main БД
+- pipeline не удаляет существующие `cf_*` и вообще не меняет целевую схему ради custom values
 
-Удаление выполняется без `CASCADE`. Если от `cf_*` зависят представления или
-другие объекты PostgreSQL, pipeline остановится и выведет ошибку с именем таблицы.
+Одноразовая очистка ранее созданных `cf_*` больше не является частью workflow.
 
 ## Конфигурация
 
@@ -173,17 +172,21 @@ repo/
 - `[paths].backup_storage_dir` — куда складывать архивы
 - `[paths].temp_dir` — где хранить временные каталоги
 - `[paths].log_file` — основной лог
-- `[paths].asterisk_csv_file` — CSV-файл для ручной загрузки `asterisk_cdr`
+- `[paths].asterisk_csv_file` — CSV-файл для append-only загрузки `asterisk_cdr`
 - `[paths].group_employee_count_csv_file` — CSV-файл для начального наполнения `group_employee_count`
 - `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
 - `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
 - `[tables].issues_table` — таблица задач для snapshot-загрузки
 - `[tables].projects_table` — таблица проектов для snapshot-загрузки
 - `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
-- `[schedule].target_day` — день weekly-обновления
+- `[schedule].weekly_enabled` — включить автоматический weekly
+- `[schedule].weekly_days` — дни запуска по ISO через запятую, например `1,4`
+- `[schedule].target_day` — совместимый fallback, если `weekly_days` не задан
+
+Точное время запуска задается cron/systemd; pipeline проверяет день недели в момент запуска.
 
 Важно: `issues_table` и `projects_table` автоматически добавляются в snapshot-список, даже если их забыли явно указать.
-Важно: `group_employee_count` и `users_active` не должны попадать в `incremental_tables`, потому что они обновляются отдельным weekly-процессом.
+Важно: `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются из `incremental_tables`, даже если ошибочно указаны в конфиге.
 
 ## Запуск
 
@@ -205,8 +208,8 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 
 ```bash
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 ### Монолитная версия
@@ -227,8 +230,8 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 
 ```bash
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 ### Стадии и частичный запуск
@@ -244,9 +247,10 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 
 Полезные флаги:
 - `--tasks` — список стадий через запятую
-- `--db-scope main|temp|auto` — куда применять `restore` и `seed_asterisk`
+- `--db-scope main|temp|auto` — куда применять `restore`; `seed_asterisk` всегда пишет в main
 - `--temp-db-name` — имя уже существующей staging БД для частичного запуска без `restore`
 - `--skip-weekly` — исключить weekly из полного nightly-потока
+- `--force-weekly` — выполнить weekly сейчас, независимо от расписания и `weekly_enabled`
 
 Практические правила:
 - `restore` автоматически подтягивает `extract`, если вы его не указали
@@ -266,14 +270,14 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 - Входящий dump по-прежнему не меняется и всегда восстанавливается только в новую БД.
 - Snapshot-режим означает, что для таблиц из `incremental_tables` в main БД подтягивается текущее состояние строк из staging.
 - Удаления строк из dump сейчас не синхронизируются автоматически.
-- Legacy `cf_*` удаляются из main БД перед UPSERT `issues/projects`.
+- Существующие `cf_*` в main БД не удаляются; pipeline только не переносит новые custom values.
 
 ## Что проверить перед prod rollout
 
 1. Корректность `incremental_tables` в конфиге.
 2. Наличие доступа `sudo -u postgres psql`.
-3. Что seed CSV для `asterisk_cdr`, `group_employee_count` и `users_active` лежат там, где ожидается логикой.
-4. Что weekly `ON CONFLICT` соответствует нужной бизнес-логике.
+3. Что CSV для `asterisk_cdr` и init-only seed CSV лежат по путям из конфига.
+4. Что `weekly_enabled`, `weekly_days` и `weekly_group_name_pattern` соответствуют расписанию.
 
 ## Документы
 

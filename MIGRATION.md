@@ -30,7 +30,7 @@
 
 - Main БД становится долгоживущей
 - `issues` и `projects` загружаются в main без автоматической материализации custom values
-- `asterisk_cdr` и другие snapshot-таблицы вливаются через `UPSERT`
+- `asterisk_cdr` дополняется напрямую из CSV в main по отсутствующим `id`
 - `group_employee_count` и `users_active` больше не живут через nightly export/import
 
 ## Выбор Python-версии
@@ -46,7 +46,7 @@
 При этом монолит и task-версия должны оставаться равноправными:
 - одинаковые стадии
 - одинаковая nightly-логика
-- одинаковые ключи `--tasks`, `--db-scope`, `--temp-db-name`, `--skip-weekly`
+- одинаковые ключи `--tasks`, `--db-scope`, `--temp-db-name`, `--skip-weekly`, `--force-weekly`
 
 ## Перед началом
 
@@ -92,18 +92,23 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `issues_table = issues`
 - `projects_table = projects`
 - `incremental_tables` — только snapshot-таблицы
+- `weekly_enabled` и `weekly_days` — включение и дни weekly-среза
 
 Важно:
 - `issues` и `projects` можно не добавлять в `incremental_tables`, они подтянутся автоматически через `issues_table` и `projects_table`
-- `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
+- `asterisk_cdr`, `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
 
 Минимальный пример:
 
 ```ini
 [tables]
-incremental_tables = asterisk_cdr:id
+incremental_tables =
 issues_table = issues
 projects_table = projects
+
+[schedule]
+weekly_enabled = true
+weekly_days = 1
 ```
 
 ## Этап 3. Подготовка seed CSV
@@ -119,7 +124,7 @@ projects_table = projects
 ```
 
 Правила:
-- `asterisk_cdr.csv` используется как CSV-source, если таблица не приходит в dump
+- `asterisk_cdr.csv` является append-only источником для стабильной main БД
 - `group_employee_count_backup.csv` и `users_active_backup.csv` нужны как стартовый seed для пустой main БД
 
 ## Этап 4. Прогон в тестовом окружении
@@ -172,7 +177,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 
 Что произойдет:
 1. dump поднимется во staging
-2. `asterisk_cdr` при необходимости догрузится из CSV
+2. в main добавятся отсутствующие строки `asterisk_cdr` из CSV
 3. snapshot-таблицы будут влиты в main через `UPSERT`
 4. weekly-таблицы обновятся отдельным шагом
 
@@ -231,7 +236,8 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 
 ```bash
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 Проверки:
@@ -259,13 +265,13 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 - проверен `sudo -u postgres psql`
 - проверен доступ к nightly dump
 - seed CSV лежат в нужных местах
-- `incremental_tables` не содержит weekly-таблицы
+- `incremental_tables` не содержит три ручные таблицы
 - `issues_table` и `projects_table` заданы
 
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues` и `projects` обновлены; legacy `cf_*` удалены из main БД
+- `issues` и `projects` обновлены; новые custom values не перенесены, существующие `cf_*` не удалялись
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

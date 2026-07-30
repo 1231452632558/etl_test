@@ -92,7 +92,7 @@ remote_path = /path/to/dumps/
 backup_tar = nightly_dump.tar.gz
 
 [tables]
-incremental_tables = asterisk_cdr:id
+incremental_tables =
 issues_table = issues
 projects_table = projects
 
@@ -101,6 +101,8 @@ max_backups = 3
 cleanup_temp_db = true
 
 [schedule]
+weekly_enabled = true
+weekly_days = 1
 target_day = 1
 ```
 
@@ -108,14 +110,14 @@ target_day = 1
 
 Сюда надо включать таблицы, которые должны попадать из staging в main через snapshot + `UPSERT`.
 
-Пример:
+Пример для обычных dump-таблиц:
 
 ```ini
-incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id
+incremental_tables = users:id,orders:id,products:id
 ```
 
 Если `issues` или `projects` не указать, они всё равно будут автоматически добавлены логикой pipeline через `issues_table` и `projects_table`.
-`group_employee_count` и `users_active` не добавляются в `incremental_tables`, потому что это ручные weekly-таблицы, а не snapshot-таблицы из nightly dump.
+`asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются из `incremental_tables`: они принадлежат стабильной main БД и не выгружаются из staging.
 
 ## 6. Seed-файлы для ручных таблиц
 
@@ -132,7 +134,7 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id
 /workspace/logs/users_active_backup.csv
 ```
 
-Для `asterisk_cdr` seed применяется если таблица пустая в main или staging БД.
+Для `asterisk_cdr` CSV читается при каждом запуске стадии `seed_asterisk`, но в main добавляются только отсутствующие `id`.
 
 Для `group_employee_count` и `users_active` seed применяется только если соответствующая таблица в main БД пустая.
 
@@ -198,22 +200,23 @@ extract, restore, seed_asterisk, compare, load, weekly, cleanup
 
 ```bash
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 И те же команды для монолита:
 
 ```bash
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk --db-scope temp /path/to/dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 Пояснения:
 - `--tasks` задаёт только нужные стадии
-- `--db-scope main|temp|auto` определяет, над какой БД выполнять `restore` и `seed_asterisk`
+- `--db-scope main|temp|auto` определяет БД для `restore`; `seed_asterisk` всегда дополняет main
 - `--temp-db-name` нужен, если вы хотите запускать temp-стадии отдельно, без нового `restore`
+- `--force-weekly` запускает weekly сейчас независимо от `weekly_days` и `weekly_enabled`
 - `compare` и `load` работают только с `temp` scope
 - `restore` автоматически добавит `extract`, если он не указан
 - `load` автоматически добавит `compare`, если он не указан
@@ -237,7 +240,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 1. Main БД уже не должна удаляться nightly-процессом.
 2. Nightly dump должен успешно подниматься во временной staging БД.
 3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
-4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
+4. CSV для append `asterisk_cdr` и init-only seed CSV должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
 6. Snapshot `issues/projects` не должен содержать колонки `cf_*`.
 
@@ -268,8 +271,8 @@ sudo -u postgres psql -d your_main_db -c "\d issues"
 sudo -u postgres psql -d your_main_db -c "\d projects"
 ```
 
-Ранее созданные `cf_*` удаляются из main БД перед UPSERT `issues/projects`.
-Удаление выполняется без `CASCADE`: при зависимостях pipeline завершится ошибкой.
+Ранее созданные `cf_*` остаются в main БД. Pipeline не удаляет их, не обновляет
+из custom values и не переносит через snapshot.
 
 ## 12. Частые проблемы
 
@@ -299,8 +302,8 @@ Pipeline намеренно остановит UPSERT `issues/projects`, есл�
 содержит `cf_*`. Проверьте, что используется актуальный код и snapshot создан
 новой стадией `compare`.
 
-### Не удаляются старые `cf_*`
+### Старые `cf_*` остались в main
 
-Проверьте лог `drop-custom-columns:<table>`. Если PostgreSQL сообщает о
-зависимостях, сначала перенастройте зависимые представления или отчеты.
+Это ожидаемо: одноразовое удаление больше не входит в pipeline. Если понадобится
+отдельная очистка схемы, выполняйте ее как контролируемую миграцию вне nightly.
 Pipeline намеренно не использует `CASCADE`.

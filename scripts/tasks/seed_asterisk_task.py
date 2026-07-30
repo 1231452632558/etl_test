@@ -11,7 +11,7 @@ from .base import BaseTask, TaskResult
 
 
 class SeedAsteriskTask(BaseTask):
-    """Задача загрузки asterisk_cdr в main или staging БД."""
+    """Добавляет отсутствующие строки asterisk_cdr напрямую в main БД."""
 
     def __init__(self, config, logger, db_ops, db_key: str):
         super().__init__(config, logger, db_ops)
@@ -35,23 +35,32 @@ class SeedAsteriskTask(BaseTask):
                     completed_at=datetime.now(),
                 )
 
-            seeded = self.db_ops.seed_asterisk_cdr_if_needed(db_name)
+            self.db_ops.create_required_tables(db_name)
+            append_result = self.db_ops.append_asterisk_cdr_from_csv(db_name)
             self.db_ops.add_project_id_column(db_name)
-            self.db_ops.log_pipeline_schema_snapshot(
-                db_name,
-                self.config.issues_table,
-                self.config.projects_table,
-            )
+            self.db_ops.log_table_schema("asterisk_cdr", db_name, include_indexes=True)
+            if not append_result["success"]:
+                reason = str(append_result.get("reason", "unknown"))
+                return self._create_result(
+                    success=False,
+                    message=f"Ошибка append asterisk_cdr в db={db_name}: {reason}",
+                    data={"db_name": db_name, **append_result},
+                    errors=[reason],
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
 
             return self._create_result(
                 success=True,
                 message=(
-                    f"asterisk_cdr обработана для db={db_name}: "
-                    f"{'seeded' if seeded else 'skipped'}"
+                    f"asterisk_cdr дополнена в db={db_name}: "
+                    f"source_rows={append_result.get('source_rows', 0)}, "
+                    f"inserted_rows={append_result.get('inserted_rows', 0)}, "
+                    f"skipped={append_result.get('skipped', False)}"
                 ),
                 data={
                     "db_name": db_name,
-                    "asterisk_seeded": seeded,
+                    **append_result,
                 },
                 started_at=started_at,
                 completed_at=datetime.now(),

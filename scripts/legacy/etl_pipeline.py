@@ -68,9 +68,11 @@ def parse_stage_selection(raw_value: str | None) -> list[str]:
 
 
 def default_stages(init_mode: bool, skip_weekly: bool) -> list[str]:
-    stages = ["extract", "restore", "seed_asterisk"]
-    if not init_mode:
-        stages.extend(["compare", "load"])
+    stages = ["extract", "restore"]
+    if init_mode:
+        stages.append("seed_asterisk")
+    else:
+        stages.extend(["compare", "load", "seed_asterisk"])
         if not skip_weekly:
             stages.append("weekly")
     stages.append("cleanup")
@@ -105,16 +107,58 @@ class ETLPipeline:
                 shutil.rmtree(path, ignore_errors=True)
 
     def _seed_asterisk(self, db_name: str) -> bool:
-        seeded = self.db_ops.seed_asterisk_cdr_if_needed(db_name)
+        self.db_ops.create_required_tables(db_name)
+        result = self.db_ops.append_asterisk_cdr_from_csv(db_name)
         self.db_ops.add_project_id_column(db_name)
-        self.db_ops.log_pipeline_schema_snapshot(
-            db_name,
-            self.settings.issues_table,
-            self.settings.projects_table,
-        )
+        self.db_ops.log_table_schema("asterisk_cdr", db_name, include_indexes=True)
+        if not result["success"]:
+            self.logger.error(
+                f"Ошибка append asterisk_cdr в db={db_name}: {result.get('reason', 'unknown')}"
+            )
+            return False
         self.logger.info(
-            f"asterisk_cdr обработана для db={db_name}: {'seeded' if seeded else 'skipped'}"
+            f"asterisk_cdr дополнена в db={db_name}: "
+            f"source_rows={result.get('source_rows', 0)}, "
+            f"inserted_rows={result.get('inserted_rows', 0)}, "
+            f"skipped={result.get('skipped', False)}"
         )
+        return True
+
+    def _run_weekly(self, db_name: str, force_weekly: bool = False) -> bool:
+        if not self.settings.weekly_enabled and not force_weekly:
+            self.logger.info("Weekly insert отключен параметром weekly_enabled=false")
+            return True
+
+        result = self.db_ops.add_weekly_records(
+            db_name,
+            self.settings.weekly_days,
+            force=force_weekly,
+        )
+        if result["skipped"]:
+            self.logger.info(
+                f"Weekly insert пропущен: сегодня {result['current_day']}, "
+                f"дни запуска {result['target_days']}"
+            )
+            return True
+
+        group_failures = result.get("group_failures", [])
+        users_failures = result.get("users_failures", [])
+        self.logger.info(
+            "Weekly insert обработан: "
+            f"snapshot_date={result.get('snapshot_date', '')}, "
+            f"target_days={result.get('target_days', [])}, "
+            f"force={result.get('force', False)}, "
+            f"group_upserted={result.get('group_upserted', 0)}, "
+            f"group_inserted={result.get('group_inserted', 0)}, "
+            f"users_upserted={result.get('users_upserted', 0)}, "
+            f"users_inserted={result.get('users_inserted', 0)}"
+        )
+        if group_failures or users_failures:
+            self.logger.error(
+                f"Weekly завершился с ошибками: group_failures={group_failures}, "
+                f"users_failures={users_failures}"
+            )
+            return False
         return True
 
     def run_init(self, dump_file: str) -> bool:
@@ -144,7 +188,8 @@ class ETLPipeline:
 
             self.db_ops.create_required_tables(main_db)
             self.db_ops.seed_manual_tables_if_needed(main_db, self.settings.manual_seed_files)
-            self._seed_asterisk(main_db)
+            if not self._seed_asterisk(main_db):
+                return False
 
             self.db_ops.grant_privileges(main_db)
             self.logger.info("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА УСПЕШНО ===")
@@ -153,7 +198,13 @@ class ETLPipeline:
             if extract_dir:
                 shutil.rmtree(extract_dir, ignore_errors=True)
 
-    def run_nightly(self, dump_file: str, cleanup: bool = True, skip_weekly: bool = False) -> bool:
+    def run_nightly(
+        self,
+        dump_file: str,
+        cleanup: bool = True,
+        skip_weekly: bool = False,
+        force_weekly: bool = False,
+    ) -> bool:
         self.logger.info("=== ЗАПУСК НОЧНОЙ ОБРАБОТКИ ===")
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
@@ -192,7 +243,6 @@ class ETLPipeline:
                 return False
 
             self.db_ops.create_required_tables(temp_db)
-            self._seed_asterisk(temp_db)
 
             modifications = build_snapshot_exports(
                 self.db_ops,
@@ -214,23 +264,12 @@ class ETLPipeline:
                     return False
 
             self.db_ops.create_required_tables(main_db)
+            if not self._seed_asterisk(main_db):
+                return False
             if skip_weekly:
                 self.logger.info("Weekly insert пропущен по флагу --skip-weekly")
-            else:
-                weekly_result = self.db_ops.add_weekly_records(main_db, self.settings.target_day)
-                if weekly_result["skipped"]:
-                    self.logger.info(
-                        f"Weekly insert пропущен: сегодня {weekly_result['current_day']}, целевой день {weekly_result['target_day']}"
-                    )
-                else:
-                    self.logger.info(
-                        "Weekly insert обработан: "
-                        f"snapshot_date={weekly_result.get('snapshot_date', '')}, "
-                        f"group_upserted={weekly_result.get('group_upserted', 0)}, "
-                        f"group_inserted={weekly_result.get('group_inserted', 0)}, "
-                        f"users_upserted={weekly_result.get('users_upserted', 0)}, "
-                        f"users_inserted={weekly_result.get('users_inserted', 0)}"
-                    )
+            elif not self._run_weekly(main_db, force_weekly=force_weekly):
+                return False
 
             self.db_ops.grant_privileges(main_db)
             self.logger.info("=== НОЧНАЯ ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО ===")
@@ -239,13 +278,25 @@ class ETLPipeline:
             self._cleanup(temp_db, extract_dir, export_dir, cleanup)
             cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
 
-    def run(self, dump_file: str, init_mode: bool = False, cleanup: bool = True, skip_weekly: bool = False) -> bool:
+    def run(
+        self,
+        dump_file: str,
+        init_mode: bool = False,
+        cleanup: bool = True,
+        skip_weekly: bool = False,
+        force_weekly: bool = False,
+    ) -> bool:
         self.logger.info(f"Дата запуска: {datetime.now()}")
         self.logger.info(f"Пользователь запуска: {os.getenv('USER', 'unknown')}")
         self.logger.info(f"Хост: {os.uname().nodename}")
         if init_mode:
             return self.run_init(dump_file)
-        return self.run_nightly(dump_file, cleanup, skip_weekly=skip_weekly)
+        return self.run_nightly(
+            dump_file,
+            cleanup,
+            skip_weekly=skip_weekly,
+            force_weekly=force_weekly,
+        )
 
     def run_selected(
         self,
@@ -254,6 +305,7 @@ class ETLPipeline:
         init_mode: bool = False,
         cleanup: bool = True,
         skip_weekly: bool = False,
+        force_weekly: bool = False,
         db_scope: str = "auto",
         temp_db_name: str | None = None,
     ) -> bool:
@@ -309,7 +361,7 @@ class ETLPipeline:
 
             if effective_scope == "temp" and "restore" in stages:
                 temp_db = self._build_temp_db_name()
-            if effective_scope == "temp" and not temp_db and any(stage in {"seed_asterisk", "compare", "load", "cleanup"} for stage in stages):
+            if effective_scope == "temp" and not temp_db and any(stage in {"compare", "load", "cleanup"} for stage in stages):
                 self.logger.error("Для temp-стадий без restore нужно указать --temp-db-name")
                 return False
 
@@ -332,8 +384,8 @@ class ETLPipeline:
                     if effective_scope == "main":
                         self.db_ops.seed_manual_tables_if_needed(target_db, self.settings.manual_seed_files)
                 elif stage == "seed_asterisk":
-                    target_db = main_db if effective_scope == "main" else temp_db
-                    self._seed_asterisk(target_db)
+                    if not self._seed_asterisk(main_db):
+                        return False
                 elif stage == "compare":
                     export_dir = os.path.join(
                         self.settings.temp_dir,
@@ -376,20 +428,8 @@ class ETLPipeline:
                     if skip_weekly:
                         self.logger.info("Weekly insert пропущен по флагу --skip-weekly")
                         continue
-                    weekly_result = self.db_ops.add_weekly_records(main_db, self.settings.target_day)
-                    if weekly_result["skipped"]:
-                        self.logger.info(
-                            f"Weekly insert пропущен: сегодня {weekly_result['current_day']}, целевой день {weekly_result['target_day']}"
-                        )
-                    else:
-                        self.logger.info(
-                            "Weekly insert обработан: "
-                            f"snapshot_date={weekly_result.get('snapshot_date', '')}, "
-                            f"group_upserted={weekly_result.get('group_upserted', 0)}, "
-                            f"group_inserted={weekly_result.get('group_inserted', 0)}, "
-                            f"users_upserted={weekly_result.get('users_upserted', 0)}, "
-                            f"users_inserted={weekly_result.get('users_inserted', 0)}"
-                        )
+                    if not self._run_weekly(main_db, force_weekly=force_weekly):
+                        return False
                 elif stage == "cleanup":
                     self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, export_dir, cleanup)
                     extract_dir = None
@@ -416,6 +456,11 @@ def main() -> None:
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
     parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
+        "--force-weekly",
+        action="store_true",
+        help="Выполнить weekly независимо от weekly_days и weekly_enabled",
+    )
+    parser.add_argument(
         "--tasks",
         help=(
             "Список стадий через запятую: "
@@ -426,7 +471,7 @@ def main() -> None:
         "--db-scope",
         choices=("auto", "main", "temp"),
         default="auto",
-        help="Для restore/seed_asterisk: main, temp или auto",
+        help="Целевая БД для restore; seed_asterisk всегда дополняет main",
     )
     parser.add_argument(
         "--temp-db-name",
@@ -461,6 +506,7 @@ def main() -> None:
             init_mode=args.init,
             cleanup=args.cleanup,
             skip_weekly=args.skip_weekly,
+            force_weekly=args.force_weekly,
             db_scope=args.db_scope,
             temp_db_name=args.temp_db_name,
         )
@@ -470,6 +516,7 @@ def main() -> None:
             init_mode=args.init,
             cleanup=args.cleanup,
             skip_weekly=args.skip_weekly,
+            force_weekly=args.force_weekly,
         )
     sys.exit(0 if success else 1)
 

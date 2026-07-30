@@ -112,14 +112,14 @@ cleanup
 ### `seed_asterisk`
 
 Назначение:
-- отдельно обработать `asterisk_cdr`
-- при необходимости загрузить её из CSV
+- отдельно дополнить `asterisk_cdr` в стабильной main БД
+- загрузить во временную таблицу CSV и вставить только отсутствующие `id`
 - гарантировать наличие `project_id`
 - снять schema snapshot после обработки
 
 Почему отдельная стадия:
 - пользователь может запускать её отдельно
-- restore больше не скрывает внутри себя `asterisk`-seed
+- она не зависит от staging и не входит в общий snapshot
 
 ### `compare`
 
@@ -137,7 +137,7 @@ cleanup
 
 Назначение:
 - применить snapshot-CSV в `main_db` через `UPSERT`
-- удалить legacy `cf_*` из `issues/projects` перед UPSERT без `CASCADE`
+- отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
 
 Работает только по staging-derived данным.
 
@@ -176,7 +176,9 @@ Task-версия передаёт между шагами словарь `conte
 - `db_name`
 - `temp_db`
 - `tables`
-- `target_day`
+- `weekly_enabled`
+- `weekly_days`
+- `force_weekly`
 - `cleanup_temp_db`
 - `create_database`
 - `modifications`
@@ -193,6 +195,7 @@ Task-версия передаёт между шагами словарь `conte
 - `--db-scope main|temp|auto`
 - `--temp-db-name`
 - `--skip-weekly`
+- `--force-weekly`
 
 ### `--tasks`
 
@@ -206,13 +209,12 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 
 ### `--db-scope`
 
-Используется для стадий:
-- `restore`
-- `seed_asterisk`
+Используется для стадии `restore`.
 
 Правила:
 - `auto` = `main` для `--init`
 - `auto` = `temp` для nightly
+- `seed_asterisk` всегда дополняет `main_db`
 
 ### `--temp-db-name`
 
@@ -240,10 +242,15 @@ CLI автоматически дополняет план:
 
 ### `asterisk_cdr`
 
-Может жить в dump или в отдельном CSV.
+Живет в стабильной main БД и дополняется из отдельного CSV.
 
 Стадия:
 - `seed_asterisk`
+
+Алгоритм:
+- CSV копируется во временную таблицу PostgreSQL
+- `INSERT ... ON CONFLICT (id) DO NOTHING` добавляет только новые строки
+- таблица не экспортируется из main и не переносится через staging snapshot
 
 ### `group_employee_count`
 
@@ -266,6 +273,11 @@ CLI автоматически дополняет план:
 
 Источник:
 - `COUNT(*)` по активным пользователям
+
+Настройка weekly:
+- `weekly_enabled` включает автоматический шаг
+- `weekly_days` принимает ISO-дни через запятую
+- `--force-weekly` запускает срез независимо от расписания
 
 ## 8. Логирование
 

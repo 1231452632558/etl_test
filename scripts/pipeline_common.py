@@ -70,7 +70,8 @@ class PipelineSettings:
     log_level: str
     max_backups: int
     cleanup_temp_db: bool
-    target_day: int
+    weekly_enabled: bool
+    weekly_days: Tuple[int, ...]
     weekly_group_name_pattern: str
     remote_user: str
     remote_host: str
@@ -103,10 +104,16 @@ class PipelineSettings:
         }
 
         snapshot_tables = cls._parse_snapshot_tables(parser)
+        for manual_table in ("asterisk_cdr", "group_employee_count", "users_active"):
+            snapshot_tables.pop(manual_table, None)
         issues_table = parser.get("tables", "issues_table", fallback="issues").strip() or "issues"
         projects_table = parser.get("tables", "projects_table", fallback="projects").strip() or "projects"
         snapshot_tables.setdefault(issues_table, "id")
         snapshot_tables.setdefault(projects_table, "id")
+        target_day = parser.getint("schedule", "target_day", fallback=1)
+        weekly_days = cls._parse_weekly_days(
+            parser.get("schedule", "weekly_days", fallback=str(target_day))
+        )
 
         return cls(
             config_path=config_path,
@@ -122,7 +129,8 @@ class PipelineSettings:
             log_level=parser.get("logging", "log_level", fallback="INFO"),
             max_backups=parser.getint("retention", "max_backups", fallback=3),
             cleanup_temp_db=parser.getboolean("retention", "cleanup_temp_db", fallback=True),
-            target_day=parser.getint("schedule", "target_day", fallback=1),
+            weekly_enabled=parser.getboolean("schedule", "weekly_enabled", fallback=True),
+            weekly_days=weekly_days,
             weekly_group_name_pattern=parser.get("schedule", "weekly_group_name_pattern", fallback="masked"),
             remote_user=parser.get("remote", "remote_user", fallback=""),
             remote_host=parser.get("remote", "remote_host", fallback=""),
@@ -154,6 +162,20 @@ class PipelineSettings:
             pk_columns = [col.strip() for col in pk.split("+") if col.strip()]
             tables[table_name.strip()] = pk_columns if len(pk_columns) > 1 else pk_columns[0]
         return tables
+
+    @staticmethod
+    def _parse_weekly_days(raw_value: str) -> Tuple[int, ...]:
+        try:
+            days = tuple(sorted({int(value.strip()) for value in raw_value.split(",") if value.strip()}))
+        except ValueError as exc:
+            raise ValueError(
+                f"Некорректный weekly_days: {raw_value}. Используйте числа 1-7 через запятую."
+            ) from exc
+        if not days or any(day < 1 or day > 7 for day in days):
+            raise ValueError(
+                f"Некорректный weekly_days: {raw_value}. Допустимы дни недели 1-7."
+            )
+        return days
 
 
 class ETLLogger:
@@ -492,45 +514,6 @@ class DatabaseOperations:
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
 
-    def drop_materialized_custom_value_columns(self, table_name: str, db_name: str) -> bool:
-        """Удаляет legacy cf_* из issues/projects перед snapshot UPSERT."""
-        table_name = _validate_identifier(table_name, "table_name")
-        protected_tables = {self.settings.issues_table, self.settings.projects_table}
-        if table_name not in protected_tables:
-            return True
-
-        custom_columns = [
-            column
-            for column in self.get_table_columns(table_name, db_name)
-            if column.startswith("cf_")
-        ]
-        if not custom_columns:
-            return True
-
-        drop_clauses = ", ".join(
-            f"DROP COLUMN IF EXISTS {_quote_identifier(column)}"
-            for column in custom_columns
-        )
-        self.logger.warning(
-            f"Удаление legacy custom value columns перед UPSERT: db={db_name}, "
-            f"table={table_name}, columns={custom_columns}"
-        )
-        if not self._run_psql(
-            f"ALTER TABLE {_quote_identifier(table_name)} {drop_clauses};",
-            db_name=db_name,
-            context_label=f"drop-custom-columns:{table_name}",
-        ):
-            self.logger.error(
-                f"Не удалось удалить legacy cf_* из {table_name}. "
-                "Проверьте зависимости представлений и отчетов; CASCADE не используется."
-            )
-            return False
-        self.logger.info(
-            f"Legacy custom value columns удалены: db={db_name}, "
-            f"table={table_name}, removed={len(custom_columns)}"
-        )
-        return True
-
     def get_table_column_details(self, table_name: str, db_name: str) -> List[Tuple[str, str]]:
         table_name = _validate_identifier(table_name, "table_name")
         query = f"""
@@ -704,8 +687,6 @@ class DatabaseOperations:
                 f"UPSERT остановлен: snapshot для {table_name} содержит запрещенные "
                 f"custom value columns: {blocked_columns}"
             )
-            return False
-        if not self.drop_materialized_custom_value_columns(table_name, db_name):
             return False
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]
@@ -903,12 +884,125 @@ DROP TABLE temp_upsert;
                 self.logger.info(f"Импортирован seed для {table_name}: {csv_file}")
         return results
 
-    def seed_asterisk_cdr_if_needed(self, db_name: str, csv_file: Optional[str] = None) -> bool:
+    def append_asterisk_cdr_from_csv(
+        self,
+        db_name: str,
+        csv_file: Optional[str] = None,
+    ) -> Dict[str, object]:
         csv_file = csv_file or self.settings.asterisk_csv_file
-        imported = self.import_csv_to_table_if_empty("asterisk_cdr", csv_file, db_name, delimiter=";")
-        if imported:
-            self.logger.info(f"Импортирован seed для asterisk_cdr: {csv_file}")
-        return imported
+        table_name = "asterisk_cdr"
+        if not os.path.exists(csv_file):
+            self.logger.warning(f"Asterisk CSV не найден: {csv_file}")
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "csv_not_found",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+        if not self.table_exists(table_name, db_name):
+            self.logger.error(f"Таблица {table_name} отсутствует в db={db_name}")
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "table_not_found",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+
+        table_columns = self.get_table_columns(table_name, db_name)
+        table_columns_by_lower = {column.lower(): column for column in table_columns}
+        csv_columns = [
+            _normalize_csv_column_name(column)
+            for column in _read_csv_header(csv_file, delimiter=";")
+        ]
+        mapped_columns: List[str] = []
+        for csv_column in csv_columns:
+            matched_column = table_columns_by_lower.get(csv_column)
+            if not matched_column:
+                self.logger.error(
+                    f"Колонка {csv_column} из {csv_file} отсутствует в {table_name}; "
+                    f"table_columns={table_columns}"
+                )
+                return {
+                    "success": False,
+                    "skipped": False,
+                    "reason": f"missing_column:{csv_column}",
+                    "source_rows": 0,
+                    "inserted_rows": 0,
+                }
+            mapped_columns.append(matched_column)
+        if "id" not in {column.lower() for column in mapped_columns}:
+            self.logger.error(f"Asterisk CSV не содержит обязательную колонку id: {csv_file}")
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "missing_primary_key",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+
+        with open(csv_file, "r", encoding="utf-8", newline="") as handle:
+            source_rows = max(sum(1 for _ in csv.reader(handle, delimiter=";")) - 1, 0)
+        rows_before = self.count_rows(table_name, db_name)
+        quoted_columns = ", ".join(_quote_identifier(column) for column in mapped_columns)
+        escaped_csv_file = csv_file.replace("'", "''")
+        script = f"""
+CREATE TEMP TABLE temp_asterisk_import AS
+SELECT {quoted_columns}
+FROM {_quote_identifier(table_name)}
+LIMIT 0;
+
+\\copy temp_asterisk_import ({quoted_columns}) FROM '{escaped_csv_file}' WITH (
+    FORMAT csv,
+    HEADER true,
+    DELIMITER ';',
+    QUOTE '"',
+    ESCAPE '"',
+    ENCODING 'UTF8'
+);
+
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM temp_asterisk_import
+ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
+"""
+        self.logger.info(
+            f"Asterisk append старт: db={db_name}, csv={csv_file}, "
+            f"source_rows={source_rows}, rows_before={rows_before}, columns={mapped_columns}"
+        )
+        if not self._run_psql_script(
+            script,
+            db_name=db_name,
+            context_label="asterisk:append",
+        ):
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "psql_error",
+                "source_rows": source_rows,
+                "inserted_rows": 0,
+                "rows_before": rows_before,
+            }
+
+        self.sync_sequence_with_max_id(table_name, db_name)
+        self.add_project_id_column(db_name)
+        rows_after = self.count_rows(table_name, db_name)
+        inserted_rows = max(rows_after - rows_before, 0)
+        self.logger.info(
+            f"Asterisk append завершен: db={db_name}, source_rows={source_rows}, "
+            f"inserted_rows={inserted_rows}, existing_rows={max(source_rows - inserted_rows, 0)}, "
+            f"rows_after={rows_after}"
+        )
+        return {
+            "success": True,
+            "skipped": False,
+            "reason": "",
+            "source_rows": source_rows,
+            "inserted_rows": inserted_rows,
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+        }
 
     def list_indexes(self, table_name: str, db_name: str) -> List[str]:
         table_name = _validate_identifier(table_name, "table_name")
@@ -921,11 +1015,28 @@ DROP TABLE temp_upsert;
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
 
-    def add_weekly_records(self, db_name: str, target_day: int) -> Dict[str, int | bool]:
+    def add_weekly_records(
+        self,
+        db_name: str,
+        target_days: Sequence[int] | int,
+        force: bool = False,
+    ) -> Dict[str, object]:
         today = date.today()
         current_day = today.isocalendar()[2]
-        if current_day != target_day:
-            return {"skipped": True, "current_day": current_day, "target_day": target_day}
+        normalized_days = (
+            (target_days,)
+            if isinstance(target_days, int)
+            else tuple(sorted(set(target_days)))
+        )
+        if not normalized_days or any(day < 1 or day > 7 for day in normalized_days):
+            raise ValueError(f"Некорректные дни weekly: {normalized_days}")
+        if not force and current_day not in normalized_days:
+            return {
+                "skipped": True,
+                "current_day": current_day,
+                "target_days": list(normalized_days),
+                "force": force,
+            }
 
         raw_pattern = self.settings.weekly_group_name_pattern.strip()
         normalized_pattern = raw_pattern.strip("\"'").strip()
@@ -937,6 +1048,7 @@ DROP TABLE temp_upsert;
         self.logger.info(
             f"Weekly debug: db={db_name}, python_snapshot_date={snapshot_date}, "
             f"db_current_date={db_current_date}, db_current_timestamp={db_current_timestamp}, "
+            f"target_days={list(normalized_days)}, force={force}, "
             f"group_name_pattern={normalized_pattern}"
         )
         self.log_table_schema("group_employee_count", db_name, include_indexes=False)
@@ -1181,7 +1293,8 @@ DROP TABLE temp_upsert;
         return {
             "skipped": False,
             "current_day": current_day,
-            "target_day": target_day,
+            "target_days": list(normalized_days),
+            "force": force,
             "snapshot_date": snapshot_date,
             "group_source_count": group_source_count,
             "group_upserted": group_upserted,
