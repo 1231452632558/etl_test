@@ -14,7 +14,7 @@
 Это значит, что:
 - SQL-логика
 - restore
-- custom transform
+- блокировка материализованных `cf_*`
 - snapshot export/import
 - weekly-логика
 - seed ручных таблиц
@@ -62,7 +62,6 @@ Task-entrypoint.
 - `extract_task.py`
 - `restore_task.py`
 - `seed_asterisk_task.py`
-- `transform_custom_values_task.py`
 - `compare_task.py`
 - `load_task.py`
 - `weekly_task.py`
@@ -84,7 +83,6 @@ Task-entrypoint.
 extract
 restore
 seed_asterisk
-transform_custom_values
 compare
 load
 weekly
@@ -114,30 +112,20 @@ cleanup
 ### `seed_asterisk`
 
 Назначение:
-- отдельно обработать `asterisk_cdr`
-- при необходимости загрузить её из CSV
+- отдельно дополнить `asterisk_cdr` в стабильной main БД
+- загрузить во временную таблицу CSV и вставить только отсутствующие `id`
 - гарантировать наличие `project_id`
 - снять schema snapshot после обработки
 
 Почему отдельная стадия:
 - пользователь может запускать её отдельно
-- restore больше не скрывает внутри себя `asterisk`-seed
-
-### `transform_custom_values`
-
-Назначение:
-- материализовать `custom_values` в `issues.cf_*` и `projects.cf_*`
-
-Работает:
-- по `main_db`
-- или по `temp_db`
-
-в зависимости от `db_scope`.
+- она не зависит от staging и не входит в общий snapshot
 
 ### `compare`
 
 Назначение:
 - экспортировать snapshot-CSV из staging
+- исключить `cf_*` из `issues/projects`
 
 Работает только по `temp_db`.
 
@@ -149,6 +137,7 @@ cleanup
 
 Назначение:
 - применить snapshot-CSV в `main_db` через `UPSERT`
+- отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
 
 Работает только по staging-derived данным.
 
@@ -187,7 +176,9 @@ Task-версия передаёт между шагами словарь `conte
 - `db_name`
 - `temp_db`
 - `tables`
-- `target_day`
+- `weekly_enabled`
+- `weekly_days`
+- `force_weekly`
 - `cleanup_temp_db`
 - `create_database`
 - `modifications`
@@ -195,10 +186,7 @@ Task-версия передаёт между шагами словарь `conte
 
 Практический смысл:
 - если стадия запускается отдельно, нужные ей ключи должны уже существовать или задаваться через CLI-режим
-
-Пример:
-- `transform_custom_values --db-scope main` не требует dump
-- `transform_custom_values --db-scope temp` без `restore` требует `--temp-db-name`
+- `cf_*` никогда не должны присутствовать в `modifications`
 
 ## 5. CLI-контракт
 
@@ -207,6 +195,7 @@ Task-версия передаёт между шагами словарь `conte
 - `--db-scope main|temp|auto`
 - `--temp-db-name`
 - `--skip-weekly`
+- `--force-weekly`
 
 ### `--tasks`
 
@@ -215,19 +204,17 @@ Task-версия передаёт между шагами словарь `conte
 Пример:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
 ```
 
 ### `--db-scope`
 
-Используется для стадий:
-- `restore`
-- `seed_asterisk`
-- `transform_custom_values`
+Используется для стадии `restore`.
 
 Правила:
 - `auto` = `main` для `--init`
 - `auto` = `temp` для nightly
+- `seed_asterisk` всегда дополняет `main_db`
 
 ### `--temp-db-name`
 
@@ -238,7 +225,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform
 ```bash
 python3 scripts/etl_pipeline.py \
   --config config/etl_config.ini \
-  --tasks transform_custom_values,compare \
+  --tasks compare \
   --db-scope temp \
   --temp-db-name temp_restore_20260507_123456
 ```
@@ -255,10 +242,15 @@ CLI автоматически дополняет план:
 
 ### `asterisk_cdr`
 
-Может жить в dump или в отдельном CSV.
+Живет в стабильной main БД и дополняется из отдельного CSV.
 
 Стадия:
 - `seed_asterisk`
+
+Алгоритм:
+- CSV копируется во временную таблицу PostgreSQL
+- `INSERT ... ON CONFLICT (id) DO NOTHING` добавляет только новые строки
+- таблица не экспортируется из main и не переносится через staging snapshot
 
 ### `group_employee_count`
 
@@ -282,6 +274,11 @@ CLI автоматически дополняет план:
 Источник:
 - `COUNT(*)` по активным пользователям
 
+Настройка weekly:
+- `weekly_enabled` включает автоматический шаг
+- `weekly_days` принимает ISO-дни через запятую
+- `--force-weekly` запускает срез независимо от расписания
+
 ## 8. Логирование
 
 Лог строится так, чтобы можно было понять:
@@ -289,13 +286,13 @@ CLI автоматически дополняет план:
 - какой набор стадий выбран
 - какая БД является target
 - какие таблицы и индексы реально существуют
-- какие sample данные были выбраны weekly/custom transform
+- какие sample данные были выбраны weekly
 
 Особенно важные отладочные блоки:
 - `Версия репозитория`
 - `План стадий ...`
 - `Schema snapshot`
-- `Custom transform sample mappings`
+- `Custom value columns исключены из snapshot`
 - `Weekly debug ...`
 
 ## 9. Почему важна эквивалентность монолита и tasks

@@ -92,7 +92,7 @@ remote_path = /path/to/dumps/
 backup_tar = nightly_dump.tar.gz
 
 [tables]
-incremental_tables = asterisk_cdr:id
+incremental_tables =
 issues_table = issues
 projects_table = projects
 
@@ -101,6 +101,8 @@ max_backups = 3
 cleanup_temp_db = true
 
 [schedule]
+weekly_enabled = true
+weekly_days = 1
 target_day = 1
 ```
 
@@ -108,14 +110,14 @@ target_day = 1
 
 Сюда надо включать таблицы, которые должны попадать из staging в main через snapshot + `UPSERT`.
 
-Пример:
+Пример для обычных dump-таблиц:
 
 ```ini
-incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id
+incremental_tables = users:id,orders:id,products:id
 ```
 
 Если `issues` или `projects` не указать, они всё равно будут автоматически добавлены логикой pipeline через `issues_table` и `projects_table`.
-`group_employee_count` и `users_active` не добавляются в `incremental_tables`, потому что это ручные weekly-таблицы, а не snapshot-таблицы из nightly dump.
+`asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются из `incremental_tables`: они принадлежат стабильной main БД и не выгружаются из staging.
 
 ## 6. Seed-файлы для ручных таблиц
 
@@ -132,7 +134,7 @@ incremental_tables = users:id,orders:id,products:id,asterisk_cdr:id
 /workspace/logs/users_active_backup.csv
 ```
 
-Для `asterisk_cdr` seed применяется если таблица пустая в main или staging БД.
+Для `asterisk_cdr` CSV читается при каждом запуске стадии `seed_asterisk`, но в main добавляются только отсутствующие `id`.
 
 Для `group_employee_count` и `users_active` seed применяется только если соответствующая таблица в main БД пустая.
 
@@ -183,36 +185,38 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup 
 
 Флаг `--cleanup` удаляет staging БД после завершения.
 
+Перед каждым запуском pipeline дополнительно ищет и удаляет осиротевшие staging-БД
+предыдущих запусков. В логе это отражается строкой `Staging cleanup завершен`.
+
 ## 8.1. Частичный запуск стадий
 
 Обе версии поддерживают одинаковые стадии:
 
 ```text
-extract, restore, seed_asterisk, transform_custom_values, compare, load, weekly, cleanup
+extract, restore, seed_asterisk, compare, load, weekly, cleanup
 ```
 
 Примеры:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 И те же команды для монолита:
 
 ```bash
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks restore,seed_asterisk,transform_custom_values --db-scope temp /path/to/dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 Пояснения:
 - `--tasks` задаёт только нужные стадии
-- `--db-scope main|temp|auto` определяет, над какой БД выполнять `restore`, `seed_asterisk`, `transform_custom_values`
+- `--db-scope main|temp|auto` определяет БД для `restore`; `seed_asterisk` всегда дополняет main
 - `--temp-db-name` нужен, если вы хотите запускать temp-стадии отдельно, без нового `restore`
+- `--force-weekly` запускает weekly сейчас независимо от `weekly_days` и `weekly_enabled`
 - `compare` и `load` работают только с `temp` scope
 - `restore` автоматически добавит `extract`, если он не указан
 - `load` автоматически добавит `compare`, если он не указан
@@ -236,9 +240,9 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks re
 1. Main БД уже не должна удаляться nightly-процессом.
 2. Nightly dump должен успешно подниматься во временной staging БД.
 3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
-4. Seed CSV для ручных таблиц должны лежать в ожидаемом месте.
+4. CSV для append `asterisk_cdr` и init-only seed CSV должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
-6. На тестовом прогоне нужно вручную сравнить `issues`, `projects` и их `cf_*` колонки после custom transform.
+6. Snapshot `issues/projects` не должен содержать колонки `cf_*`.
 
 ## 11. Диагностика
 
@@ -260,20 +264,15 @@ sudo -u postgres psql -c "\l"
 sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'temp_restore_%';"
 ```
 
-### Проверка custom transform
+### Проверка блокировки custom values
 
 ```bash
 sudo -u postgres psql -d your_main_db -c "\d issues"
 sudo -u postgres psql -d your_main_db -c "\d projects"
-sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM issues LIMIT 5;"
-sudo -u postgres psql -d your_main_db -c "SELECT id, * FROM projects LIMIT 5;"
 ```
 
-### Проверка индексов на custom_values
-
-```bash
-sudo -u postgres psql -d your_main_db -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'custom_values';"
-```
+Ранее созданные `cf_*` остаются в main БД. Pipeline не удаляет их, не обновляет
+из custom values и не переносит через snapshot.
 
 ## 12. Частые проблемы
 
@@ -297,12 +296,14 @@ ssh your_remote_user@your_remote_host
 sudo -u postgres psql -c "SELECT 1;"
 ```
 
-### Не создаются `cf_*` колонки
+### В snapshot обнаружены `cf_*`
 
-Проверьте наличие:
-- `issues`
-- `projects`
-- `custom_values`
-- `custom_fields`
+Pipeline намеренно остановит UPSERT `issues/projects`, если входной snapshot
+содержит `cf_*`. Проверьте, что используется актуальный код и snapshot создан
+новой стадией `compare`.
 
-И посмотрите индексы на `custom_values`.
+### Старые `cf_*` остались в main
+
+Это ожидаемо: одноразовое удаление больше не входит в pipeline. Если понадобится
+отдельная очистка схемы, выполняйте ее как контролируемую миграцию вне nightly.
+Pipeline намеренно не использует `CASCADE`.

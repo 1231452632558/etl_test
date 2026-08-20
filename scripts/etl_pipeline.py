@@ -32,7 +32,6 @@ from tasks import (  # noqa: E402
     RestoreTask,
     SeedAsteriskTask,
     TaskRunner,
-    TransformCustomValuesTask,
     WeeklyTask,
 )
 
@@ -41,7 +40,6 @@ STAGE_NAMES = (
     "extract",
     "restore",
     "seed_asterisk",
-    "transform_custom_values",
     "compare",
     "load",
     "weekly",
@@ -83,9 +81,11 @@ def parse_stage_selection(raw_value: str | None, init_mode: bool) -> list[str]:
 
 
 def default_stages(init_mode: bool, skip_weekly: bool) -> list[str]:
-    stages = ["extract", "restore", "seed_asterisk", "transform_custom_values"]
-    if not init_mode:
-        stages.extend(["compare", "load"])
+    stages = ["extract", "restore"]
+    if init_mode:
+        stages.append("seed_asterisk")
+    else:
+        stages.extend(["compare", "load", "seed_asterisk"])
         if not skip_weekly:
             stages.append("weekly")
     stages.append("cleanup")
@@ -121,16 +121,7 @@ def build_runner(
                     settings,
                     logger,
                     db_ops,
-                    db_key="main_db" if effective_scope == "main" else "temp_db",
-                )
-            )
-        elif stage == "transform_custom_values":
-            runner.add_task(
-                TransformCustomValuesTask(
-                    settings,
-                    logger,
-                    db_ops,
-                    db_key="main_db" if effective_scope == "main" else "temp_db",
+                    db_key="main_db",
                 )
             )
         elif stage == "compare":
@@ -154,17 +145,22 @@ def main() -> None:
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
     parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
+        "--force-weekly",
+        action="store_true",
+        help="Выполнить weekly независимо от weekly_days и weekly_enabled",
+    )
+    parser.add_argument(
         "--tasks",
         help=(
             "Список стадий через запятую: "
-            "extract,restore,seed_asterisk,transform_custom_values,compare,load,weekly,cleanup"
+            "extract,restore,seed_asterisk,compare,load,weekly,cleanup"
         ),
     )
     parser.add_argument(
         "--db-scope",
         choices=("auto", "main", "temp"),
         default="auto",
-        help="Для restore/seed_asterisk/transform_custom_values: main, temp или auto",
+        help="Целевая БД для restore; seed_asterisk всегда дополняет main",
     )
     parser.add_argument(
         "--temp-db-name",
@@ -209,6 +205,7 @@ def main() -> None:
         logger.error("Стадия load предполагает snapshot из temp scope")
         sys.exit(1)
 
+    db_ops.cleanup_stale_databases(exclude_names=[args.temp_db_name] if args.temp_db_name else [])
     cleanup_temp_artifacts(settings.temp_dir, logger)
 
     if (
@@ -233,7 +230,7 @@ def main() -> None:
     temp_db = None
     if effective_scope == "temp":
         temp_db = build_temp_db_name(settings) if "restore" in planned_stages else args.temp_db_name
-        if not temp_db and any(stage in {"seed_asterisk", "transform_custom_values", "compare", "load", "cleanup"} for stage in planned_stages):
+        if not temp_db and any(stage in {"compare", "load", "cleanup"} for stage in planned_stages):
             logger.error("Для temp-стадий без restore нужно указать --temp-db-name")
             sys.exit(1)
 
@@ -255,7 +252,9 @@ def main() -> None:
             "temp_db": temp_db,
             "tables": settings.snapshot_tables,
             "cleanup_temp_db": args.cleanup,
-            "target_day": settings.target_day,
+            "weekly_enabled": settings.weekly_enabled,
+            "weekly_days": settings.weekly_days,
+            "force_weekly": args.force_weekly,
             "create_database": args.init or ("restore" in planned_stages and effective_scope == "main"),
         }
     )

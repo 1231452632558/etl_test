@@ -16,7 +16,6 @@
 
 на процесс:
 - restore dump во временную staging БД
-- custom transform в staging
 - `UPSERT` snapshot-таблиц в стабильную main БД
 - weekly-обновление ручных таблиц
 
@@ -30,8 +29,8 @@
 ## Что меняется
 
 - Main БД становится долгоживущей
-- `issues` и `projects` загружаются в main уже после materialized custom transform
-- `asterisk_cdr` и другие snapshot-таблицы вливаются через `UPSERT`
+- `issues` и `projects` загружаются в main без автоматической материализации custom values
+- `asterisk_cdr` дополняется напрямую из CSV в main по отсутствующим `id`
 - `group_employee_count` и `users_active` больше не живут через nightly export/import
 
 ## Выбор Python-версии
@@ -47,7 +46,7 @@
 При этом монолит и task-версия должны оставаться равноправными:
 - одинаковые стадии
 - одинаковая nightly-логика
-- одинаковые ключи `--tasks`, `--db-scope`, `--temp-db-name`, `--skip-weekly`
+- одинаковые ключи `--tasks`, `--db-scope`, `--temp-db-name`, `--skip-weekly`, `--force-weekly`
 
 ## Перед началом
 
@@ -68,13 +67,13 @@
 2. Какие таблицы реально должны идти через snapshot nightly-поток.
 3. Где сейчас лежит CSV для `asterisk_cdr`.
 4. Где лежат CSV для `group_employee_count` и `users_active`.
-5. Какие индексы уже есть на `custom_values`, `issues` и `projects`.
+5. Какие индексы уже есть на `issues` и `projects`.
 
 Проверки:
 
 ```bash
 sudo -u postgres psql -d <main_db> -c "\dt"
-sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('custom_values', 'issues', 'projects');"
+sudo -u postgres psql -d <main_db> -c "SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('issues', 'projects');"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM asterisk_cdr;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM group_employee_count;"
 sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
@@ -93,18 +92,23 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `issues_table = issues`
 - `projects_table = projects`
 - `incremental_tables` — только snapshot-таблицы
+- `weekly_enabled` и `weekly_days` — включение и дни weekly-среза
 
 Важно:
 - `issues` и `projects` можно не добавлять в `incremental_tables`, они подтянутся автоматически через `issues_table` и `projects_table`
-- `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
+- `asterisk_cdr`, `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
 
 Минимальный пример:
 
 ```ini
 [tables]
-incremental_tables = asterisk_cdr:id
+incremental_tables =
 issues_table = issues
 projects_table = projects
+
+[schedule]
+weekly_enabled = true
+weekly_days = 1
 ```
 
 ## Этап 3. Подготовка seed CSV
@@ -120,7 +124,7 @@ projects_table = projects
 ```
 
 Правила:
-- `asterisk_cdr.csv` используется как CSV-source, если таблица не приходит в dump
+- `asterisk_cdr.csv` является append-only источником для стабильной main БД
 - `group_employee_count_backup.csv` и `users_active_backup.csv` нужны как стартовый seed для пустой main БД
 
 ## Этап 4. Прогон в тестовом окружении
@@ -140,8 +144,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 ```
 
 Что проверить:
-- `issues` содержит `cf_*`
-- `projects` содержит `cf_*`
+- `issues` и `projects` обновились через snapshot-поток
 - `asterisk_cdr` загружена корректно
 - `group_employee_count` и `users_active` не потеряли исторические данные
 - staging БД очищается после завершения
@@ -174,10 +177,9 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/t
 
 Что произойдет:
 1. dump поднимется во staging
-2. `asterisk_cdr` при необходимости догрузится из CSV
-3. custom transform выполнится в staging для `issues` и `projects`
-4. snapshot-таблицы будут влиты в main через `UPSERT`
-5. weekly-таблицы обновятся отдельным шагом
+2. в main добавятся отсутствующие строки `asterisk_cdr` из CSV
+3. snapshot-таблицы будут влиты в main через `UPSERT`
+4. weekly-таблицы обновятся отдельным шагом
 
 ### Вариант B. Нужна новая инициализация новой main БД
 
@@ -204,10 +206,9 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 ```
 
 Дополнительно:
-1. Визуально проверить несколько `issues` и `projects` с custom fields.
-2. Проверить, что `cf_*` колонки заполнились.
-3. Проверить, что `project_id` в `asterisk_cdr` задан.
-4. Проверить, что weekly-таблицы не задублировались.
+1. Визуально проверить несколько `issues` и `projects`.
+2. Проверить, что `project_id` в `asterisk_cdr` задан.
+3. Проверить, что weekly-таблицы не задублировались.
 
 ## Этап 8. Переключение cron
 
@@ -228,16 +229,15 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 В первые 3-7 дней отслеживайте:
 1. Ошибки в `etl_pipeline.log`
 2. Появление неожиданных staging БД
-3. Наполнение `cf_*` колонок
-4. Корректность `asterisk_cdr`
-5. Дубли в weekly-таблицах
+3. Корректность `asterisk_cdr`
+4. Дубли в weekly-таблицах
 
 Для диагностики после переключения можно запускать отдельные стадии:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks transform_custom_values --db-scope main
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk --db-scope main
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks weekly --force-weekly
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks seed_asterisk
 ```
 
 Проверки:
@@ -265,13 +265,13 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 - проверен `sudo -u postgres psql`
 - проверен доступ к nightly dump
 - seed CSV лежат в нужных местах
-- `incremental_tables` не содержит weekly-таблицы
+- `incremental_tables` не содержит три ручные таблицы
 - `issues_table` и `projects_table` заданы
 
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues.cf_*` и `projects.cf_*` появились и заполнены
+- `issues` и `projects` обновлены; новые custom values не перенесены, существующие `cf_*` не удалялись
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

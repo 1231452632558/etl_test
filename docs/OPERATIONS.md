@@ -6,7 +6,7 @@
 - фактический nightly-процесс
 - роль main и staging БД
 - поведение ручных таблиц
-- смысл custom transform
+- запрет материализации custom values
 - что проверять при rollout и поддержке
 
 ## 1. Модель данных и поток
@@ -19,7 +19,7 @@
 - не удаляется каждый день
 - накапливает актуальное состояние snapshot-таблиц
 - хранит ручные таблицы
-- хранит материализованные `cf_*` колонки в `issues` и `projects`
+- не получает новые материализованные `cf_*` из pipeline
 
 ### Staging database
 
@@ -36,14 +36,17 @@ Staging нужна потому, что входящий dump нельзя ме�
 3. Создать staging БД.
 4. Восстановить SQL-файлы в staging БД.
 5. Создать служебные таблицы, если они нужны.
-6. Если `asterisk_cdr` отсутствует в dump, подгрузить её из отдельного CSV в staging.
-7. Добавить `project_id` в `asterisk_cdr`, если нужно.
-8. Выполнить custom transform в staging.
-9. Экспортировать snapshot-таблицы в CSV.
-10. Выполнить `UPSERT` этих snapshot-таблиц в main.
-11. Выполнить weekly-upsert для ручных таблиц.
-12. Выдать права.
-13. Очистить staging БД и временные каталоги.
+6. Экспортировать обычные snapshot-таблицы из staging в CSV.
+7. Выполнить `UPSERT` этих snapshot-таблиц в main.
+8. Дополнить `asterisk_cdr` в main отсутствующими строками из CSV.
+9. Выполнить weekly-upsert исторических таблиц после основного `load`.
+10. Выдать права.
+11. Очистить staging БД и временные каталоги.
+
+До создания новой staging-БД pipeline удаляет осиротевшие базы предыдущих
+запусков, если их имя точно соответствует шаблону
+`<temp_db_prefix>YYYYMMDD_HHMMSS` и у них нет активных подключений.
+Явно указанная `--temp-db-name` защищается от удаления.
 
 ## 2.1. Операционные стадии
 
@@ -51,7 +54,6 @@ Staging нужна потому, что входящий dump нельзя ме�
 - `extract`
 - `restore`
 - `seed_asterisk`
-- `transform_custom_values`
 - `compare`
 - `load`
 - `weekly`
@@ -60,10 +62,9 @@ Staging нужна потому, что входящий dump нельзя ме�
 Это позволяет запускать не только полный nightly-поток, но и отдельные шаги для диагностики или ручного обслуживания.
 
 Типовые сценарии:
-- пересчитать `cf_*` в основной БД: `--tasks transform_custom_values --db-scope main`
-- принудительно выполнить weekly-логику: `--tasks weekly`
-- отдельно догрузить `asterisk_cdr`: `--tasks seed_asterisk --db-scope main`
-- поднять staging и остановиться после transform: `--tasks restore,seed_asterisk,transform_custom_values --db-scope temp <dump>`
+- выполнить weekly по расписанию: `--tasks weekly`
+- принудительно выполнить weekly сейчас: `--tasks weekly --force-weekly`
+- отдельно догрузить новые строки `asterisk_cdr`: `--tasks seed_asterisk`
 
 ## 3. Snapshot-таблицы
 
@@ -78,7 +79,8 @@ projects_table = projects
 
 `issues` и `projects` можно не дублировать в `incremental_tables`, если они заданы через `issues_table` и `projects_table`.
 
-`group_employee_count` и `users_active` не должны включаться в `incremental_tables`, потому что они живут в main БД как ручные weekly-таблицы.
+`asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются
+из `incremental_tables`, потому что принадлежат стабильной main БД.
 
 Смысл:
 - таблица из dump считается текущим срезом данных
@@ -120,23 +122,23 @@ projects_table = projects
 
 При `--init`:
 - таблицы создаются, если отсутствуют
-- если они пустые, можно загрузить их из seed CSV
-- `asterisk_cdr` может быть импортирована из `asterisk_csv_file`
+- пустые weekly-таблицы можно загрузить из seed CSV
+- `asterisk_cdr` дополняется из `asterisk_csv_file`
 - `group_employee_count` и `users_active` могут быть импортированы из `group_employee_count_csv_file` и `users_active_csv_file`
 
 При nightly run:
-- pipeline не перезаливает эти таблицы из CSV
-- pipeline только выполняет weekly-upsert
-- `asterisk_cdr` при необходимости подгружается в staging из CSV и затем попадает в main как snapshot-таблица
+- pipeline не экспортирует эти таблицы из main и не перезаливает их полностью
+- weekly добавляет/обновляет только срез текущей даты
+- `asterisk_cdr` загружается напрямую в main через `ON CONFLICT (id) DO NOTHING`
 
 ### Seed CSV
 
-Seed CSV нужны только как стартовая точка, если надо сохранить старые ручные данные:
+CSV-файлы:
 - `asterisk_cdr.csv`
 - `group_employee_count_backup.csv`
 - `users_active_backup.csv`
 
-Для `asterisk_cdr` seed может применяться в пустую staging/main БД.
+`asterisk_cdr.csv` может пополняться новыми строками и обрабатываться повторно.
 
 Для `group_employee_count` и `users_active` seed применяется один раз, если таблица пустая.
 
@@ -161,43 +163,24 @@ Seed CSV нужны только как стартовая точка, если 
 Важно:
 - weekly всегда должен выполняться после `load`, если нужен полный nightly-сценарий
 - weekly можно запускать отдельно, без dump, потому что источник данных уже находится в `main_db`
+- `weekly_enabled=false` отключает автоматический запуск
+- `weekly_days=1,4` задает один или несколько ISO-дней недели
+- `--force-weekly` игнорирует расписание для разового ручного запуска
 
-## 6. Custom transform
+Час и минуты задаются расписанием запуска всего pipeline в cron/systemd.
+Параметры `[schedule]` определяют, выполнять ли weekly в конкретном запуске.
 
-### Что трансформируется
+## 6. Custom values
 
-Из:
-- `issues`
-- `projects`
-- `custom_values`
-- `custom_fields`
-
-В:
-- `issues.cf_*`
-- `projects.cf_*`
-
-### Зачем это нужно
-
-Чтобы аналитика читала уже материализованные custom-поля напрямую из `issues` и `projects`, без постоянных JOIN к `custom_values`.
-
-### Текущий подход
-
-1. Получить все custom fields для `Issue` и `Project`.
-2. Сгенерировать для них имена `cf_*`.
-3. Создать недостающие колонки.
-4. Агрегировать значения по `customized_id`.
-5. Обновить `issues` и `projects` отдельными set-based SQL.
-
-### Почему шаг делается в staging
-
-Так в main попадают уже подготовленные `issues` и `projects`, и nightly загрузка работает с конечной схемой, а не с сырыми `custom_values`.
+Материализация `custom_values` в `issues/projects` полностью удалена:
+- стадии transform нет в CLI обеих версий
+- snapshot-экспорт исключает `cf_*`
+- UPSERT отклоняет snapshot с `cf_*`
+- существующие `cf_*` в main БД не удаляются и не обновляются pipeline
 
 ## 7. Индексы и производительность
 
-`custom transform` потенциально самое дорогое место.
-
 Перед rollout стоит проверить индексы на:
-- `custom_values`
 - `issues`
 - `projects`
 - PK таблиц из `incremental_tables`
@@ -207,14 +190,8 @@ Seed CSV нужны только как стартовая точка, если 
 ```sql
 SELECT indexname, indexdef
 FROM pg_indexes
-WHERE tablename IN ('custom_values', 'issues');
--- при необходимости добавьте 'projects'
+WHERE tablename IN ('issues', 'projects');
 ```
-
-Особенно полезны индексы, покрывающие:
-- `customized_type`
-- `customized_id`
-- `custom_field_id`
 
 ## 8. Что смотреть при первом rollout
 
@@ -223,7 +200,7 @@ WHERE tablename IN ('custom_values', 'issues');
 Проверить:
 - main БД создана
 - ручные таблицы существуют
-- `issues` и `projects` содержат `cf_*` колонки
+- pipeline не создал и не перенес новые `cf_*`; существующая схема не изменялась
 - seed CSV импортировались, если таблицы были пусты
 
 ### После первого nightly
@@ -244,9 +221,10 @@ WHERE tablename IN ('custom_values', 'issues');
 
 После nightly:
 - нет висящих staging БД
+- в логе есть итог `Staging cleanup завершен`
 - нет ошибок в `etl_pipeline.log`
 - размеры экспортов выглядят ожидаемо
-- `issues`, `projects` и их `cf_*` визуально корректны
+- `issues` и `projects` визуально корректны; custom values не переносились
 
 ## 10. Когда использовать монолит, когда tasks
 

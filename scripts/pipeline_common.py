@@ -70,7 +70,8 @@ class PipelineSettings:
     log_level: str
     max_backups: int
     cleanup_temp_db: bool
-    target_day: int
+    weekly_enabled: bool
+    weekly_days: Tuple[int, ...]
     weekly_group_name_pattern: str
     remote_user: str
     remote_host: str
@@ -103,10 +104,16 @@ class PipelineSettings:
         }
 
         snapshot_tables = cls._parse_snapshot_tables(parser)
+        for manual_table in ("asterisk_cdr", "group_employee_count", "users_active"):
+            snapshot_tables.pop(manual_table, None)
         issues_table = parser.get("tables", "issues_table", fallback="issues").strip() or "issues"
         projects_table = parser.get("tables", "projects_table", fallback="projects").strip() or "projects"
         snapshot_tables.setdefault(issues_table, "id")
         snapshot_tables.setdefault(projects_table, "id")
+        target_day = parser.getint("schedule", "target_day", fallback=1)
+        weekly_days = cls._parse_weekly_days(
+            parser.get("schedule", "weekly_days", fallback=str(target_day))
+        )
 
         return cls(
             config_path=config_path,
@@ -122,7 +129,8 @@ class PipelineSettings:
             log_level=parser.get("logging", "log_level", fallback="INFO"),
             max_backups=parser.getint("retention", "max_backups", fallback=3),
             cleanup_temp_db=parser.getboolean("retention", "cleanup_temp_db", fallback=True),
-            target_day=parser.getint("schedule", "target_day", fallback=1),
+            weekly_enabled=parser.getboolean("schedule", "weekly_enabled", fallback=True),
+            weekly_days=weekly_days,
             weekly_group_name_pattern=parser.get("schedule", "weekly_group_name_pattern", fallback="masked"),
             remote_user=parser.get("remote", "remote_user", fallback=""),
             remote_host=parser.get("remote", "remote_host", fallback=""),
@@ -154,6 +162,20 @@ class PipelineSettings:
             pk_columns = [col.strip() for col in pk.split("+") if col.strip()]
             tables[table_name.strip()] = pk_columns if len(pk_columns) > 1 else pk_columns[0]
         return tables
+
+    @staticmethod
+    def _parse_weekly_days(raw_value: str) -> Tuple[int, ...]:
+        try:
+            days = tuple(sorted({int(value.strip()) for value in raw_value.split(",") if value.strip()}))
+        except ValueError as exc:
+            raise ValueError(
+                f"Некорректный weekly_days: {raw_value}. Используйте числа 1-7 через запятую."
+            ) from exc
+        if not days or any(day < 1 or day > 7 for day in days):
+            raise ValueError(
+                f"Некорректный weekly_days: {raw_value}. Допустимы дни недели 1-7."
+            )
+        return days
 
 
 class ETLLogger:
@@ -398,6 +420,78 @@ class DatabaseOperations:
             )
         )
 
+    def cleanup_stale_databases(
+        self,
+        exclude_names: Optional[Sequence[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """Удаляет осиротевшие staging-БД предыдущих запусков."""
+        prefix = _validate_identifier(self.settings.temp_db_prefix, "temp_db_prefix")
+        protected = {name for name in (exclude_names or []) if name}
+        generated_name_pattern = re.compile(
+            rf"^{re.escape(prefix)}\d{{8}}_\d{{6}}$"
+        )
+        rows = self.run_rows(
+            """
+            SELECT
+                d.datname,
+                COUNT(a.pid)::text
+            FROM pg_database d
+            LEFT JOIN pg_stat_activity a ON a.datname = d.datname
+            GROUP BY d.datname
+            ORDER BY d.datname;
+            """,
+            db_name="postgres",
+        )
+
+        removed: List[str] = []
+        skipped_active: List[str] = []
+        skipped_protected: List[str] = []
+        for row in rows:
+            if len(row) < 2:
+                continue
+            db_name, active_connections_raw = row[0], row[1]
+            if not generated_name_pattern.fullmatch(db_name):
+                continue
+            if db_name in protected:
+                skipped_protected.append(db_name)
+                self.logger.info(
+                    f"Staging cleanup: база защищена текущим запуском, db={db_name}"
+                )
+                continue
+
+            active_connections = int(active_connections_raw or 0)
+            if active_connections > 0:
+                skipped_active.append(db_name)
+                self.logger.warning(
+                    f"Staging cleanup: база пропущена из-за активных подключений, "
+                    f"db={db_name}, connections={active_connections}"
+                )
+                continue
+
+            self.logger.info(f"Staging cleanup: удаление осиротевшей базы {db_name}")
+            if self._run_psql(
+                f'DROP DATABASE IF EXISTS "{db_name}";',
+                db_name="postgres",
+                context_label=f"staging-cleanup:{db_name}",
+            ):
+                removed.append(db_name)
+            else:
+                self.logger.error(
+                    f"Staging cleanup: не удалось безопасно удалить базу {db_name}; "
+                    "возможно, появилось активное подключение"
+                )
+
+        self.logger.info(
+            "Staging cleanup завершен: "
+            f"removed={len(removed)}, active_skipped={len(skipped_active)}, "
+            f"protected={len(skipped_protected)}"
+        )
+        return {
+            "removed": removed,
+            "skipped_active": skipped_active,
+            "skipped_protected": skipped_protected,
+        }
+
     def restore_dump(self, db_name: str, sql_files: Sequence[str]) -> bool:
         self.logger.info(f"Восстановление дампа в базу {db_name}...")
         for sql_file in sql_files:
@@ -463,28 +557,6 @@ class DatabaseOperations:
             f"default={default_expr!r}, setval_result={result}"
         )
         return True
-
-    def ensure_text_columns(self, table_name: str, columns: Sequence[str], db_name: str) -> List[str]:
-        table_name = _validate_identifier(table_name, "table_name")
-        existing_columns = set(self.get_table_columns(table_name, db_name))
-        added_columns: List[str] = []
-        for column in columns:
-            column = _validate_identifier(column, "column")
-            if column in existing_columns:
-                continue
-            alter = (
-                f"ALTER TABLE {_quote_identifier(table_name)} "
-                f"ADD COLUMN IF NOT EXISTS {_quote_identifier(column)} TEXT;"
-            )
-            if self._run_psql(alter, db_name=db_name, ignore_errors=True):
-                added_columns.append(column)
-                existing_columns.add(column)
-        if added_columns:
-            self.logger.info(
-                f"Добавлены недостающие TEXT-колонки перед UPSERT: db={db_name}, "
-                f"table={table_name}, columns={added_columns}"
-            )
-        return added_columns
 
     def table_exists(self, table_name: str, db_name: str) -> bool:
         table_name = _validate_identifier(table_name, "table_name")
@@ -571,7 +643,27 @@ class DatabaseOperations:
 
     def export_table_to_csv(self, table_name: str, csv_file: str, db_name: str) -> int:
         table_name = _validate_identifier(table_name, "table_name")
-        query = f"SELECT * FROM {_quote_identifier(table_name)}"
+        columns = self.get_table_columns(table_name, db_name)
+        protected_tables = {self.settings.issues_table, self.settings.projects_table}
+        blocked_columns = [
+            column
+            for column in columns
+            if table_name in protected_tables and column.startswith("cf_")
+        ]
+        export_columns = [column for column in columns if column not in blocked_columns]
+        if not export_columns:
+            self.logger.error(
+                f"Экспорт невозможен: после исключения cf_* не осталось колонок, "
+                f"db={db_name}, table={table_name}"
+            )
+            return 0
+        if blocked_columns:
+            self.logger.info(
+                f"Custom value columns исключены из snapshot: db={db_name}, "
+                f"table={table_name}, columns={blocked_columns}"
+            )
+        quoted_columns = ", ".join(_quote_identifier(column) for column in export_columns)
+        query = f"SELECT {quoted_columns} FROM {_quote_identifier(table_name)}"
         return self.export_query_to_csv(query, csv_file, db_name)
 
     def upsert_from_csv(self, table_name: str, primary_key: Sequence[str] | str, csv_file: str, db_name: str) -> bool:
@@ -584,8 +676,18 @@ class DatabaseOperations:
         pk_cols = [_validate_identifier(pk, "primary_key") for pk in pk_cols]
 
         csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file)]
-        missing_cf_columns = [col for col in csv_columns if col.startswith("cf_")]
-        self.ensure_text_columns(table_name, missing_cf_columns, db_name)
+        protected_tables = {self.settings.issues_table, self.settings.projects_table}
+        blocked_columns = [
+            column
+            for column in csv_columns
+            if table_name in protected_tables and column.startswith("cf_")
+        ]
+        if blocked_columns:
+            self.logger.error(
+                f"UPSERT остановлен: snapshot для {table_name} содержит запрещенные "
+                f"custom value columns: {blocked_columns}"
+            )
+            return False
         table_columns = set(self.get_table_columns(table_name, db_name))
         columns = [col for col in csv_columns if col in table_columns]
         skipped_columns = [col for col in csv_columns if col not in table_columns]
@@ -782,12 +884,125 @@ DROP TABLE temp_upsert;
                 self.logger.info(f"Импортирован seed для {table_name}: {csv_file}")
         return results
 
-    def seed_asterisk_cdr_if_needed(self, db_name: str, csv_file: Optional[str] = None) -> bool:
+    def append_asterisk_cdr_from_csv(
+        self,
+        db_name: str,
+        csv_file: Optional[str] = None,
+    ) -> Dict[str, object]:
         csv_file = csv_file or self.settings.asterisk_csv_file
-        imported = self.import_csv_to_table_if_empty("asterisk_cdr", csv_file, db_name, delimiter=";")
-        if imported:
-            self.logger.info(f"Импортирован seed для asterisk_cdr: {csv_file}")
-        return imported
+        table_name = "asterisk_cdr"
+        if not os.path.exists(csv_file):
+            self.logger.warning(f"Asterisk CSV не найден: {csv_file}")
+            return {
+                "success": True,
+                "skipped": True,
+                "reason": "csv_not_found",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+        if not self.table_exists(table_name, db_name):
+            self.logger.error(f"Таблица {table_name} отсутствует в db={db_name}")
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "table_not_found",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+
+        table_columns = self.get_table_columns(table_name, db_name)
+        table_columns_by_lower = {column.lower(): column for column in table_columns}
+        csv_columns = [
+            _normalize_csv_column_name(column)
+            for column in _read_csv_header(csv_file, delimiter=";")
+        ]
+        mapped_columns: List[str] = []
+        for csv_column in csv_columns:
+            matched_column = table_columns_by_lower.get(csv_column)
+            if not matched_column:
+                self.logger.error(
+                    f"Колонка {csv_column} из {csv_file} отсутствует в {table_name}; "
+                    f"table_columns={table_columns}"
+                )
+                return {
+                    "success": False,
+                    "skipped": False,
+                    "reason": f"missing_column:{csv_column}",
+                    "source_rows": 0,
+                    "inserted_rows": 0,
+                }
+            mapped_columns.append(matched_column)
+        if "id" not in {column.lower() for column in mapped_columns}:
+            self.logger.error(f"Asterisk CSV не содержит обязательную колонку id: {csv_file}")
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "missing_primary_key",
+                "source_rows": 0,
+                "inserted_rows": 0,
+            }
+
+        with open(csv_file, "r", encoding="utf-8", newline="") as handle:
+            source_rows = max(sum(1 for _ in csv.reader(handle, delimiter=";")) - 1, 0)
+        rows_before = self.count_rows(table_name, db_name)
+        quoted_columns = ", ".join(_quote_identifier(column) for column in mapped_columns)
+        escaped_csv_file = csv_file.replace("'", "''")
+        script = f"""
+CREATE TEMP TABLE temp_asterisk_import AS
+SELECT {quoted_columns}
+FROM {_quote_identifier(table_name)}
+LIMIT 0;
+
+\\copy temp_asterisk_import ({quoted_columns}) FROM '{escaped_csv_file}' WITH (
+    FORMAT csv,
+    HEADER true,
+    DELIMITER ';',
+    QUOTE '"',
+    ESCAPE '"',
+    ENCODING 'UTF8'
+);
+
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM temp_asterisk_import
+ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
+"""
+        self.logger.info(
+            f"Asterisk append старт: db={db_name}, csv={csv_file}, "
+            f"source_rows={source_rows}, rows_before={rows_before}, columns={mapped_columns}"
+        )
+        if not self._run_psql_script(
+            script,
+            db_name=db_name,
+            context_label="asterisk:append",
+        ):
+            return {
+                "success": False,
+                "skipped": False,
+                "reason": "psql_error",
+                "source_rows": source_rows,
+                "inserted_rows": 0,
+                "rows_before": rows_before,
+            }
+
+        self.sync_sequence_with_max_id(table_name, db_name)
+        self.add_project_id_column(db_name)
+        rows_after = self.count_rows(table_name, db_name)
+        inserted_rows = max(rows_after - rows_before, 0)
+        self.logger.info(
+            f"Asterisk append завершен: db={db_name}, source_rows={source_rows}, "
+            f"inserted_rows={inserted_rows}, existing_rows={max(source_rows - inserted_rows, 0)}, "
+            f"rows_after={rows_after}"
+        )
+        return {
+            "success": True,
+            "skipped": False,
+            "reason": "",
+            "source_rows": source_rows,
+            "inserted_rows": inserted_rows,
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+        }
 
     def list_indexes(self, table_name: str, db_name: str) -> List[str]:
         table_name = _validate_identifier(table_name, "table_name")
@@ -800,175 +1015,28 @@ DROP TABLE temp_upsert;
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
 
-    def _sanitize_custom_column_name(self, name: str, field_id: str, used_names: set[str]) -> str:
-        sanitized = re.sub(r"[^a-zA-Z0-9_]", "_", name)
-        sanitized = re.sub(r"_+", "_", sanitized).strip("_").lower()
-        generic_names = {"field", "custom_field", "customfield", "custom_value", "customvalue", "value"}
-        if not sanitized or sanitized in generic_names:
-            base = f"cf_{field_id}"
-        else:
-            base = f"cf_{sanitized[:45]}"
-        candidate = base
-        if candidate in used_names:
-            candidate = f"{base}_{field_id}"
-        used_names.add(candidate)
-        return candidate
-
-    def _transform_custom_values_for_entity(
+    def add_weekly_records(
         self,
         db_name: str,
-        target_table: str,
-        customized_type: str,
-        entity_label: str,
+        target_days: Sequence[int] | int,
+        force: bool = False,
     ) -> Dict[str, object]:
-        target_table = _validate_identifier(target_table, f"{entity_label}_table")
-        required_tables = [target_table, "custom_values", "custom_fields"]
-        if not all(self.table_exists(table_name, db_name) for table_name in required_tables):
-            self.logger.info(
-                f"Таблицы для custom transform отсутствуют, шаг пропущен: db={db_name}, "
-                f"entity={entity_label}, table={target_table}"
-            )
-            return {
-                "processed_count": 0,
-                "custom_fields_count": 0,
-                "columns_added": [],
-                "index_count": 0,
-                "entity": entity_label,
-                "target_table": target_table,
-            }
-
-        custom_fields = self.run_rows(
-            f"""
-            SELECT DISTINCT cf.id, cf.name
-            FROM custom_fields cf
-            JOIN custom_values cv
-              ON cv.custom_field_id = cf.id
-            WHERE cv.customized_type = '{customized_type}'
-            ORDER BY cf.id;
-            """,
-            db_name=db_name,
-        )
-        if not custom_fields:
-            self.logger.warning(
-                f"Custom transform: не найдены custom fields через custom_values, db={db_name}, "
-                f"entity={entity_label}, customized_type={customized_type}"
-            )
-            return {
-                "processed_count": 0,
-                "custom_fields_count": 0,
-                "columns_added": [],
-                "index_count": len(self.list_indexes("custom_values", db_name)),
-                "entity": entity_label,
-                "target_table": target_table,
-            }
-
-        existing_columns = set(self.get_table_columns(target_table, db_name))
-        used_names = set(existing_columns)
-        field_mappings: List[Tuple[str, str, str]] = []
-        added_columns: List[str] = []
-
-        for field_id, field_name in custom_fields:
-            column_name = self._sanitize_custom_column_name(field_name, field_id, used_names)
-            field_mappings.append((field_id, field_name, column_name))
-            if column_name not in existing_columns:
-                alter = f"ALTER TABLE {_quote_identifier(target_table)} ADD COLUMN IF NOT EXISTS {_quote_identifier(column_name)} TEXT;"
-                if self._run_psql(alter, db_name=db_name, ignore_errors=True):
-                    added_columns.append(column_name)
-                    existing_columns.add(column_name)
-        self.logger.info(
-            f"Custom transform mappings: db={db_name}, entity={entity_label}, target_table={target_table}, "
-            f"fields={len(field_mappings)}, added_columns={len(added_columns)}"
-        )
-        sample_mappings = ", ".join(
-            f"{field_id}:{field_name}->{column_name}" for field_id, field_name, column_name in field_mappings[:10]
-        )
-        if sample_mappings:
-            self.logger.info(f"Custom transform sample mappings: db={db_name}, {sample_mappings}")
-
-        set_clauses = ",\n                ".join(
-            f'{_quote_identifier(column_name)} = src.{_quote_identifier(column_name)}'
-            for _, _, column_name in field_mappings
-        )
-        select_clauses = ",\n                    ".join(
-            (
-                "STRING_AGG(NULLIF(cv.value, ''), ', ' ORDER BY cv.id) "
-                f"FILTER (WHERE cv.custom_field_id = {int(field_id)}) AS {_quote_identifier(column_name)}"
-            )
-            for field_id, _, column_name in field_mappings
-        )
-
-        update_query = f"""
-            WITH aggregated AS (
-                SELECT
-                    cv.customized_id AS entity_id,
-                    {select_clauses}
-                FROM custom_values cv
-                WHERE cv.customized_type = '{customized_type}'
-                GROUP BY cv.customized_id
-            )
-            UPDATE {_quote_identifier(target_table)} AS target
-            SET
-                {set_clauses}
-            FROM aggregated AS src
-            WHERE src.entity_id = target.id;
-        """
-        self._run_psql(update_query, db_name=db_name, context_label="custom_transform:update")
-
-        processed_count = int(
-            self.run_scalar(
-                f"""
-                SELECT COUNT(DISTINCT customized_id)
-                FROM custom_values
-                WHERE customized_type = '{customized_type}';
-                """,
-                db_name=db_name,
-            )
-            or 0
-        )
-        indexes = self.list_indexes("custom_values", db_name)
-        return {
-            "processed_count": processed_count,
-            "custom_fields_count": len(field_mappings),
-            "columns_added": added_columns,
-            "index_count": len(indexes),
-            "entity": entity_label,
-            "target_table": target_table,
-        }
-
-    def transform_custom_values(
-        self,
-        db_name: str,
-        issues_table: str = "issues",
-        projects_table: str = "projects",
-    ) -> Dict[str, object]:
-        issue_result = self._transform_custom_values_for_entity(
-            db_name=db_name,
-            target_table=issues_table,
-            customized_type="Issue",
-            entity_label="issues",
-        )
-        project_result = self._transform_custom_values_for_entity(
-            db_name=db_name,
-            target_table=projects_table,
-            customized_type="Project",
-            entity_label="projects",
-        )
-        return {
-            "processed_count": issue_result["processed_count"] + project_result["processed_count"],
-            "custom_fields_count": issue_result["custom_fields_count"] + project_result["custom_fields_count"],
-            "columns_added": issue_result["columns_added"] + project_result["columns_added"],
-            "index_count": max(int(issue_result["index_count"]), int(project_result["index_count"])),
-            "entities": {
-                "issues": issue_result,
-                "projects": project_result,
-            },
-        }
-
-    def add_weekly_records(self, db_name: str, target_day: int) -> Dict[str, int | bool]:
         today = date.today()
         current_day = today.isocalendar()[2]
-        if current_day != target_day:
-            return {"skipped": True, "current_day": current_day, "target_day": target_day}
+        normalized_days = (
+            (target_days,)
+            if isinstance(target_days, int)
+            else tuple(sorted(set(target_days)))
+        )
+        if not normalized_days or any(day < 1 or day > 7 for day in normalized_days):
+            raise ValueError(f"Некорректные дни weekly: {normalized_days}")
+        if not force and current_day not in normalized_days:
+            return {
+                "skipped": True,
+                "current_day": current_day,
+                "target_days": list(normalized_days),
+                "force": force,
+            }
 
         raw_pattern = self.settings.weekly_group_name_pattern.strip()
         normalized_pattern = raw_pattern.strip("\"'").strip()
@@ -980,6 +1048,7 @@ DROP TABLE temp_upsert;
         self.logger.info(
             f"Weekly debug: db={db_name}, python_snapshot_date={snapshot_date}, "
             f"db_current_date={db_current_date}, db_current_timestamp={db_current_timestamp}, "
+            f"target_days={list(normalized_days)}, force={force}, "
             f"group_name_pattern={normalized_pattern}"
         )
         self.log_table_schema("group_employee_count", db_name, include_indexes=False)
@@ -1224,7 +1293,8 @@ DROP TABLE temp_upsert;
         return {
             "skipped": False,
             "current_day": current_day,
-            "target_day": target_day,
+            "target_days": list(normalized_days),
+            "force": force,
             "snapshot_date": snapshot_date,
             "group_source_count": group_source_count,
             "group_upserted": group_upserted,
