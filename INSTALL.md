@@ -78,6 +78,7 @@ temp_db_prefix = temp_restore_
 
 [paths]
 backup_storage_dir = /var/backups/postgres
+old_backup_dir = /workspace/old_backup
 temp_dir = /tmp/pg_etl_temp
 log_dir = /workspace/logs
 log_file = /workspace/logs/etl_pipeline.log
@@ -100,6 +101,7 @@ issues_table = issues
 projects_table = projects
 
 [retention]
+# Всего 3 копии: текущая + 2 предыдущих
 max_backups = 3
 cleanup_temp_db = true
 
@@ -179,14 +181,19 @@ sudo -u postgres psql -d your_main_db -c "SELECT COUNT(*) FROM users_active;"
 ### Task-версия
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
 ### Монолитная версия
 
 ```bash
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
+
+Команды без позиционного пути используют `[remote]`: архив сначала скачивается
+в `temp_dir`, а в постоянное хранилище переносится только после успешного ETL.
+При локальном dump передайте путь последним аргументом; автоматическая ротация
+удаленных архивов для такого запуска не выполняется.
 
 Флаг `--cleanup` удаляет staging БД после завершения.
 
@@ -231,14 +238,25 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks se
 Пример для task-версии:
 
 ```cron
-0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz >> /workspace/logs/cron.log 2>&1
+0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup >> /workspace/logs/cron.log 2>&1
 ```
 
 Пример для монолита:
 
 ```cron
-0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz >> /workspace/logs/cron_legacy.log 2>&1
+0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup >> /workspace/logs/cron_legacy.log 2>&1
 ```
+
+До включения cron создайте каталоги и выдайте пользователю запуска права на них:
+
+```bash
+sudo mkdir -p /var/backups/postgres /workspace/old_backup /workspace/logs
+sudo chown -R tehpod:tehpod /var/backups/postgres /workspace/old_backup /workspace/logs
+```
+
+При `max_backups=3` pipeline хранит текущий архив в `backup_storage_dir` и два
+предыдущих архива в `/workspace/old_backup/`. Ротация выполняется только после
+успешного восстановления и переноса данных в main БД.
 
 ## 10. Что проверить перед включением в прод
 

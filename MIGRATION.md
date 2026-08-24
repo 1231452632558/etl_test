@@ -145,7 +145,7 @@ weekly_days = 1
 
 ```bash
 python3 scripts/etl_pipeline.py --config config/etl_config.ini --init /path/to/dump.tar.gz
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
 Что проверить:
@@ -177,7 +177,7 @@ pg_dump -U postgres <main_db> > backup_before_python_migration.sql
 Команда:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
 Что произойдет:
@@ -224,8 +224,12 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 Пример:
 
 ```cron
-0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz >> /workspace/logs/cron.log 2>&1
+0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup >> /workspace/logs/cron.log 2>&1
 ```
+
+Команда без пути к dump использует источник из `[remote]`. После успешного ETL
+текущий архив сохраняется в `backup_storage_dir`, а два предыдущих — в
+`old_backup_dir` при `max_backups=3`.
 
 На первую неделю полезно оставить старый shell-скрипт рядом, но выключенным.
 

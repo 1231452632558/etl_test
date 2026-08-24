@@ -19,13 +19,13 @@ from pipeline_common import (  # noqa: E402
     DatabaseOperations,
     ETLLogger,
     PipelineSettings,
-    archive_existing_backup,
     build_snapshot_exports,
     cleanup_temp_artifacts,
     copy_from_remote_or_local,
     extract_dump,
+    finalize_remote_backup,
     log_git_revision,
-    rotate_backups,
+    should_download_remote_backup,
 )
 
 
@@ -161,9 +161,10 @@ class ETLPipeline:
             return False
         return True
 
-    def run_init(self, dump_file: str) -> bool:
+    def run_init(self, dump_file: str | None) -> bool:
         self.logger.info("=== ЗАПУСК ИНИЦИАЛИЗАЦИИ ===")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+        remote_download = should_download_remote_backup(self.settings, dump_file)
         actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
         if not actual_file:
             return False
@@ -192,6 +193,12 @@ class ETLPipeline:
                 return False
 
             self.db_ops.grant_privileges(main_db)
+            if remote_download and not finalize_remote_backup(
+                self.settings,
+                self.logger,
+                actual_file,
+            ):
+                return False
             self.logger.info("=== ИНИЦИАЛИЗАЦИЯ ЗАВЕРШЕНА УСПЕШНО ===")
             return True
         finally:
@@ -200,7 +207,7 @@ class ETLPipeline:
 
     def run_nightly(
         self,
-        dump_file: str,
+        dump_file: str | None,
         cleanup: bool = True,
         skip_weekly: bool = False,
         force_weekly: bool = False,
@@ -208,17 +215,7 @@ class ETLPipeline:
         self.logger.info("=== ЗАПУСК НОЧНОЙ ОБРАБОТКИ ===")
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
-
-        if (
-            not os.path.exists(dump_file)
-            and self.settings.remote_user
-            and self.settings.remote_host
-            and self.settings.remote_path
-            and self.settings.backup_tar
-        ):
-            archive_existing_backup(self.settings, self.logger)
-            rotate_backups(self.settings, self.logger)
-
+        remote_download = should_download_remote_backup(self.settings, dump_file)
         actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
         if not actual_file:
             return False
@@ -272,6 +269,12 @@ class ETLPipeline:
                 return False
 
             self.db_ops.grant_privileges(main_db)
+            if remote_download and not finalize_remote_backup(
+                self.settings,
+                self.logger,
+                actual_file,
+            ):
+                return False
             self.logger.info("=== НОЧНАЯ ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО ===")
             return True
         finally:
@@ -280,7 +283,7 @@ class ETLPipeline:
 
     def run(
         self,
-        dump_file: str,
+        dump_file: str | None,
         init_mode: bool = False,
         cleanup: bool = True,
         skip_weekly: bool = False,
@@ -311,8 +314,15 @@ class ETLPipeline:
     ) -> bool:
         effective_scope = resolve_db_scope(init_mode, db_scope)
         requires_dump = any(stage in {"extract", "restore"} for stage in stages)
-        if requires_dump and not dump_file:
-            self.logger.error("Для стадий extract/restore необходимо передать dump_file")
+        remote_download = requires_dump and should_download_remote_backup(
+            self.settings,
+            dump_file,
+        )
+        if requires_dump and not dump_file and not remote_download:
+            self.logger.error(
+                "Для стадий extract/restore необходимо передать dump_file "
+                "либо заполнить настройки [remote]"
+            )
             return False
         if "compare" in stages and effective_scope != "temp":
             self.logger.error("Стадия compare поддерживается только для temp scope")
@@ -322,19 +332,6 @@ class ETLPipeline:
             return False
 
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
-        if (
-            requires_dump
-            and not init_mode
-            and dump_file
-            and not os.path.exists(dump_file)
-            and self.settings.remote_user
-            and self.settings.remote_host
-            and self.settings.remote_path
-            and self.settings.backup_tar
-        ):
-            archive_existing_backup(self.settings, self.logger)
-            rotate_backups(self.settings, self.logger)
-
         actual_file = None
         extract_dir = None
         export_dir = None
@@ -438,6 +435,20 @@ class ETLPipeline:
 
             if self.db_ops.database_exists(main_db):
                 self.db_ops.grant_privileges(main_db)
+            applied_to_main = "load" in stages or (
+                "restore" in stages and effective_scope == "main"
+            )
+            if (
+                remote_download
+                and applied_to_main
+                and actual_file
+                and not finalize_remote_backup(
+                    self.settings,
+                    self.logger,
+                    actual_file,
+                )
+            ):
+                return False
             cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
             return True
         finally:

@@ -29,7 +29,9 @@
 - `PipelineSettings` — чтение `etl_config.ini`
 - `ETLLogger` — логирование
 - `DatabaseOperations` — операции с PostgreSQL
-- `copy_from_remote_or_local()` — выбор локального dump или `scp`
+- `copy_from_remote_or_local()` — выбор локального dump или скачивание `scp` во временный файл
+- `finalize_remote_backup()` — публикация проверенного удаленного архива после успешного ETL
+- `rotate_backups()` — хранение одного текущего и `max_backups - 1` старых архивов
 - `extract_dump()` — распаковка входящего дампа
 - `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
 - `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей

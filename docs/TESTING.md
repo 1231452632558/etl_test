@@ -191,14 +191,17 @@ sudo -u postgres psql -d test_main_db -c "\d projects"
 ### Task-версия
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
 ### Монолит
 
 ```bash
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/nightly_dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
+
+Для этих команд должны быть заполнены `[remote]`. Для теста с локальным архивом
+передайте его путь последним аргументом; удаленная ротация тогда не выполняется.
 
 Проверить:
 

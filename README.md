@@ -169,7 +169,8 @@ repo/
 Ключевые параметры:
 - `[database].db_name` — имя стабильной main БД
 - `[database].temp_db_prefix` — префикс staging БД
-- `[paths].backup_storage_dir` — куда складывать архивы
+- `[paths].backup_storage_dir` — где хранить один текущий проверенный архив
+- `[paths].old_backup_dir` — где хранить предыдущие проверенные архивы (по умолчанию `/workspace/old_backup`)
 - `[paths].temp_dir` — где хранить временные каталоги
 - `[paths].log_file` — основной лог
 - `[paths].asterisk_csv_file` — CSV-файл для append-only загрузки `asterisk_cdr`
@@ -181,7 +182,7 @@ repo/
 - `[tables].incremental_tables` — явные overrides ключей или полный список при отключенном автообнаружении
 - `[tables].issues_table` — таблица задач для snapshot-загрузки
 - `[tables].projects_table` — таблица проектов для snapshot-загрузки
-- `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
+- `[retention].max_backups` — общее число копий: текущая + старые (по умолчанию `3`)
 - `[schedule].weekly_enabled` — включить автоматический weekly
 - `[schedule].weekly_days` — дни запуска по ISO через запятую, например `1,4`
 - `[schedule].target_day` — совместимый fallback, если `weekly_days` не задан
@@ -204,8 +205,12 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --init /path/to/d
 Nightly run:
 
 ```bash
-python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
+python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
+
+Если секция `[remote]` заполнена, путь к dump указывать не нужно: архив
+скачивается во временный файл. Локальный путь можно передать явно — тогда `scp`
+и ротация удаленных архивов не выполняются.
 
 Запуск отдельных стадий:
 
@@ -226,7 +231,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --init /pa
 Nightly run:
 
 ```bash
-python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup /path/to/dump.tar.gz
+python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
 Запуск отдельных стадий:
@@ -267,6 +272,20 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks se
 - Берите `scripts/legacy/etl_pipeline.py`, если удобнее поддерживать один большой исполняемый сценарий.
 
 С точки зрения nightly-логики они должны вести себя одинаково.
+
+## Хранение удаленных архивов
+
+Для полного запуска с `[remote]` порядок безопасный:
+
+1. Новый архив скачивается в `temp_dir` и распаковывается.
+2. Данные успешно восстанавливаются в staging и вливаются в main БД.
+3. Предыдущий текущий архив переносится в `old_backup_dir`.
+4. Новый архив становится текущим в `backup_storage_dir`.
+5. Ротация оставляет всего `max_backups` копий.
+
+При `max_backups=3` это один текущий архив и два предыдущих каталога в
+`/workspace/old_backup/`. Если ETL завершился ошибкой, текущий архив и старые
+копии не ротируются.
 
 ## Ограничения и допущения
 

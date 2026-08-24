@@ -6,12 +6,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from pipeline_common import DatabaseOperations  # noqa: E402
+from pipeline_common import (  # noqa: E402
+    DatabaseOperations,
+    copy_from_remote_or_local,
+    finalize_remote_backup,
+    should_download_remote_backup,
+)
 
 
 class FakeLogger:
@@ -185,6 +191,173 @@ class SnapshotDiscoveryTests(unittest.TestCase):
             'WHERE "issues"."subject" IS DISTINCT FROM EXCLUDED."subject"',
             captured["script"],
         )
+
+
+class BackupRotationTests(unittest.TestCase):
+    def test_remote_mode_does_not_require_dump_argument(self):
+        settings = make_settings(
+            remote_user="backup",
+            remote_host="example.internal",
+            remote_path="/exports/",
+            backup_tar="nightly.tar.gz",
+        )
+
+        self.assertTrue(should_download_remote_backup(settings, None))
+
+    def test_remote_archive_is_downloaded_to_temp_before_etl(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            backup_dir = os.path.join(root_dir, "current")
+            temp_dir = os.path.join(root_dir, "temp")
+            os.makedirs(backup_dir)
+            current_file = os.path.join(backup_dir, "nightly.tar.gz")
+            with open(current_file, "w", encoding="utf-8") as handle:
+                handle.write("previous")
+
+            settings = make_settings(
+                remote_user="backup",
+                remote_host="example.internal",
+                remote_path="/exports/",
+                backup_tar="nightly.tar.gz",
+                backup_storage_dir=backup_dir,
+                temp_dir=temp_dir,
+            )
+
+            def fake_scp(command, **_kwargs):
+                destination = command[2]
+                with open(destination, "w", encoding="utf-8") as handle:
+                    handle.write("incoming")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("pipeline_common.subprocess.run", side_effect=fake_scp):
+                incoming_file = copy_from_remote_or_local(settings, logger, None)
+
+            self.assertIsNotNone(incoming_file)
+            self.assertTrue(incoming_file.startswith(os.path.join(temp_dir, "incoming_")))
+            with open(current_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "previous")
+
+    def test_invalid_incoming_archive_does_not_change_existing_backups(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            backup_dir = os.path.join(root_dir, "current")
+            old_backup_dir = os.path.join(root_dir, "old_backup")
+            os.makedirs(backup_dir)
+            os.makedirs(old_backup_dir)
+            current_file = os.path.join(backup_dir, "nightly.tar.gz")
+            with open(current_file, "w", encoding="utf-8") as handle:
+                handle.write("previous")
+
+            settings = make_settings(
+                backup_storage_dir=backup_dir,
+                old_backup_dir=old_backup_dir,
+                backup_tar="nightly.tar.gz",
+                max_backups=3,
+            )
+            missing_file = os.path.join(root_dir, "incoming_missing.tar.gz")
+
+            self.assertFalse(finalize_remote_backup(settings, logger, missing_file))
+            with open(current_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "previous")
+            self.assertEqual(os.listdir(old_backup_dir), [])
+
+    def test_successful_finalize_keeps_current_and_two_old_backups(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            backup_dir = os.path.join(root_dir, "current")
+            old_backup_dir = os.path.join(root_dir, "old_backup")
+            temp_dir = os.path.join(root_dir, "temp")
+            os.makedirs(backup_dir)
+            os.makedirs(old_backup_dir)
+            os.makedirs(temp_dir)
+
+            current_file = os.path.join(backup_dir, "nightly.tar.gz")
+            with open(current_file, "w", encoding="utf-8") as handle:
+                handle.write("yesterday")
+
+            for index, timestamp in ((1, 1000), (2, 2000)):
+                old_dir = os.path.join(old_backup_dir, f"old_2026082{index}_020000")
+                os.makedirs(old_dir)
+                with open(
+                    os.path.join(old_dir, "nightly.tar.gz"),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write(f"old-{index}")
+                os.utime(old_dir, (timestamp, timestamp))
+
+            incoming_file = os.path.join(temp_dir, "incoming_nightly.tar.gz")
+            with open(incoming_file, "w", encoding="utf-8") as handle:
+                handle.write("today")
+
+            settings = make_settings(
+                backup_storage_dir=backup_dir,
+                old_backup_dir=old_backup_dir,
+                backup_tar="nightly.tar.gz",
+                max_backups=3,
+            )
+            self.assertTrue(finalize_remote_backup(settings, logger, incoming_file))
+
+            with open(current_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "today")
+            old_dirs = sorted(
+                item
+                for item in os.listdir(old_backup_dir)
+                if item.startswith("old_")
+            )
+            self.assertEqual(len(old_dirs), 2)
+            old_contents = []
+            for old_dir in old_dirs:
+                archived_file = os.path.join(
+                    old_backup_dir,
+                    old_dir,
+                    "nightly.tar.gz",
+                )
+                with open(archived_file, "r", encoding="utf-8") as handle:
+                    old_contents.append(handle.read())
+            self.assertCountEqual(old_contents, ["old-2", "yesterday"])
+            self.assertFalse(os.path.exists(incoming_file))
+
+    def test_legacy_old_directories_are_moved_to_new_location(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            backup_dir = os.path.join(root_dir, "current")
+            old_backup_dir = os.path.join(root_dir, "old_backup")
+            temp_dir = os.path.join(root_dir, "temp")
+            os.makedirs(backup_dir)
+            os.makedirs(temp_dir)
+
+            legacy_dir = os.path.join(backup_dir, "old_20260820_020000")
+            os.makedirs(legacy_dir)
+            with open(
+                os.path.join(legacy_dir, "nightly.tar.gz"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("legacy")
+
+            incoming_file = os.path.join(temp_dir, "incoming_nightly.tar.gz")
+            with open(incoming_file, "w", encoding="utf-8") as handle:
+                handle.write("today")
+
+            settings = make_settings(
+                backup_storage_dir=backup_dir,
+                old_backup_dir=old_backup_dir,
+                backup_tar="nightly.tar.gz",
+                max_backups=3,
+            )
+            self.assertTrue(finalize_remote_backup(settings, logger, incoming_file))
+
+            self.assertFalse(os.path.exists(legacy_dir))
+            self.assertTrue(
+                os.path.exists(
+                    os.path.join(
+                        old_backup_dir,
+                        "old_20260820_020000",
+                        "nightly.tar.gz",
+                    )
+                )
+            )
 
 
 if __name__ == "__main__":

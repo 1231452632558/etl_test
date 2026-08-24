@@ -18,11 +18,11 @@ from pipeline_common import (  # noqa: E402
     DatabaseOperations,
     ETLLogger,
     PipelineSettings,
-    archive_existing_backup,
     cleanup_temp_artifacts,
     copy_from_remote_or_local,
+    finalize_remote_backup,
     log_git_revision,
-    rotate_backups,
+    should_download_remote_backup,
 )
 from tasks import (  # noqa: E402
     CleanupTask,
@@ -193,8 +193,15 @@ def main() -> None:
         f"План стадий task-pipeline: stages={planned_stages}, db_scope={effective_scope}, init={args.init}"
     )
     requires_dump = any(stage in {"extract", "restore"} for stage in planned_stages)
-    if requires_dump and not args.dump_file:
-        logger.error("Для стадий extract/restore необходимо передать dump_file")
+    remote_download = requires_dump and should_download_remote_backup(
+        settings,
+        args.dump_file,
+    )
+    if requires_dump and not args.dump_file and not remote_download:
+        logger.error(
+            "Для стадий extract/restore необходимо передать dump_file "
+            "либо заполнить настройки [remote]"
+        )
         sys.exit(1)
     if not requires_dump and not args.dump_file:
         logger.info("Запуск без dump_file: будут выполнены только стадии, не требующие дампа")
@@ -207,19 +214,6 @@ def main() -> None:
 
     db_ops.cleanup_stale_databases(exclude_names=[args.temp_db_name] if args.temp_db_name else [])
     cleanup_temp_artifacts(settings.temp_dir, logger)
-
-    if (
-        requires_dump
-        and not args.init
-        and args.dump_file
-        and not os.path.exists(args.dump_file)
-        and settings.remote_user
-        and settings.remote_host
-        and settings.remote_path
-        and settings.backup_tar
-    ):
-        archive_existing_backup(settings, logger)
-        rotate_backups(settings, logger)
 
     actual_file = None
     if requires_dump:
@@ -264,6 +258,11 @@ def main() -> None:
         sys.exit(1)
 
     success = runner.run()
+    applied_to_main = "load" in planned_stages or (
+        "restore" in planned_stages and effective_scope == "main"
+    )
+    if success and remote_download and applied_to_main and actual_file:
+        success = finalize_remote_backup(settings, logger, actual_file)
     cleanup_temp_artifacts(settings.temp_dir, logger)
     sys.exit(0 if success else 1)
 

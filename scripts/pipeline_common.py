@@ -68,6 +68,7 @@ class PipelineSettings:
     db_port: str
     temp_db_prefix: str
     backup_storage_dir: str
+    old_backup_dir: str
     temp_dir: str
     log_file: str
     log_level: str
@@ -136,6 +137,9 @@ class PipelineSettings:
             db_port=parser.get("database", "db_port", fallback="5432"),
             temp_db_prefix=parser.get("database", "temp_db_prefix", fallback="temp_restore_"),
             backup_storage_dir=parser.get("paths", "backup_storage_dir", fallback="/var/backups/postgres"),
+            old_backup_dir=parser.get(
+                "paths", "old_backup_dir", fallback="/workspace/old_backup"
+            ),
             temp_dir=parser.get("paths", "temp_dir", fallback="/tmp/pg_etl_temp"),
             log_file=log_file,
             log_level=parser.get("logging", "log_level", fallback="INFO"),
@@ -1580,72 +1584,202 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
         }
 
 
-def copy_from_remote_or_local(settings: PipelineSettings, logger: ETLLogger, dump_file: str) -> Optional[str]:
-    if os.path.exists(dump_file):
+def remote_backup_configured(settings: PipelineSettings) -> bool:
+    return bool(
+        settings.remote_user
+        and settings.remote_host
+        and settings.remote_path
+        and settings.backup_tar
+    )
+
+
+def should_download_remote_backup(
+    settings: PipelineSettings,
+    dump_file: Optional[str],
+) -> bool:
+    return remote_backup_configured(settings) and not (
+        dump_file and os.path.exists(dump_file)
+    )
+
+
+def copy_from_remote_or_local(
+    settings: PipelineSettings,
+    logger: ETLLogger,
+    dump_file: Optional[str],
+) -> Optional[str]:
+    if dump_file and os.path.exists(dump_file):
         logger.info(f"Использую локальный дамп: {dump_file}")
         return dump_file
 
-    if settings.remote_user and settings.remote_host and settings.remote_path and settings.backup_tar:
-        logger.info("Шаг 1: Копирование архива с удаленного сервера...")
+    if remote_backup_configured(settings):
+        logger.info("Шаг 1: Скачивание нового архива во временный файл...")
         source = f"{settings.remote_user}@{settings.remote_host}:{settings.remote_path}{settings.backup_tar}"
-        destination = f"{settings.backup_storage_dir}/"
-        os.makedirs(settings.backup_storage_dir, exist_ok=True)
-        result = subprocess.run(["scp", source, destination], capture_output=True, text=True, timeout=600)
-        if result.returncode == 0:
-            return os.path.join(destination, settings.backup_tar)
+        os.makedirs(settings.temp_dir, exist_ok=True)
+        backup_name = os.path.basename(settings.backup_tar)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        destination = os.path.join(
+            settings.temp_dir,
+            f"incoming_{timestamp}_{backup_name}",
+        )
+        result = subprocess.run(
+            ["scp", source, destination],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        if (
+            result.returncode == 0
+            and os.path.isfile(destination)
+            and os.path.getsize(destination) > 0
+        ):
+            logger.info(
+                f"Новый архив скачан во временный файл: {destination}, "
+                f"size={os.path.getsize(destination)}"
+            )
+            return destination
         logger.error(f"Ошибка копирования: {(result.stderr or '').strip()}")
+        try:
+            os.remove(destination)
+        except OSError:
+            pass
 
-    if os.path.exists(dump_file):
+    if dump_file and os.path.exists(dump_file):
         return dump_file
 
-    logger.error(f"Файл не найден: {dump_file}")
+    logger.error(
+        f"Файл не найден и удаленный источник не настроен: {dump_file or '<не указан>'}"
+    )
     return None
 
 
-def archive_existing_backup(settings: PipelineSettings, logger: ETLLogger) -> None:
+def _migrate_legacy_backup_dirs(settings: PipelineSettings, logger: ETLLogger) -> bool:
+    """Переносит old_* из старого backup_storage_dir в новый old_backup_dir."""
     os.makedirs(settings.backup_storage_dir, exist_ok=True)
-    current_tar = os.path.join(settings.backup_storage_dir, settings.backup_tar) if settings.backup_tar else ""
-    if not current_tar or not os.path.exists(current_tar):
-        return
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    archive_dir = os.path.join(settings.backup_storage_dir, f"old_{timestamp}")
-    os.makedirs(archive_dir, exist_ok=True)
-    archived_any = False
-
-    for candidate in (current_tar,):
-        if candidate and os.path.exists(candidate):
-            shutil.move(candidate, os.path.join(archive_dir, os.path.basename(candidate)))
-            archived_any = True
-
-    if archived_any:
-        logger.info(f"Текущий архив перенесен в {archive_dir}")
-    else:
-        shutil.rmtree(archive_dir, ignore_errors=True)
-
-
-def rotate_backups(settings: PipelineSettings, logger: ETLLogger) -> None:
-    logger.info("Шаг 0: Ротация старых бэкапов...")
-    os.makedirs(settings.backup_storage_dir, exist_ok=True)
-    old_dirs: List[Tuple[float, str]] = []
-    for item in os.listdir(settings.backup_storage_dir):
+    os.makedirs(settings.old_backup_dir, exist_ok=True)
+    success = True
+    for item in sorted(os.listdir(settings.backup_storage_dir)):
         if not item.startswith("old_"):
             continue
-        full_path = os.path.join(settings.backup_storage_dir, item)
+        source = os.path.join(settings.backup_storage_dir, item)
+        if not os.path.isdir(source):
+            continue
+        target = os.path.join(settings.old_backup_dir, item)
+        if os.path.exists(target):
+            target = os.path.join(
+                settings.old_backup_dir,
+                f"{item}_legacy_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+            )
+        try:
+            shutil.move(source, target)
+            logger.info(f"Старая резервная копия перенесена: {source} -> {target}")
+        except OSError as exc:
+            logger.error(f"Не удалось перенести старую резервную копию {source}: {exc}")
+            success = False
+    return success
+
+
+def rotate_backups(settings: PipelineSettings, logger: ETLLogger) -> bool:
+    """Оставляет max_backups - 1 исторических каталогов плюс текущий архив."""
+    logger.info(
+        f"Ротация бэкапов: current=1, old_limit={max(settings.max_backups - 1, 0)}, "
+        f"old_dir={settings.old_backup_dir}"
+    )
+    os.makedirs(settings.old_backup_dir, exist_ok=True)
+    old_dirs: List[Tuple[float, str]] = []
+    for item in os.listdir(settings.old_backup_dir):
+        if not item.startswith("old_"):
+            continue
+        full_path = os.path.join(settings.old_backup_dir, item)
         if os.path.isdir(full_path):
             old_dirs.append((os.path.getmtime(full_path), full_path))
 
     old_dirs.sort(reverse=True)
-    if len(old_dirs) <= settings.max_backups:
-        return
+    keep_old = max(settings.max_backups - 1, 0)
+    success = True
+    for _, dir_path in old_dirs[keep_old:]:
+        try:
+            shutil.rmtree(dir_path)
+            logger.info(f"Удалена устаревшая резервная копия: {dir_path}")
+        except OSError as exc:
+            logger.error(f"Не удалось удалить резервную копию {dir_path}: {exc}")
+            success = False
+    return success
 
-    for _, dir_path in old_dirs[settings.max_backups:]:
-        shutil.rmtree(dir_path, ignore_errors=True)
+
+def finalize_remote_backup(
+    settings: PipelineSettings,
+    logger: ETLLogger,
+    incoming_file: str,
+) -> bool:
+    """После успешного ETL публикует новый архив и оставляет всего max_backups копий."""
+    if not os.path.isfile(incoming_file) or os.path.getsize(incoming_file) == 0:
+        logger.error(
+            f"Нельзя завершить ротацию: временный архив отсутствует или пуст: {incoming_file}"
+        )
+        return False
+
+    if settings.max_backups < 1:
+        logger.error(
+            f"Некорректный max_backups={settings.max_backups}; должно быть не меньше 1"
+        )
+        return False
+
+    os.makedirs(settings.backup_storage_dir, exist_ok=True)
+    os.makedirs(settings.old_backup_dir, exist_ok=True)
+    if not _migrate_legacy_backup_dirs(settings, logger):
+        return False
+
+    backup_name = os.path.basename(settings.backup_tar)
+    current_tar = os.path.join(settings.backup_storage_dir, backup_name)
+    archived_current = ""
+    archive_dir = ""
+
+    try:
+        if os.path.exists(current_tar):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            archive_dir = os.path.join(settings.old_backup_dir, f"old_{timestamp}")
+            os.makedirs(archive_dir, exist_ok=False)
+            archived_current = os.path.join(archive_dir, backup_name)
+            shutil.move(current_tar, archived_current)
+            logger.info(f"Предыдущий текущий архив перенесен: {archived_current}")
+
+        shutil.move(incoming_file, current_tar)
+        logger.info(f"Новый проверенный архив установлен как текущий: {current_tar}")
+    except OSError as exc:
+        logger.error(f"Ошибка публикации нового архива: {exc}")
+        if (
+            archived_current
+            and os.path.exists(archived_current)
+            and not os.path.exists(current_tar)
+        ):
+            try:
+                shutil.move(archived_current, current_tar)
+                logger.warning(f"Предыдущий текущий архив восстановлен: {current_tar}")
+            except OSError as rollback_exc:
+                logger.error(f"Не удалось восстановить предыдущий архив: {rollback_exc}")
+        if archive_dir and os.path.isdir(archive_dir) and not os.listdir(archive_dir):
+            shutil.rmtree(archive_dir, ignore_errors=True)
+        return False
+
+    if not rotate_backups(settings, logger):
+        return False
+
+    old_count = sum(
+        1
+        for item in os.listdir(settings.old_backup_dir)
+        if item.startswith("old_")
+        and os.path.isdir(os.path.join(settings.old_backup_dir, item))
+    )
+    logger.info(
+        f"Ротация завершена: current=1, old={old_count}, total={1 + old_count}, "
+        f"max_backups={settings.max_backups}"
+    )
+    return True
 
 
 def cleanup_temp_artifacts(temp_dir: str, logger: ETLLogger, keep_latest: int = 0) -> None:
     os.makedirs(temp_dir, exist_ok=True)
-    prefixes = ("extract_", "snapshot_", "pg_etl_upsert_")
+    prefixes = ("extract_", "snapshot_", "pg_etl_upsert_", "incoming_")
     candidates: List[Tuple[float, str]] = []
     for item in os.listdir(temp_dir):
         if not item.startswith(prefixes):
