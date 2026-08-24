@@ -122,8 +122,8 @@ repo/
 Используется каждый день:
 1. Nightly dump разворачивается в новую staging БД.
 2. Во staging создаются только служебные объекты, необходимые для snapshot.
-3. Из staging экспортируются snapshot-таблицы, перечисленные в конфиге.
-4. Эти snapshot-файлы вливаются в main БД через `UPSERT`.
+3. Pipeline автоматически находит обычные таблицы `public` и их PK/UNIQUE-ключи.
+4. Все найденные snapshot-таблицы экспортируются и вливаются в main БД через `UPSERT`; совпадающие строки не обновляются повторно.
 5. CSV `asterisk_cdr` напрямую дополняет стабильную main БД по отсутствующим `id`.
 6. После загрузки основных таблиц в main выполняется weekly-update исторических таблиц.
 7. Staging БД удаляется.
@@ -175,7 +175,10 @@ repo/
 - `[paths].asterisk_csv_file` — CSV-файл для append-only загрузки `asterisk_cdr`
 - `[paths].group_employee_count_csv_file` — CSV-файл для начального наполнения `group_employee_count`
 - `[paths].users_active_csv_file` — CSV-файл для начального наполнения `users_active`
-- `[tables].incremental_tables` — список snapshot-таблиц для `UPSERT`
+- `[tables].auto_discover_tables` — автоматически обрабатывать все таблицы `public`
+- `[tables].fail_on_unkeyed_tables` — останавливать запуск, если таблицу нельзя безопасно UPSERT-ить
+- `[tables].snapshot_excluded_tables` — дополнительные осознанные исключения
+- `[tables].incremental_tables` — явные overrides ключей или полный список при отключенном автообнаружении
 - `[tables].issues_table` — таблица задач для snapshot-загрузки
 - `[tables].projects_table` — таблица проектов для snapshot-загрузки
 - `[retention].max_backups` — сколько последних архивов хранить в `backup_storage_dir` (по умолчанию `3`)
@@ -186,7 +189,7 @@ repo/
 Точное время запуска задается cron/systemd; pipeline проверяет день недели в момент запуска.
 
 Важно: `issues_table` и `projects_table` автоматически добавляются в snapshot-список, даже если их забыли явно указать.
-Важно: `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются из `incremental_tables`, даже если ошибочно указаны в конфиге.
+Важно: `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются из общего snapshot, даже если ошибочно указаны в конфиге.
 
 ## Запуск
 
@@ -268,13 +271,15 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks se
 ## Ограничения и допущения
 
 - Входящий dump по-прежнему не меняется и всегда восстанавливается только в новую БД.
-- Snapshot-режим означает, что для таблиц из `incremental_tables` в main БД подтягивается текущее состояние строк из staging.
+- Snapshot-режим означает, что для всех автообнаруженных таблиц в main БД подтягивается текущее состояние строк из staging.
 - Удаления строк из dump сейчас не синхронизируются автоматически.
+- Таблица должна иметь PRIMARY KEY или простой UNIQUE index; иначе pipeline останавливается и требует явного решения.
+- Новые таблицы/колонки в staging не создаются автоматически в main: расхождение схемы останавливает загрузку.
 - Существующие `cf_*` в main БД не удаляются; pipeline только не переносит новые custom values.
 
 ## Что проверить перед prod rollout
 
-1. Корректность `incremental_tables` в конфиге.
+1. Что автообнаружение нашло ожидаемое количество таблиц, а исключения заданы осознанно.
 2. Наличие доступа `sudo -u postgres psql`.
 3. Что CSV для `asterisk_cdr` и init-only seed CSV лежат по путям из конфига.
 4. Что `weekly_enabled`, `weekly_days` и `weekly_group_name_pattern` соответствуют расписанию.

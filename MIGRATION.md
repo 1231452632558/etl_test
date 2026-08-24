@@ -91,7 +91,9 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `users_active_csv_file` — путь к CSV для `users_active`
 - `issues_table = issues`
 - `projects_table = projects`
-- `incremental_tables` — только snapshot-таблицы
+- `auto_discover_tables = true` — обрабатывать все обычные таблицы `public`
+- `snapshot_excluded_tables` — только осознанные дополнительные исключения
+- `incremental_tables` — явные overrides ключей
 - `weekly_enabled` и `weekly_days` — включение и дни weekly-среза
 
 Важно:
@@ -102,6 +104,9 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 
 ```ini
 [tables]
+auto_discover_tables = true
+fail_on_unkeyed_tables = true
+snapshot_excluded_tables =
 incremental_tables =
 issues_table = issues
 projects_table = projects
@@ -265,13 +270,14 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 - проверен `sudo -u postgres psql`
 - проверен доступ к nightly dump
 - seed CSV лежат в нужных местах
-- `incremental_tables` не содержит три ручные таблицы
+- включено автообнаружение и проверены таблицы без безопасного ключа
+- список исключений не содержит случайно пропущенных рабочих таблиц
 - `issues_table` и `projects_table` заданы
 
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- `issues` и `projects` обновлены; новые custom values не перенесены, существующие `cf_*` не удалялись
+- новые и измененные строки всех snapshot-таблиц обновлены; `cf_*` не переносились
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

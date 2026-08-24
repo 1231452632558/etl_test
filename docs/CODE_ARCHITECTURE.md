@@ -32,6 +32,8 @@
 - `copy_from_remote_or_local()` — выбор локального dump или `scp`
 - `extract_dump()` — распаковка входящего дампа
 - `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
+- `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей
+- `order_snapshot_tables()` — порядок UPSERT с учетом внешних ключей
 - `add_weekly_records()` — weekly-историзация в `users_active` и `group_employee_count`
 
 Ключевой принцип:
@@ -124,6 +126,8 @@ cleanup
 ### `compare`
 
 Назначение:
+- обнаружить обычные таблицы `public` и их PK/UNIQUE-ключи
+- поставить родительские таблицы раньше дочерних
 - экспортировать snapshot-CSV из staging
 - исключить `cf_*` из `issues/projects`
 
@@ -137,6 +141,7 @@ cleanup
 
 Назначение:
 - применить snapshot-CSV в `main_db` через `UPSERT`
+- остановиться при расхождении схемы staging/main вместо тихого пропуска колонок
 - отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
 
 Работает только по staging-derived данным.

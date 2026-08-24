@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 
+MANUAL_TABLES = ("asterisk_cdr", "group_employee_count", "users_active")
+
+
 def _validate_identifier(identifier: str, kind: str = "identifier") -> str:
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", identifier):
         raise ValueError(f"Некорректный {kind}: {identifier}")
@@ -79,6 +82,9 @@ class PipelineSettings:
     backup_tar: str
     issues_table: str
     projects_table: str
+    auto_discover_tables: bool
+    fail_on_unkeyed_tables: bool
+    snapshot_excluded_tables: Tuple[str, ...]
     snapshot_tables: Dict[str, Sequence[str] | str]
     manual_seed_files: Dict[str, str]
     asterisk_csv_file: str
@@ -104,8 +110,14 @@ class PipelineSettings:
         }
 
         snapshot_tables = cls._parse_snapshot_tables(parser)
-        for manual_table in ("asterisk_cdr", "group_employee_count", "users_active"):
-            snapshot_tables.pop(manual_table, None)
+        configured_exclusions = cls._parse_identifier_list(
+            parser.get("tables", "snapshot_excluded_tables", fallback="")
+        )
+        snapshot_excluded_tables = tuple(
+            dict.fromkeys((*MANUAL_TABLES, *configured_exclusions))
+        )
+        for excluded_table in snapshot_excluded_tables:
+            snapshot_tables.pop(excluded_table, None)
         issues_table = parser.get("tables", "issues_table", fallback="issues").strip() or "issues"
         projects_table = parser.get("tables", "projects_table", fallback="projects").strip() or "projects"
         snapshot_tables.setdefault(issues_table, "id")
@@ -138,6 +150,13 @@ class PipelineSettings:
             backup_tar=parser.get("remote", "backup_tar", fallback=""),
             issues_table=issues_table,
             projects_table=projects_table,
+            auto_discover_tables=parser.getboolean(
+                "tables", "auto_discover_tables", fallback=True
+            ),
+            fail_on_unkeyed_tables=parser.getboolean(
+                "tables", "fail_on_unkeyed_tables", fallback=True
+            ),
+            snapshot_excluded_tables=snapshot_excluded_tables,
             snapshot_tables=snapshot_tables,
             manual_seed_files=manual_seed_files,
             asterisk_csv_file=parser.get(
@@ -162,6 +181,16 @@ class PipelineSettings:
             pk_columns = [col.strip() for col in pk.split("+") if col.strip()]
             tables[table_name.strip()] = pk_columns if len(pk_columns) > 1 else pk_columns[0]
         return tables
+
+    @staticmethod
+    def _parse_identifier_list(raw_value: str) -> Tuple[str, ...]:
+        identifiers: List[str] = []
+        for value in raw_value.split(","):
+            value = value.strip()
+            if not value:
+                continue
+            identifiers.append(_validate_identifier(value, "table_name"))
+        return tuple(identifiers)
 
     @staticmethod
     def _parse_weekly_days(raw_value: str) -> Tuple[int, ...]:
@@ -641,7 +670,13 @@ class DatabaseOperations:
         self.logger.info(f"Экспортирован CSV: db={db_name}, csv={csv_file}, rows={count}")
         return count
 
-    def export_table_to_csv(self, table_name: str, csv_file: str, db_name: str) -> int:
+    def export_table_to_csv(
+        self,
+        table_name: str,
+        csv_file: str,
+        db_name: str,
+        order_by: Optional[Sequence[str] | str] = None,
+    ) -> int:
         table_name = _validate_identifier(table_name, "table_name")
         columns = self.get_table_columns(table_name, db_name)
         protected_tables = {self.settings.issues_table, self.settings.projects_table}
@@ -664,6 +699,22 @@ class DatabaseOperations:
             )
         quoted_columns = ", ".join(_quote_identifier(column) for column in export_columns)
         query = f"SELECT {quoted_columns} FROM {_quote_identifier(table_name)}"
+        if order_by:
+            order_columns = list(order_by) if isinstance(order_by, (list, tuple)) else [order_by]
+            normalized_order_columns = [
+                _validate_identifier(column, "order_column") for column in order_columns
+            ]
+            missing_order_columns = [
+                column for column in normalized_order_columns if column not in export_columns
+            ]
+            if missing_order_columns:
+                raise ValueError(
+                    f"Snapshot key отсутствует в экспортируемых колонках: "
+                    f"table={table_name}, columns={missing_order_columns}"
+                )
+            query += " ORDER BY " + ", ".join(
+                _quote_identifier(column) for column in normalized_order_columns
+            )
         return self.export_query_to_csv(query, csv_file, db_name)
 
     def upsert_from_csv(self, table_name: str, primary_key: Sequence[str] | str, csv_file: str, db_name: str) -> bool:
@@ -698,16 +749,35 @@ class DatabaseOperations:
             )
             return False
         if skipped_columns:
-            self.logger.warning(
-                f"При UPSERT будут пропущены колонки, которых нет в целевой таблице: "
-                f"db={db_name}, table={table_name}, skipped_columns={skipped_columns}"
+            self.logger.error(
+                f"UPSERT остановлен из-за расхождения схемы: в main отсутствуют колонки "
+                f"из snapshot, db={db_name}, table={table_name}, "
+                f"missing_target_columns={skipped_columns}"
             )
+            return False
+        missing_pk_columns = [pk for pk in pk_cols if pk not in columns]
+        if missing_pk_columns:
+            self.logger.error(
+                f"UPSERT остановлен: ключевые колонки отсутствуют в snapshot, "
+                f"db={db_name}, table={table_name}, missing_pk={missing_pk_columns}"
+            )
+            return False
 
         quoted_columns = ", ".join(_quote_identifier(col) for col in columns)
         update_columns = [col for col in columns if col not in pk_cols]
         conflict_columns = ", ".join(_quote_identifier(pk) for pk in pk_cols)
         update_clause = ", ".join(
             f'{_quote_identifier(col)} = EXCLUDED.{_quote_identifier(col)}' for col in update_columns
+        )
+        change_predicate = " OR ".join(
+            f'{_quote_identifier(table_name)}.{_quote_identifier(col)} '
+            f'IS DISTINCT FROM EXCLUDED.{_quote_identifier(col)}'
+            for col in update_columns
+        )
+        conflict_action = (
+            f"DO UPDATE SET {update_clause} WHERE {change_predicate}"
+            if update_clause
+            else "DO NOTHING"
         )
         data_csv_file = _strip_csv_header(csv_file, delimiter=",")
 
@@ -727,7 +797,7 @@ INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
 SELECT {quoted_columns}
 FROM temp_upsert
 ON CONFLICT ({conflict_columns})
-DO UPDATE SET {update_clause};
+{conflict_action};
 
 DROP TABLE temp_upsert;
 """
@@ -736,7 +806,14 @@ DROP TABLE temp_upsert;
             f"csv={csv_file}, data_csv={data_csv_file}, header=true->stripped, delimiter=',', columns={columns}"
         )
         try:
-            return self._run_psql_script(script, db_name=db_name, context_label=f"upsert:{table_name}")
+            success = self._run_psql_script(
+                script,
+                db_name=db_name,
+                context_label=f"upsert:{table_name}",
+            )
+            if success and len(pk_cols) == 1:
+                self.sync_sequence_with_max_id(table_name, db_name, column_name=pk_cols[0])
+            return success
         finally:
             try:
                 os.remove(data_csv_file)
@@ -947,20 +1024,18 @@ DROP TABLE temp_upsert;
         rows_before = self.count_rows(table_name, db_name)
         quoted_columns = ", ".join(_quote_identifier(column) for column in mapped_columns)
         escaped_csv_file = csv_file.replace("'", "''")
+        copy_command = (
+            f"\\copy temp_asterisk_import ({quoted_columns}) FROM '{escaped_csv_file}' "
+            "WITH (FORMAT csv, HEADER true, DELIMITER ';', QUOTE '\"', "
+            "ESCAPE '\"', ENCODING 'UTF8');"
+        )
         script = f"""
 CREATE TEMP TABLE temp_asterisk_import AS
 SELECT {quoted_columns}
 FROM {_quote_identifier(table_name)}
 LIMIT 0;
 
-\\copy temp_asterisk_import ({quoted_columns}) FROM '{escaped_csv_file}' WITH (
-    FORMAT csv,
-    HEADER true,
-    DELIMITER ';',
-    QUOTE '"',
-    ESCAPE '"',
-    ENCODING 'UTF8'
-);
+{copy_command}
 
 INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
 SELECT {quoted_columns}
@@ -1014,6 +1089,201 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
             ORDER BY indexname;
         """
         return [row[0] for row in self.run_rows(query, db_name=db_name) if row]
+
+    def list_snapshot_candidate_tables(self, db_name: str) -> List[str]:
+        """Возвращает обычные и partitioned-таблицы public без дочерних partitions."""
+        rows = self.run_rows(
+            """
+            SELECT c.relname
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public'
+              AND c.relkind IN ('r', 'p')
+              AND NOT c.relispartition
+            ORDER BY c.relname;
+            """,
+            db_name=db_name,
+        )
+        return [
+            _validate_identifier(row[0], "table_name")
+            for row in rows
+            if row
+        ]
+
+    def discover_unique_table_keys(
+        self,
+        db_name: str,
+    ) -> Dict[str, Sequence[str] | str]:
+        """Находит PK либо простой непредикатный UNIQUE index для каждой таблицы."""
+        rows = self.run_rows(
+            """
+            SELECT
+                tbl.relname,
+                idx.relname,
+                i.indisprimary::text,
+                key_column.ordinality::text,
+                attr.attname
+            FROM pg_class tbl
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN pg_index i ON i.indrelid = tbl.oid
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            CROSS JOIN LATERAL unnest(i.indkey)
+                WITH ORDINALITY AS key_column(attnum, ordinality)
+            JOIN pg_attribute attr
+              ON attr.attrelid = tbl.oid
+             AND attr.attnum = key_column.attnum
+            WHERE ns.nspname = 'public'
+              AND tbl.relkind IN ('r', 'p')
+              AND NOT tbl.relispartition
+              AND i.indisunique
+              AND i.indisvalid
+              AND i.indisready
+              AND i.indpred IS NULL
+              AND i.indexprs IS NULL
+              AND key_column.attnum > 0
+              AND key_column.ordinality <= i.indnkeyatts
+            ORDER BY
+                tbl.relname,
+                i.indisprimary DESC,
+                i.indnkeyatts,
+                idx.relname,
+                key_column.ordinality;
+            """,
+            db_name=db_name,
+        )
+
+        candidates: Dict[Tuple[str, str], Dict[str, object]] = {}
+        candidate_order: List[Tuple[str, str]] = []
+        for row in rows:
+            if len(row) < 5:
+                continue
+            table_name = _validate_identifier(row[0], "table_name")
+            index_name = row[1]
+            candidate_id = (table_name, index_name)
+            if candidate_id not in candidates:
+                candidates[candidate_id] = {
+                    "primary": row[2].lower() in {"t", "true", "1"},
+                    "columns": [],
+                }
+                candidate_order.append(candidate_id)
+            columns = candidates[candidate_id]["columns"]
+            if isinstance(columns, list):
+                columns.append((int(row[3]), _validate_identifier(row[4], "column")))
+
+        keys: Dict[str, Sequence[str] | str] = {}
+        for table_name, index_name in candidate_order:
+            if table_name in keys:
+                continue
+            candidate = candidates[(table_name, index_name)]
+            raw_columns = candidate["columns"]
+            if not isinstance(raw_columns, list) or not raw_columns:
+                continue
+            ordered_columns = [column for _, column in sorted(raw_columns)]
+            keys[table_name] = (
+                ordered_columns[0] if len(ordered_columns) == 1 else ordered_columns
+            )
+            key_kind = "PRIMARY KEY" if candidate["primary"] else "UNIQUE index"
+            self.logger.debug(
+                f"Snapshot key discovered: db={db_name}, table={table_name}, "
+                f"key={ordered_columns}, source={key_kind}:{index_name}"
+            )
+        return keys
+
+    def order_snapshot_tables(
+        self,
+        db_name: str,
+        tables: Dict[str, Sequence[str] | str],
+    ) -> Dict[str, Sequence[str] | str]:
+        """Ставит родительские таблицы раньше дочерних для FK-safe UPSERT."""
+        selected = set(tables)
+        dependencies: Dict[str, set[str]] = {table_name: set() for table_name in tables}
+        rows = self.run_rows(
+            """
+            SELECT child.relname, parent.relname
+            FROM pg_constraint constraint_row
+            JOIN pg_class child ON child.oid = constraint_row.conrelid
+            JOIN pg_class parent ON parent.oid = constraint_row.confrelid
+            JOIN pg_namespace ns ON ns.oid = child.relnamespace
+            WHERE constraint_row.contype = 'f'
+              AND ns.nspname = 'public'
+            ORDER BY child.relname, parent.relname;
+            """,
+            db_name=db_name,
+        )
+        for row in rows:
+            if len(row) < 2:
+                continue
+            child, parent = row[0], row[1]
+            if child in selected and parent in selected and child != parent:
+                dependencies[child].add(parent)
+
+        ordered: List[str] = []
+        pending = set(tables)
+        while pending:
+            ready = sorted(
+                table_name
+                for table_name in pending
+                if not (dependencies[table_name] & pending)
+            )
+            if not ready:
+                cyclic = sorted(pending)
+                self.logger.warning(
+                    f"Snapshot FK cycle detected: db={db_name}, tables={cyclic}; "
+                    "для цикла сохраняется алфавитный порядок"
+                )
+                ordered.extend(cyclic)
+                break
+            ordered.extend(ready)
+            pending.difference_update(ready)
+
+        return {table_name: tables[table_name] for table_name in ordered}
+
+    def resolve_snapshot_tables(
+        self,
+        db_name: str,
+        configured_tables: Dict[str, Sequence[str] | str],
+    ) -> Dict[str, Sequence[str] | str]:
+        """Объединяет автообнаруженные таблицы и явные overrides из config."""
+        excluded = set(self.settings.snapshot_excluded_tables)
+        resolved: Dict[str, Sequence[str] | str] = {}
+        unkeyed_tables: List[str] = []
+
+        if self.settings.auto_discover_tables:
+            candidate_tables = [
+                table_name
+                for table_name in self.list_snapshot_candidate_tables(db_name)
+                if table_name not in excluded
+            ]
+            discovered_keys = self.discover_unique_table_keys(db_name)
+            for table_name in candidate_tables:
+                key = discovered_keys.get(table_name)
+                if key:
+                    resolved[table_name] = key
+                elif table_name not in configured_tables:
+                    unkeyed_tables.append(table_name)
+
+        for table_name, key in configured_tables.items():
+            table_name = _validate_identifier(table_name, "table_name")
+            if table_name not in excluded:
+                resolved[table_name] = key
+
+        if unkeyed_tables:
+            message = (
+                "Snapshot auto-discovery: таблицы без PRIMARY KEY/UNIQUE index: "
+                f"{unkeyed_tables}. Добавьте безопасный уникальный ключ в БД либо "
+                "явно исключите таблицы через snapshot_excluded_tables."
+            )
+            if self.settings.fail_on_unkeyed_tables:
+                raise ValueError(message)
+            self.logger.warning(message)
+
+        ordered = self.order_snapshot_tables(db_name, resolved)
+        self.logger.info(
+            f"Snapshot tables resolved: db={db_name}, auto={self.settings.auto_discover_tables}, "
+            f"tables={len(ordered)}, excluded={sorted(excluded)}, "
+            f"unkeyed={len(unkeyed_tables)}"
+        )
+        return ordered
 
     def add_weekly_records(
         self,
@@ -1461,11 +1731,20 @@ def build_snapshot_exports(
 ) -> List[Dict[str, object]]:
     os.makedirs(export_dir, exist_ok=True)
     modifications: List[Dict[str, object]] = []
-    for table_name, primary_key in snapshot_tables.items():
+    resolved_tables = db_ops.resolve_snapshot_tables(temp_db, snapshot_tables)
+    for table_name, primary_key in resolved_tables.items():
         if not db_ops.table_exists(table_name, temp_db):
+            db_ops.logger.warning(
+                f"Snapshot table отсутствует в staging: db={temp_db}, table={table_name}"
+            )
             continue
         csv_file = os.path.join(export_dir, f"{table_name}.csv")
-        row_count = db_ops.export_table_to_csv(table_name, csv_file, temp_db)
+        row_count = db_ops.export_table_to_csv(
+            table_name,
+            csv_file,
+            temp_db,
+            order_by=primary_key,
+        )
         if row_count == 0 and not os.path.exists(csv_file):
             continue
         modifications.append(

@@ -92,6 +92,9 @@ remote_path = /path/to/dumps/
 backup_tar = nightly_dump.tar.gz
 
 [tables]
+auto_discover_tables = true
+fail_on_unkeyed_tables = true
+snapshot_excluded_tables =
 incremental_tables =
 issues_table = issues
 projects_table = projects
@@ -106,11 +109,13 @@ weekly_days = 1
 target_day = 1
 ```
 
-### Важно про `incremental_tables`
+### Важно про snapshot-таблицы
 
-Сюда надо включать таблицы, которые должны попадать из staging в main через snapshot + `UPSERT`.
+При `auto_discover_tables=true` pipeline сам находит все обычные таблицы `public`
+и использует их PRIMARY KEY либо UNIQUE index.
 
-Пример для обычных dump-таблиц:
+`incremental_tables` нужен только для явного override ключа либо при отключенном
+автообнаружении. Пример:
 
 ```ini
 incremental_tables = users:id,orders:id,products:id
@@ -239,7 +244,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks se
 
 1. Main БД уже не должна удаляться nightly-процессом.
 2. Nightly dump должен успешно подниматься во временной staging БД.
-3. Таблицы из `incremental_tables` должны иметь корректные PK для `UPSERT`.
+3. Все рабочие таблицы должны иметь PRIMARY KEY/UNIQUE index либо быть явно исключены.
 4. CSV для append `asterisk_cdr` и init-only seed CSV должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
 6. Snapshot `issues/projects` не должен содержать колонки `cf_*`.

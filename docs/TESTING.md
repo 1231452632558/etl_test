@@ -61,6 +61,9 @@ group_employee_count_csv_file = /workspace/logs/group_employee_count_backup.csv
 users_active_csv_file = /workspace/logs/users_active_backup.csv
 
 [tables]
+auto_discover_tables = true
+fail_on_unkeyed_tables = true
+snapshot_excluded_tables =
 incremental_tables =
 issues_table = issues
 projects_table = projects
@@ -72,7 +75,8 @@ weekly_days = 1
 
 Важно:
 - `asterisk_cdr`, `group_employee_count` и `users_active` не должны лежать в `incremental_tables`
-- `issues` и `projects` можно не добавлять руками, если заданы `issues_table` и `projects_table`
+- остальные обычные таблицы `public` должны находиться автоматически
+- таблица без PK/UNIQUE должна остановить compare с понятной ошибкой
 
 ## 4. Подготовка директорий и seed CSV
 
@@ -223,7 +227,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 2. В `asterisk_cdr` добавились только новые `id`; существующие строки не перезаписались.
 3. Main БД не пересоздавалась.
 
-Если в конфиге есть другие snapshot-таблицы, проверьте их так же.
+Проверьте в логе `Snapshot tables resolved` и выборочно сравните несколько таблиц,
+кроме `issues/projects`, включая таблицу с составным UNIQUE-ключом.
 
 ## 11. Тест 6. Проверка `asterisk_cdr` CSV-source
 
@@ -348,10 +353,12 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare -
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
 3. Стадии custom transform нет, `cf_*` отсутствуют в snapshot, а схема main не изменяется.
-4. `asterisk_cdr` присутствует после прогона.
-5. `group_employee_count` и `users_active` не теряют историю.
-6. Нет дублей в weekly-таблицах.
-7. Task и монолит дают эквивалентный результат.
+4. Все таблицы public с безопасным ключом обнаружены и обработаны.
+5. Таблицы без ключей и расхождения схемы не пропущены молча.
+6. `asterisk_cdr` присутствует после прогона.
+7. `group_employee_count` и `users_active` не теряют историю.
+8. Нет дублей в weekly-таблицах.
+9. Task и монолит дают эквивалентный результат.
 
 ## 16. Если найден дефект
 

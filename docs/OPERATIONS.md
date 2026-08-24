@@ -68,16 +68,26 @@ Staging нужна потому, что входящий dump нельзя ме�
 
 ## 3. Snapshot-таблицы
 
-Snapshot-таблицы задаются через:
+По умолчанию snapshot-таблицы автоматически обнаруживаются в схеме `public`:
 
 ```ini
 [tables]
+auto_discover_tables = true
+fail_on_unkeyed_tables = true
+snapshot_excluded_tables =
 incremental_tables = table_a:id,table_b:id
 issues_table = issues
 projects_table = projects
 ```
 
-`issues` и `projects` можно не дублировать в `incremental_tables`, если они заданы через `issues_table` и `projects_table`.
+Pipeline выбирает PRIMARY KEY, а при его отсутствии — простой UNIQUE index.
+`incremental_tables` остается способом явно переопределить ключ. Если автообнаружение
+отключено, этот параметр снова становится полным списком таблиц.
+
+Таблицы загружаются с учетом внешних ключей: сначала родительские, затем дочерние.
+Если безопасного уникального ключа нет, pipeline останавливается, чтобы таблица не
+была молча пропущена. После осознанного решения ее можно добавить в
+`snapshot_excluded_tables`.
 
 `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются
 из `incremental_tables`, потому что принадлежат стабильной main БД.
@@ -90,7 +100,8 @@ projects_table = projects
 ### Что это означает practically
 
 - новые строки появятся в main
-- измененные строки обновятся в main
+- измененные строки обновятся в main через `IS DISTINCT FROM`
+- полностью совпадающие строки не выполняют лишний `UPDATE`
 - удаленные строки автоматически не удаляются
 
 Если нужна поддержка удалений, её надо проектировать отдельно.
@@ -180,17 +191,15 @@ CSV-файлы:
 
 ## 7. Индексы и производительность
 
-Перед rollout стоит проверить индексы на:
-- `issues`
-- `projects`
-- PK таблиц из `incremental_tables`
+Перед rollout стоит проверить, что каждая рабочая таблица имеет PRIMARY KEY или
+подходящий UNIQUE index.
 
 Минимум стоит посмотреть:
 
 ```sql
 SELECT indexname, indexdef
 FROM pg_indexes
-WHERE tablename IN ('issues', 'projects');
+    WHERE schemaname = 'public';
 ```
 
 ## 8. Что смотреть при первом rollout
@@ -207,8 +216,9 @@ WHERE tablename IN ('issues', 'projects');
 
 Проверить:
 - staging БД создалась и удалилась
-- `issues` и `projects` в main обновились
-- `UPSERT` сработал по нужным таблицам
+- в логе есть `Snapshot tables resolved` с ожидаемым количеством таблиц
+- новые и измененные строки всех snapshot-таблиц появились в main
+- не было ошибок про таблицы без ключей или расхождение схемы
 - weekly-таблицы не получили дубликаты
 
 ## 9. Operational checklist
@@ -217,14 +227,14 @@ WHERE tablename IN ('issues', 'projects');
 - доступен PostgreSQL
 - доступен remote dump или локальный dump
 - в конфиге корректен `db_name`
-- в конфиге корректен `incremental_tables`
+- включено `auto_discover_tables` и осознанно заданы исключения
 
 После nightly:
 - нет висящих staging БД
 - в логе есть итог `Staging cleanup завершен`
 - нет ошибок в `etl_pipeline.log`
 - размеры экспортов выглядят ожидаемо
-- `issues` и `projects` визуально корректны; custom values не переносились
+- выборочно сверены counts и строки нескольких таблиц; `cf_*` не переносились
 
 ## 10. Когда использовать монолит, когда tasks
 
