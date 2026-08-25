@@ -57,6 +57,8 @@ def make_settings(**overrides):
         "db_name": "main",
         "db_host": "/tmp",
         "db_port": "5432",
+        "snapshot_batch_timeout_seconds": 14400,
+        "snapshot_lock_timeout_seconds": 300,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -235,10 +237,13 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         db_ops.get_column_default = lambda *_args, **_kwargs: ""
         captured = {}
 
-        def fake_run_script(script, db_name=None, context_label=None):
+        def fake_run_script(
+            script, db_name=None, context_label=None, timeout_seconds=None
+        ):
             captured["script"] = script
             captured["db_name"] = db_name
             captured["context_label"] = context_label
+            captured["timeout_seconds"] = timeout_seconds
             return True
 
         db_ops._run_psql_script = fake_run_script
@@ -280,12 +285,15 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         script = captured["script"]
         self.assertTrue(result)
         self.assertEqual(captured["context_label"], "snapshot_atomic_batch")
+        self.assertEqual(captured["timeout_seconds"], 14400)
         self.assertEqual(script.count("BEGIN;"), 1)
         self.assertEqual(script.count("COMMIT;"), 1)
+        self.assertIn("SET LOCAL lock_timeout = '300s';", script)
         self.assertNotIn('DELETE FROM "issues"', script)
         self.assertIn('DELETE FROM "keyless_links";', script)
         self.assertIn('INSERT INTO "issues"', script)
         self.assertIn("source_minus_target <> 0", script)
+        self.assertNotIn("EXCEPT ALL", script)
 
     def test_query_failure_is_not_returned_as_empty_rows(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())

@@ -68,6 +68,8 @@ class PipelineSettings:
     db_host: str
     db_port: str
     temp_db_prefix: str
+    snapshot_batch_timeout_seconds: int
+    snapshot_lock_timeout_seconds: int
     backup_storage_dir: str
     old_backup_dir: str
     temp_dir: str
@@ -151,6 +153,22 @@ class PipelineSettings:
             db_host=parser.get("database", "db_host", fallback="localhost"),
             db_port=parser.get("database", "db_port", fallback="5432"),
             temp_db_prefix=parser.get("database", "temp_db_prefix", fallback="temp_restore_"),
+            snapshot_batch_timeout_seconds=max(
+                60,
+                parser.getint(
+                    "database",
+                    "snapshot_batch_timeout_seconds",
+                    fallback=14400,
+                ),
+            ),
+            snapshot_lock_timeout_seconds=max(
+                0,
+                parser.getint(
+                    "database",
+                    "snapshot_lock_timeout_seconds",
+                    fallback=300,
+                ),
+            ),
             backup_storage_dir=parser.get("paths", "backup_storage_dir", fallback="/var/backups/postgres"),
             old_backup_dir=parser.get(
                 "paths", "old_backup_dir", fallback="/workspace/old_backup"
@@ -370,6 +388,7 @@ class DatabaseOperations:
         db_name: Optional[str] = None,
         ignore_errors: bool = False,
         context_label: Optional[str] = None,
+        timeout_seconds: int = 1800,
     ) -> bool:
         target_db = db_name or self.settings.db_name
         cmd = self._psql_base_cmd(target_db)
@@ -379,12 +398,14 @@ class DatabaseOperations:
                 input=script,
                 capture_output=True,
                 text=True,
-                timeout=1800,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired:
             label = f" [{context_label}]" if context_label else ""
             self.logger.error(
-                f"PSQL script timeout{label}: db={target_db}, sql={self._preview_sql(script, 180)}"
+                f"PSQL script timeout{label}: db={target_db}, "
+                f"timeout_seconds={timeout_seconds}, "
+                f"sql={self._preview_sql(script, 180)}"
             )
             return False
         except Exception as exc:
@@ -1122,30 +1143,13 @@ SELECT setval(
                 )
 
             if load_mode == "replace":
-                source_diff_query = f"""
-    SELECT COUNT(*) INTO source_minus_target
-    FROM (
-        SELECT to_jsonb(source_row) AS row_data
-        FROM (SELECT {quoted_columns} FROM {_quote_identifier(temp_table)}) AS source_row
-        EXCEPT ALL
-        SELECT to_jsonb(target_row) AS row_data
-        FROM (SELECT {quoted_columns} FROM {_quote_identifier(table_name)}) AS target_row
-    ) AS source_diff;
-""".strip()
-                target_diff_query = f"""
-    SELECT COUNT(*) INTO target_minus_source
-    FROM (
-        SELECT to_jsonb(target_row) AS row_data
-        FROM (SELECT {quoted_columns} FROM {_quote_identifier(table_name)}) AS target_row
-        EXCEPT ALL
-        SELECT to_jsonb(source_row) AS row_data
-        FROM (SELECT {quoted_columns} FROM {_quote_identifier(temp_table)}) AS source_row
-    ) AS target_diff;
-""".strip()
-                verification_condition = (
-                    "source_rows <> target_rows OR source_minus_target <> 0 "
-                    "OR target_minus_source <> 0"
-                )
+                # REPLACE выполняется прямым INSERT ... SELECT после DELETE в этой
+                # же транзакции. Проверка количества подтверждает, что PostgreSQL
+                # вставил все строки. Двойной EXCEPT ALL здесь повторно сортировал
+                # миллионы широких строк и мог занимать дольше самой загрузки.
+                source_diff_query = "source_minus_target := 0;"
+                target_diff_query = "target_minus_source := 0;"
+                verification_condition = "source_rows <> target_rows"
             else:
                 key_match = " AND ".join(
                     f"target.{_quote_identifier(column)} IS NOT DISTINCT FROM "
@@ -1211,6 +1215,10 @@ $verify_{index}$;
         )
         script = "\n\n".join(setup_statements)
         script += "\n\nBEGIN;\n"
+        script += (
+            "SET LOCAL lock_timeout = "
+            f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
+        )
         script += f"LOCK TABLE {lock_tables} IN SHARE ROW EXCLUSIVE MODE;\n"
         script += "\n".join(reversed(delete_replace_statements)) + "\n"
         script += "\n".join(upsert_statements) + "\n"
@@ -1223,12 +1231,15 @@ $verify_{index}$;
         self.logger.info(
             f"Snapshot atomic batch подготовлен: db={db_name}, "
             f"tables={len(table_names)}, keyed={len(keyed_items)}, "
-            f"replace={len(replace_items)}"
+            f"replace={len(replace_items)}, "
+            f"timeout_seconds={self.settings.snapshot_batch_timeout_seconds}, "
+            f"lock_timeout_seconds={self.settings.snapshot_lock_timeout_seconds}"
         )
         success = self._run_psql_script(
             script,
             db_name=db_name,
             context_label="snapshot_atomic_batch",
+            timeout_seconds=self.settings.snapshot_batch_timeout_seconds,
         )
         if not success:
             self.logger.error(

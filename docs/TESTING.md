@@ -242,6 +242,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 3. Main БД не пересоздавалась.
 4. В логе есть `Snapshot verified` для `issues`, `projects` и остальных непустых таблиц.
 5. Искусственная ошибка одной таблицы откатывает изменения, сделанные предыдущими таблицами того же load.
+6. В строке `Snapshot atomic batch подготовлен` видны `timeout_seconds=14400` и `lock_timeout_seconds=300`.
 
 Проверьте в логе `Snapshot tables resolved` и выборочно сравните несколько таблиц,
 кроме `issues/projects`, включая таблицу с составным UNIQUE-ключом.
