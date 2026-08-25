@@ -289,6 +289,8 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         self.assertEqual(script.count("BEGIN;"), 1)
         self.assertEqual(script.count("COMMIT;"), 1)
         self.assertIn("SET LOCAL lock_timeout = '300s';", script)
+        self.assertIn("pg_advisory_xact_lock", script)
+        self.assertNotIn("LOCK TABLE", script)
         self.assertNotIn('DELETE FROM "issues"', script)
         self.assertIn('DELETE FROM "keyless_links";', script)
         self.assertIn('INSERT INTO "issues"', script)

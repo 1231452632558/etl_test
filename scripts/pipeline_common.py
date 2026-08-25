@@ -1210,16 +1210,21 @@ $verify_{index}$;
 
         keyed_items = [item for item in prepared if item["load_mode"] == "upsert"]
         replace_items = [item for item in prepared if item["load_mode"] == "replace"]
-        lock_tables = ", ".join(
-            _quote_identifier(str(item["table_name"])) for item in prepared
-        )
         script = "\n\n".join(setup_statements)
         script += "\n\nBEGIN;\n"
         script += (
             "SET LOCAL lock_timeout = "
             f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
         )
-        script += f"LOCK TABLE {lock_tables} IN SHARE ROW EXCLUSIVE MODE;\n"
+        # Сериализуем только параллельные snapshot-batch. Предварительный
+        # SHARE ROW EXCLUSIVE сразу на всех таблицах заставлял весь load ждать
+        # любую активную запись в одной из 153 таблиц. INSERT/UPDATE/DELETE сами
+        # берут необходимые PostgreSQL-блокировки, атомарность транзакции при
+        # этом сохраняется.
+        script += (
+            "SELECT pg_advisory_xact_lock("
+            "hashtext(current_database()), hashtext('snapshot_atomic_batch'));\n"
+        )
         script += "\n".join(reversed(delete_replace_statements)) + "\n"
         script += "\n".join(upsert_statements) + "\n"
         script += "\n".join(replace_insert_statements) + "\n"
@@ -1233,7 +1238,8 @@ $verify_{index}$;
             f"tables={len(table_names)}, keyed={len(keyed_items)}, "
             f"replace={len(replace_items)}, "
             f"timeout_seconds={self.settings.snapshot_batch_timeout_seconds}, "
-            f"lock_timeout_seconds={self.settings.snapshot_lock_timeout_seconds}"
+            f"lock_timeout_seconds={self.settings.snapshot_lock_timeout_seconds}, "
+            "table_lock_strategy=implicit"
         )
         success = self._run_psql_script(
             script,

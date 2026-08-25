@@ -316,6 +316,7 @@ python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --tasks se
 - Удаления строк из dump сейчас не синхронизируются автоматически.
 - Исключение — `snapshot_replace_tables`: они точно зеркалируются, включая удаления.
 - Атомарный load ограничен `snapshot_batch_timeout_seconds`, а ожидание блокировки — более коротким `snapshot_lock_timeout_seconds`.
+- Pipeline не запрашивает предварительную блокировку всех snapshot-таблиц: необходимые блокировки PostgreSQL берет непосредственно для `INSERT/UPDATE/DELETE`. Advisory-lock предотвращает только параллельный запуск второго snapshot-batch.
 - Таблица должна иметь PRIMARY KEY или простой UNIQUE index; иначе pipeline останавливается и требует явного решения.
 - Новые таблицы/колонки в staging не создаются автоматически в main: расхождение схемы останавливает загрузку.
 - Существующие `cf_*` в main БД не удаляются; pipeline только не переносит новые custom values.
