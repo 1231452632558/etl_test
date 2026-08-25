@@ -36,13 +36,14 @@
 - `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
 - `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей
 - `replace_tables_from_csv()` — групповая транзакционная синхронизация явно заданных таблиц
-- `apply_snapshot_batch()` — единая транзакция UPSERT/REPLACE и проверка всех source-строк перед COMMIT
+- `apply_snapshot_batch()` — проверяемая транзакция одной keyed-таблицы или связанной REPLACE-группы
+- `apply_snapshot_in_transactions()` — общий preflight и последовательное применение транзакций с учетом прогресса
 - `order_snapshot_tables()` — порядок UPSERT с учетом внешних ключей
 - `add_weekly_records()` — weekly-историзация в `users_active` и `group_employee_count`
 
 Ключевой принцип:
 - все действия над БД должны жить здесь, а не дублироваться в task/monolith слое
-- все таблицы загружаются одним атомарным batch; таблицы с ключом используют UPSERT, а `snapshot_replace_tables` — точную замену
+- таблицы с ключом загружаются отдельными UPSERT-транзакциями, а `snapshot_replace_tables` — связанной REPLACE-группой
 - тип `json` в changed-row предикате приводится к `jsonb`, тип `xml` — к `text`
 
 ### `scripts/etl_pipeline.py`
@@ -146,11 +147,11 @@ cleanup
 ### `load`
 
 Назначение:
-- применить все snapshot-CSV в `main_db` одной транзакцией и проверить source/main до COMMIT
+- выполнить общий preflight snapshot-CSV, затем применять keyed-таблицы по одной и проверять source/main до каждого COMMIT
 - остановиться при расхождении схемы staging/main вместо тихого пропуска колонок
 - отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
 - использовать отдельные лимиты для полного batch и ожидания блокировок; REPLACE после прямой вставки проверять по row count
-- сериализовать snapshot-batch advisory-lock, не блокируя заранее все таблицы через `LOCK TABLE`
+- не использовать общий `LOCK TABLE` или advisory-lock для всех snapshot-таблиц
 
 Работает только по staging-derived данным.
 

@@ -175,7 +175,15 @@ class ETLPipeline:
                 f"{load_mode.upper()} snapshot {table_name} "
                 f"({mod['row_count']} rows) -> {main_db}"
             )
-        return self.db_ops.apply_snapshot_batch(modifications, main_db)
+        success, applied_count, errors = self.db_ops.apply_snapshot_in_transactions(
+            modifications,
+            main_db,
+        )
+        if not success:
+            self.logger.error(
+                f"Snapshot load остановлен: applied={applied_count}, errors={errors}"
+            )
+        return success
 
     def run_init(self, dump_file: str | None, force_local_dump: bool = False) -> bool:
         self.logger.info("=== ЗАПУСК ИНИЦИАЛИЗАЦИИ ===")

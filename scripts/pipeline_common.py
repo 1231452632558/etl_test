@@ -392,6 +392,9 @@ class DatabaseOperations:
     ) -> bool:
         target_db = db_name or self.settings.db_name
         cmd = self._psql_base_cmd(target_db)
+        process_env = os.environ.copy()
+        if context_label:
+            process_env["PGAPPNAME"] = f"etl_pipeline:{context_label}"[:63]
         try:
             result = subprocess.run(
                 cmd,
@@ -399,6 +402,7 @@ class DatabaseOperations:
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,
+                env=process_env,
             )
         except subprocess.TimeoutExpired:
             label = f" [{context_label}]" if context_label else ""
@@ -442,6 +446,46 @@ class DatabaseOperations:
                 continue
             rows.append([part.strip() for part in line.split("\t")])
         return rows
+
+    def log_suspicious_transactions(self, db_name: str) -> None:
+        """Показывает старые/ожидающие транзакции, способные блокировать load."""
+        query = """
+            SELECT
+                pid::text,
+                COALESCE(application_name, ''),
+                state,
+                COALESCE(wait_event_type, ''),
+                COALESCE(wait_event, ''),
+                COALESCE(ROUND(EXTRACT(EPOCH FROM (NOW() - xact_start)))::bigint, 0)::text,
+                pg_blocking_pids(pid)::text,
+                LEFT(REGEXP_REPLACE(query, E'\\s+', ' ', 'g'), 180)
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+              AND xact_start IS NOT NULL
+              AND (
+                    state = 'idle in transaction'
+                    OR wait_event_type = 'Lock'
+                    OR application_name LIKE 'etl_pipeline:%'
+                  )
+            ORDER BY xact_start;
+        """
+        try:
+            rows = self.run_rows(query, db_name=db_name)
+        except RuntimeError as exc:
+            self.logger.warning(
+                f"Не удалось проверить блокирующие транзакции: db={db_name}, error={exc}"
+            )
+            return
+        for row in rows:
+            if len(row) < 8:
+                continue
+            self.logger.warning(
+                "Подозрительная транзакция main БД: "
+                f"db={db_name}, pid={row[0]}, application={row[1]!r}, "
+                f"state={row[2]}, wait={row[3]}:{row[4]}, "
+                f"age_seconds={row[5]}, blocked_by={row[6]}, query={row[7]}"
+            )
 
     def _run_psql_file(self, sql_file: str, db_name: Optional[str] = None) -> bool:
         target_db = db_name or self.settings.db_name
@@ -901,8 +945,9 @@ DROP TABLE temp_upsert;
         self,
         modifications: Sequence[Dict[str, object]],
         db_name: str,
+        validate_only: bool = False,
     ) -> bool:
-        """Атомарно применяет snapshot и проверяет все строки источника в main БД."""
+        """Проверяет и атомарно применяет одну таблицу или связанную группу."""
         if not modifications:
             self.logger.error("Snapshot batch пуст: синхронизация main БД отменена")
             return False
@@ -1029,6 +1074,12 @@ DROP TABLE temp_upsert;
                     "temp_table": f"temp_snapshot_batch_{index}",
                 }
             )
+
+        if validate_only:
+            self.logger.info(
+                f"Snapshot preflight пройден: db={db_name}, tables={len(prepared)}"
+            )
+            return True
 
         setup_statements: List[str] = []
         delete_replace_statements: List[str] = []
@@ -1216,15 +1267,6 @@ $verify_{index}$;
             "SET LOCAL lock_timeout = "
             f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
         )
-        # Сериализуем только параллельные snapshot-batch. Предварительный
-        # SHARE ROW EXCLUSIVE сразу на всех таблицах заставлял весь load ждать
-        # любую активную запись в одной из 153 таблиц. INSERT/UPDATE/DELETE сами
-        # берут необходимые PostgreSQL-блокировки, атомарность транзакции при
-        # этом сохраняется.
-        script += (
-            "SELECT pg_advisory_xact_lock("
-            "hashtext(current_database()), hashtext('snapshot_atomic_batch'));\n"
-        )
         script += "\n".join(reversed(delete_replace_statements)) + "\n"
         script += "\n".join(upsert_statements) + "\n"
         script += "\n".join(replace_insert_statements) + "\n"
@@ -1233,23 +1275,33 @@ $verify_{index}$;
         script += "COMMIT;\n"
 
         table_names = [str(item["table_name"]) for item in prepared]
+        if len(table_names) == 1:
+            context_label = f"snapshot_table:{table_names[0]}"
+            transaction_scope = "table"
+        elif all(item["load_mode"] == "replace" for item in prepared):
+            context_label = "snapshot_replace_group"
+            transaction_scope = "replace_group"
+        else:
+            context_label = "snapshot_atomic_batch"
+            transaction_scope = "all_tables"
         self.logger.info(
-            f"Snapshot atomic batch подготовлен: db={db_name}, "
+            f"Snapshot transaction prepared: db={db_name}, "
             f"tables={len(table_names)}, keyed={len(keyed_items)}, "
             f"replace={len(replace_items)}, "
             f"timeout_seconds={self.settings.snapshot_batch_timeout_seconds}, "
             f"lock_timeout_seconds={self.settings.snapshot_lock_timeout_seconds}, "
-            "table_lock_strategy=implicit"
+            f"transaction_scope={transaction_scope}"
         )
         success = self._run_psql_script(
             script,
             db_name=db_name,
-            context_label="snapshot_atomic_batch",
+            context_label=context_label,
             timeout_seconds=self.settings.snapshot_batch_timeout_seconds,
         )
         if not success:
             self.logger.error(
-                "Snapshot atomic batch откатан полностью; табличные изменения main БД не применены"
+                f"Snapshot transaction rolled back: db={db_name}, "
+                f"tables={table_names}"
             )
             return False
 
@@ -1259,6 +1311,74 @@ $verify_{index}$;
                 f"table={item['table_name']}, rows={item['expected_rows']}"
             )
         return True
+
+    def apply_snapshot_in_transactions(
+        self,
+        modifications: Sequence[Dict[str, object]],
+        db_name: str,
+    ) -> Tuple[bool, int, List[str]]:
+        """Применяет keyed-таблицы по одной, а REPLACE — связанной группой."""
+        if not modifications:
+            return False, 0, ["Список snapshot-модификаций пуст"]
+
+        # Сначала проверяем все CSV, ключи и соответствие схемы. Так ошибки
+        # входных данных обнаруживаются до первой изменяющей транзакции.
+        if not self.apply_snapshot_batch(modifications, db_name, validate_only=True):
+            return False, 0, ["Snapshot preflight не пройден"]
+
+        self.log_suspicious_transactions(db_name)
+
+        keyed_modifications = [
+            modification
+            for modification in modifications
+            if str(modification.get("load_mode", "upsert")) == "upsert"
+        ]
+        replace_modifications = [
+            modification
+            for modification in modifications
+            if str(modification.get("load_mode", "upsert")) == "replace"
+        ]
+        total_transactions = len(keyed_modifications) + bool(replace_modifications)
+        applied_count = 0
+
+        self.logger.info(
+            f"Snapshot transaction plan: db={db_name}, "
+            f"keyed_transactions={len(keyed_modifications)}, "
+            f"replace_group_tables={len(replace_modifications)}, "
+            f"transactions={total_transactions}"
+        )
+        for transaction_index, modification in enumerate(keyed_modifications, 1):
+            table_name = str(modification.get("table_name", ""))
+            self.logger.info(
+                f"Snapshot transaction [{transaction_index}/{total_transactions}]: "
+                f"table={table_name}, mode=upsert, rows={modification.get('row_count', 0)}"
+            )
+            if not self.apply_snapshot_batch([modification], db_name):
+                return (
+                    False,
+                    applied_count,
+                    [f"Ошибка snapshot-таблицы {table_name}"],
+                )
+            applied_count += 1
+
+        if replace_modifications:
+            replace_tables = [
+                str(modification.get("table_name", ""))
+                for modification in replace_modifications
+            ]
+            self.logger.info(
+                f"Snapshot transaction [{total_transactions}/{total_transactions}]: "
+                f"mode=replace_group, tables={replace_tables}"
+            )
+            if not self.apply_snapshot_batch(replace_modifications, db_name):
+                return (
+                    False,
+                    applied_count,
+                    [f"Ошибка REPLACE-группы: {replace_tables}"],
+                )
+            applied_count += len(replace_modifications)
+
+        return True, applied_count, []
 
     def replace_tables_from_csv(
         self,

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Задача загрузки изменений в основную базу данных
-Применяет UPSERT для keyed-таблиц и атомарный REPLACE для явно заданных keyless-таблиц
+Применяет UPSERT в транзакции на таблицу и атомарный REPLACE связанной группы
 """
 
 from datetime import datetime
@@ -55,18 +55,16 @@ class LoadTask(BaseTask):
                 )
 
             self.logger.info(
-                f"Атомарная синхронизация snapshot: "
+                f"Транзакционная синхронизация snapshot: "
                 f"db={db_name}, tables={len(modifications)}"
             )
-            success = self.db_ops.apply_snapshot_batch(modifications, db_name)
-            errors = [] if success else [
-                "Ошибка атомарной snapshot-синхронизации; изменения main БД откатаны"
-            ]
-            applied_count = len(modifications) if success else 0
+            success, applied_count, errors = (
+                self.db_ops.apply_snapshot_in_transactions(modifications, db_name)
+            )
 
             return self._create_result(
-                    success=success,
-                    message=f"Применено {applied_count} модификаций",
+                success=success,
+                message=f"Применено {applied_count} модификаций",
                 data={
                     'applied_count': applied_count,
                     'errors_count': len(errors)

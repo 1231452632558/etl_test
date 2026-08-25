@@ -289,7 +289,7 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         self.assertEqual(script.count("BEGIN;"), 1)
         self.assertEqual(script.count("COMMIT;"), 1)
         self.assertIn("SET LOCAL lock_timeout = '300s';", script)
-        self.assertIn("pg_advisory_xact_lock", script)
+        self.assertNotIn("pg_advisory_xact_lock", script)
         self.assertNotIn("LOCK TABLE", script)
         self.assertNotIn('DELETE FROM "issues"', script)
         self.assertIn('DELETE FROM "keyless_links";', script)
@@ -304,14 +304,30 @@ class SnapshotDiscoveryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 db_ops.run_rows("SELECT 1", db_name="main")
 
-    def test_load_task_routes_replace_snapshot_to_replace_loader(self):
+    def test_psql_script_sets_diagnostic_application_name(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with patch("pipeline_common.subprocess.run", return_value=completed) as run:
+            result = db_ops._run_psql_script(
+                "SELECT 1;",
+                db_name="main",
+                context_label="snapshot_table:issues",
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["PGAPPNAME"],
+            "etl_pipeline:snapshot_table:issues",
+        )
+
+    def test_load_task_routes_snapshot_to_per_table_loader(self):
         logger = FakeLogger()
         calls = []
 
         class FakeDatabaseOperations:
-            def apply_snapshot_batch(self, modifications, db_name):
+            def apply_snapshot_in_transactions(self, modifications, db_name):
                 calls.append((modifications, db_name))
-                return True
+                return True, len(modifications), []
 
         csv_path = ""
         try:
@@ -341,6 +357,42 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(calls[0][1], "main")
         self.assertEqual(calls[0][0][0]["table_name"], "keyless_links")
+
+    def test_snapshot_transactions_preflight_then_keyed_tables_then_replace_group(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        calls = []
+
+        def fake_apply(modifications, db_name, validate_only=False):
+            calls.append(
+                (
+                    [str(item["table_name"]) for item in modifications],
+                    db_name,
+                    validate_only,
+                )
+            )
+            return True
+
+        db_ops.apply_snapshot_batch = fake_apply
+        db_ops.log_suspicious_transactions = lambda _db_name: None
+        modifications = [
+            {"table_name": "projects", "load_mode": "upsert", "row_count": 2},
+            {"table_name": "issues", "load_mode": "upsert", "row_count": 3},
+            {"table_name": "members", "load_mode": "replace", "row_count": 4},
+            {"table_name": "member_roles", "load_mode": "replace", "row_count": 5},
+        ]
+
+        result = db_ops.apply_snapshot_in_transactions(modifications, "main")
+
+        self.assertEqual(result, (True, 4, []))
+        self.assertEqual(
+            calls,
+            [
+                (["projects", "issues", "members", "member_roles"], "main", True),
+                (["projects"], "main", False),
+                (["issues"], "main", False),
+                (["members", "member_roles"], "main", False),
+            ],
+        )
 
     def test_replace_batch_deletes_children_first_and_inserts_parents_first(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())

@@ -241,9 +241,10 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 2. В `asterisk_cdr` добавились только новые `id`; существующие строки не перезаписались.
 3. Main БД не пересоздавалась.
 4. В логе есть `Snapshot verified` для `issues`, `projects` и остальных непустых таблиц.
-5. Искусственная ошибка одной таблицы откатывает изменения, сделанные предыдущими таблицами того же load.
-6. В строке `Snapshot atomic batch подготовлен` видны `timeout_seconds=14400`, `lock_timeout_seconds=300` и `table_lock_strategy=implicit`.
-7. SQL batch содержит `pg_advisory_xact_lock`, но не содержит общего `LOCK TABLE` для snapshot-таблиц.
+5. Искусственная ошибка откатывает текущую таблицу или REPLACE-группу, но не ранее успешно зафиксированные keyed-таблицы.
+6. В логе видны общий `Snapshot preflight`, план транзакций и строки `Snapshot transaction [N/M]` с именем таблицы.
+7. SQL не содержит общего `LOCK TABLE` или `pg_advisory_xact_lock` для snapshot-таблиц.
+8. При наличии старой транзакции в логе видны её `pid`, `application`, возраст, ожидание и SQL; ошибки psql содержат контекст `snapshot_table:<table>`.
 
 Проверьте в логе `Snapshot tables resolved` и выборочно сравните несколько таблиц,
 кроме `issues/projects`, включая таблицу с составным UNIQUE-ключом.
