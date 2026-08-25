@@ -107,7 +107,9 @@ class ETLPipeline:
                 shutil.rmtree(path, ignore_errors=True)
 
     def _seed_asterisk(self, db_name: str) -> bool:
-        self.db_ops.create_required_tables(db_name)
+        if not self.db_ops.create_required_tables(db_name):
+            self.logger.error(f"Не удалось создать служебные таблицы в db={db_name}")
+            return False
         result = self.db_ops.append_asterisk_cdr_from_csv(db_name)
         self.db_ops.add_project_id_column(db_name)
         self.db_ops.log_table_schema("asterisk_cdr", db_name, include_indexes=True)
@@ -166,38 +168,27 @@ class ETLPipeline:
         modifications: list[dict],
         main_db: str,
     ) -> bool:
-        replace_snapshots: list[tuple[str, str]] = []
         for mod in modifications:
             load_mode = str(mod.get("load_mode", "upsert"))
             table_name = str(mod["table_name"])
-            csv_file = str(mod["csv_file"])
             self.logger.info(
                 f"{load_mode.upper()} snapshot {table_name} "
                 f"({mod['row_count']} rows) -> {main_db}"
             )
-            if load_mode == "replace":
-                replace_snapshots.append((table_name, csv_file))
-                continue
-            if not self.db_ops.upsert_from_csv(
-                table_name,
-                mod["primary_key"],
-                csv_file,
-                main_db,
-            ):
-                return False
+        return self.db_ops.apply_snapshot_batch(modifications, main_db)
 
-        if replace_snapshots and not self.db_ops.replace_tables_from_csv(
-            replace_snapshots,
-            main_db,
-        ):
-            return False
-        return True
-
-    def run_init(self, dump_file: str | None) -> bool:
+    def run_init(self, dump_file: str | None, force_local_dump: bool = False) -> bool:
         self.logger.info("=== ЗАПУСК ИНИЦИАЛИЗАЦИИ ===")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
-        remote_download = should_download_remote_backup(self.settings, dump_file)
-        actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
+        remote_download = should_download_remote_backup(
+            self.settings, dump_file, force_local=force_local_dump
+        )
+        actual_file = copy_from_remote_or_local(
+            self.settings,
+            self.logger,
+            dump_file,
+            force_local=force_local_dump,
+        )
         if not actual_file:
             return False
 
@@ -219,12 +210,14 @@ class ETLPipeline:
             if not self.db_ops.restore_dump(main_db, sql_files):
                 return False
 
-            self.db_ops.create_required_tables(main_db)
+            if not self.db_ops.create_required_tables(main_db):
+                return False
             self.db_ops.seed_manual_tables_if_needed(main_db, self.settings.manual_seed_files)
             if not self._seed_asterisk(main_db):
                 return False
 
-            self.db_ops.grant_privileges(main_db)
+            if not self.db_ops.grant_privileges(main_db):
+                return False
             if remote_download and not finalize_remote_backup(
                 self.settings,
                 self.logger,
@@ -243,12 +236,20 @@ class ETLPipeline:
         cleanup: bool = True,
         skip_weekly: bool = False,
         force_weekly: bool = False,
+        force_local_dump: bool = False,
     ) -> bool:
         self.logger.info("=== ЗАПУСК НОЧНОЙ ОБРАБОТКИ ===")
         self.logger.info("Основная БД не пересоздается; nightly-дамп разворачивается только во временную staging БД.")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
-        remote_download = should_download_remote_backup(self.settings, dump_file)
-        actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
+        remote_download = should_download_remote_backup(
+            self.settings, dump_file, force_local=force_local_dump
+        )
+        actual_file = copy_from_remote_or_local(
+            self.settings,
+            self.logger,
+            dump_file,
+            force_local=force_local_dump,
+        )
         if not actual_file:
             return False
 
@@ -260,6 +261,7 @@ class ETLPipeline:
         main_db = self.settings.db_name
         temp_db = self._build_temp_db_name()
         export_dir = os.path.join(self.settings.temp_dir, f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        completed_successfully = False
 
         try:
             if not self.db_ops.database_exists(main_db):
@@ -271,7 +273,8 @@ class ETLPipeline:
             if not self.db_ops.restore_dump(temp_db, sql_files):
                 return False
 
-            self.db_ops.create_required_tables(temp_db)
+            if not self.db_ops.create_required_tables(temp_db):
+                return False
 
             modifications = build_snapshot_exports(
                 self.db_ops,
@@ -283,7 +286,8 @@ class ETLPipeline:
             if not self._apply_snapshot_modifications(modifications, main_db):
                 return False
 
-            self.db_ops.create_required_tables(main_db)
+            if not self.db_ops.create_required_tables(main_db):
+                return False
             if not self._seed_asterisk(main_db):
                 return False
             if skip_weekly:
@@ -291,7 +295,8 @@ class ETLPipeline:
             elif not self._run_weekly(main_db, force_weekly=force_weekly):
                 return False
 
-            self.db_ops.grant_privileges(main_db)
+            if not self.db_ops.grant_privileges(main_db):
+                return False
             if remote_download and not finalize_remote_backup(
                 self.settings,
                 self.logger,
@@ -299,10 +304,18 @@ class ETLPipeline:
             ):
                 return False
             self.logger.info("=== НОЧНАЯ ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО ===")
+            completed_successfully = True
             return True
         finally:
-            self._cleanup(temp_db, extract_dir, export_dir, cleanup)
-            cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+            if completed_successfully:
+                self._cleanup(temp_db, extract_dir, export_dir, cleanup)
+                cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+            else:
+                self.logger.warning(
+                    "Nightly завершился с ошибкой; staging и временные "
+                    f"артефакты сохранены: staging={temp_db}, "
+                    f"extract_dir={extract_dir}, export_dir={export_dir}"
+                )
 
     def run(
         self,
@@ -311,17 +324,19 @@ class ETLPipeline:
         cleanup: bool = True,
         skip_weekly: bool = False,
         force_weekly: bool = False,
+        force_local_dump: bool = False,
     ) -> bool:
         self.logger.info(f"Дата запуска: {datetime.now()}")
         self.logger.info(f"Пользователь запуска: {os.getenv('USER', 'unknown')}")
         self.logger.info(f"Хост: {os.uname().nodename}")
         if init_mode:
-            return self.run_init(dump_file)
+            return self.run_init(dump_file, force_local_dump=force_local_dump)
         return self.run_nightly(
             dump_file,
             cleanup,
             skip_weekly=skip_weekly,
             force_weekly=force_weekly,
+            force_local_dump=force_local_dump,
         )
 
     def run_selected(
@@ -334,12 +349,14 @@ class ETLPipeline:
         force_weekly: bool = False,
         db_scope: str = "auto",
         temp_db_name: str | None = None,
+        force_local_dump: bool = False,
     ) -> bool:
         effective_scope = resolve_db_scope(init_mode, db_scope)
         requires_dump = any(stage in {"extract", "restore"} for stage in stages)
         remote_download = requires_dump and should_download_remote_backup(
             self.settings,
             dump_file,
+            force_local=force_local_dump,
         )
         if requires_dump and not dump_file and not remote_download:
             self.logger.error(
@@ -362,6 +379,7 @@ class ETLPipeline:
         sql_files: list[str] = []
         temp_db = temp_db_name
         main_db = self.settings.db_name
+        completed_successfully = False
 
         self.logger.info(
             f"План стадий monolith-pipeline: stages={stages}, db_scope={effective_scope}, init={init_mode}"
@@ -369,7 +387,12 @@ class ETLPipeline:
 
         try:
             if requires_dump:
-                actual_file = copy_from_remote_or_local(self.settings, self.logger, dump_file)
+                actual_file = copy_from_remote_or_local(
+                    self.settings,
+                    self.logger,
+                    dump_file,
+                    force_local=force_local_dump,
+                )
                 if not actual_file:
                     return False
 
@@ -400,7 +423,8 @@ class ETLPipeline:
                         return False
                     if sql_files and not self.db_ops.restore_dump(target_db, sql_files):
                         return False
-                    self.db_ops.create_required_tables(target_db)
+                    if not self.db_ops.create_required_tables(target_db):
+                        return False
                     if effective_scope == "main":
                         self.db_ops.seed_manual_tables_if_needed(target_db, self.settings.manual_seed_files)
                 elif stage == "seed_asterisk":
@@ -451,7 +475,8 @@ class ETLPipeline:
                     temp_db = None if effective_scope == "temp" else temp_db
 
             if self.db_ops.database_exists(main_db):
-                self.db_ops.grant_privileges(main_db)
+                if not self.db_ops.grant_privileges(main_db):
+                    return False
             applied_to_main = "load" in stages or (
                 "restore" in stages and effective_scope == "main"
             )
@@ -467,11 +492,18 @@ class ETLPipeline:
             ):
                 return False
             cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+            completed_successfully = True
             return True
         finally:
-            if "cleanup" not in stages:
+            if completed_successfully and "cleanup" not in stages:
                 self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, export_dir, cleanup)
                 cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
+            elif not completed_successfully:
+                self.logger.warning(
+                    "Выборочный pipeline завершился с ошибкой; staging и "
+                    f"артефакты сохранены: staging={temp_db}, "
+                    f"extract_dir={extract_dir}, export_dir={export_dir}"
+                )
 
 
 def main() -> None:
@@ -482,6 +514,11 @@ def main() -> None:
     parser.add_argument("dump_file", nargs="?", help="Путь к .tar.gz или .sql дампу")
     parser.add_argument("--init", action="store_true", help="Первичная инициализация основной БД")
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
+    parser.add_argument(
+        "--local-dump",
+        action="store_true",
+        help="Явно использовать переданный локальный dump вместо настроенного [remote]",
+    )
     parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
         "--force-weekly",
@@ -512,6 +549,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.local_dump and not args.dump_file:
+        parser.error("Флаг --local-dump требует путь dump_file")
+
     if not os.path.exists(args.config):
         print(f"Ошибка: Конфигурационный файл не найден: {args.config}")
         sys.exit(1)
@@ -523,9 +563,15 @@ def main() -> None:
         print(f"Ошибка: {exc}")
         sys.exit(1)
 
-    pipeline.db_ops.cleanup_stale_databases(
-        exclude_names=[args.temp_db_name] if args.temp_db_name else []
-    )
+    try:
+        pipeline.db_ops.cleanup_stale_databases(
+            exclude_names=[args.temp_db_name] if args.temp_db_name else []
+        )
+    except Exception as exc:
+        pipeline.logger.error(
+            f"Предварительная проверка PostgreSQL завершилась ошибкой: {exc}"
+        )
+        sys.exit(1)
 
     if selected_stages:
         success = pipeline.run_selected(
@@ -537,6 +583,7 @@ def main() -> None:
             force_weekly=args.force_weekly,
             db_scope=args.db_scope,
             temp_db_name=args.temp_db_name,
+            force_local_dump=args.local_dump,
         )
     else:
         success = pipeline.run(
@@ -545,6 +592,7 @@ def main() -> None:
             cleanup=args.cleanup,
             skip_weekly=args.skip_weekly,
             force_weekly=args.force_weekly,
+            force_local_dump=args.local_dump,
         )
     sys.exit(0 if success else 1)
 

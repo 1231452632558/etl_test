@@ -205,8 +205,14 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
-Для этих команд должны быть заполнены `[remote]`. Для теста с локальным архивом
-передайте его путь последним аргументом; удаленная ротация тогда не выполняется.
+Для этих команд должны быть заполнены `[remote]`. Проверьте наличие в логе строк
+`обязательное скачивание`, `remote_mtime`, `sha256` и `changed=`. Даже если cron
+передаёт существующий локальный путь, должен выполняться `scp`. Для теста с
+локальным архивом используйте только явный режим:
+
+```bash
+python3 scripts/etl_pipeline.py /path/to/test.tar.gz --local-dump --config config/etl_config.ini --cleanup
+```
 
 Проверить:
 
@@ -234,6 +240,8 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 1. Новые строки обычных snapshot-таблиц появились, измененные обновились.
 2. В `asterisk_cdr` добавились только новые `id`; существующие строки не перезаписались.
 3. Main БД не пересоздавалась.
+4. В логе есть `Snapshot verified` для `issues`, `projects` и остальных непустых таблиц.
+5. Искусственная ошибка одной таблицы откатывает изменения, сделанные предыдущими таблицами того же load.
 
 Проверьте в логе `Snapshot tables resolved` и выборочно сравните несколько таблиц,
 кроме `issues/projects`, включая таблицу с составным UNIQUE-ключом.

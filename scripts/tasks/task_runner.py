@@ -165,6 +165,11 @@ class TaskRunner:
                     break
 
         if not all_success and failed_index is not None:
+            self.context["preserve_on_failure"] = True
+            self.logger.warning(
+                "Pipeline завершился с ошибкой: staging БД и временные "
+                "артефакты будут сохранены для диагностики"
+            )
             self._run_cleanup_tasks_from(failed_index + 1)
         
         # Итоговый отчет

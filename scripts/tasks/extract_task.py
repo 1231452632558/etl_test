@@ -54,7 +54,14 @@ class ExtractTask(BaseTask):
             self.logger.info(f"Подготовка дампа: {dump_file}")
             extract_dir, sql_files = extract_dump(dump_file, temp_dir, self.logger)
             if not sql_files:
-                self.logger.warning("SQL файлы не найдены в дампе")
+                return self._create_result(
+                    success=False,
+                    message="SQL файлы не найдены в дампе",
+                    errors=["Архив не содержит пригодных SQL-файлов"],
+                    data={"extract_dir": extract_dir, "sql_files": []},
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             
             self.logger.info(f"Архив успешно распакован в {extract_dir}")
             self.logger.info(f"Найдено SQL файлов: {len(sql_files)}")

@@ -35,7 +35,14 @@ class SeedAsteriskTask(BaseTask):
                     completed_at=datetime.now(),
                 )
 
-            self.db_ops.create_required_tables(db_name)
+            if not self.db_ops.create_required_tables(db_name):
+                return self._create_result(
+                    success=False,
+                    message=f"Ошибка создания служебных таблиц в db={db_name}",
+                    errors=["create_required_tables failed"],
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             append_result = self.db_ops.append_asterisk_cdr_from_csv(db_name)
             self.db_ops.add_project_id_column(db_name)
             self.db_ops.log_table_schema("asterisk_cdr", db_name, include_indexes=True)

@@ -229,7 +229,10 @@ sudo -u postgres psql -d <main_db> -c "\d projects"
 0 2 * * * cd /workspace/etl_test && /usr/bin/python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup >> /workspace/logs/cron.log 2>&1
 ```
 
-Команда без пути к dump использует источник из `[remote]`. После успешного ETL
+При заполненном `[remote]` новый архив скачивается всегда, даже если старый cron
+передает существующий локальный путь. Ошибка скачивания останавливает запуск без
+fallback на старую копию. Ручной локальный запуск требует `--local-dump`.
+После успешного ETL
 текущий архив сохраняется в `backup_storage_dir`, а два предыдущих — в
 `old_backup_dir` при `max_backups=3`.
 

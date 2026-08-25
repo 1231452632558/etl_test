@@ -54,6 +54,9 @@ def make_settings(**overrides):
         "snapshot_replace_tables": (),
         "issues_table": "issues",
         "projects_table": "projects",
+        "db_name": "main",
+        "db_host": "/tmp",
+        "db_port": "5432",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -173,8 +176,14 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         db_ops.resolve_snapshot_tables = lambda *_args, **_kwargs: {}
         db_ops.order_snapshot_tables = lambda _db, tables: tables
         db_ops.table_exists = lambda *_args, **_kwargs: True
-        db_ops.export_table_to_csv = lambda *_args, **_kwargs: 0
         db_ops.get_table_columns = lambda *_args, **_kwargs: ["left_id", "right_id"]
+
+        def export_empty(_table_name, csv_file, *_args, **_kwargs):
+            with open(csv_file, "w", encoding="utf-8") as handle:
+                handle.write("left_id,right_id\n")
+            return 0
+
+        db_ops.export_table_to_csv = export_empty
 
         with tempfile.TemporaryDirectory() as export_dir:
             modifications = build_snapshot_exports(
@@ -192,17 +201,107 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         self.assertEqual(modifications[0]["row_count"], 0)
         self.assertEqual(csv_content, "left_id,right_id\n")
 
+    def test_empty_keyed_snapshot_is_not_skipped(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        db_ops.resolve_snapshot_tables = lambda *_args, **_kwargs: {"issues": "id"}
+        db_ops.table_exists = lambda *_args, **_kwargs: True
+
+        def export_empty(_table_name, csv_file, *_args, **_kwargs):
+            with open(csv_file, "w", encoding="utf-8") as handle:
+                handle.write("id,subject\n")
+            return 0
+
+        db_ops.export_table_to_csv = export_empty
+        with tempfile.TemporaryDirectory() as export_dir:
+            modifications = build_snapshot_exports(
+                db_ops,
+                "staging",
+                {},
+                export_dir,
+            )
+            self.assertTrue(os.path.isfile(modifications[0]["csv_file"]))
+
+        self.assertEqual(len(modifications), 1)
+        self.assertEqual(modifications[0]["table_name"], "issues")
+        self.assertEqual(modifications[0]["row_count"], 0)
+
+    def test_atomic_batch_does_not_delete_keyed_rows_and_verifies_source(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        db_ops.get_table_column_details = lambda table_name, _db_name: (
+            [("id", "integer"), ("subject", "character varying")]
+            if table_name == "issues"
+            else [("left_id", "integer"), ("right_id", "integer")]
+        )
+        db_ops.get_column_default = lambda *_args, **_kwargs: ""
+        captured = {}
+
+        def fake_run_script(script, db_name=None, context_label=None):
+            captured["script"] = script
+            captured["db_name"] = db_name
+            captured["context_label"] = context_label
+            return True
+
+        db_ops._run_psql_script = fake_run_script
+        csv_paths = []
+        try:
+            for content in (
+                "id,subject\n1,Fresh\n",
+                "left_id,right_id\n10,20\n",
+            ):
+                with tempfile.NamedTemporaryFile(
+                    "w", suffix=".csv", delete=False
+                ) as handle:
+                    handle.write(content)
+                    csv_paths.append(handle.name)
+            result = db_ops.apply_snapshot_batch(
+                [
+                    {
+                        "table_name": "issues",
+                        "load_mode": "upsert",
+                        "primary_key": "id",
+                        "csv_file": csv_paths[0],
+                        "row_count": 1,
+                    },
+                    {
+                        "table_name": "keyless_links",
+                        "load_mode": "replace",
+                        "primary_key": None,
+                        "csv_file": csv_paths[1],
+                        "row_count": 1,
+                    },
+                ],
+                "main",
+            )
+        finally:
+            for csv_path in csv_paths:
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+
+        script = captured["script"]
+        self.assertTrue(result)
+        self.assertEqual(captured["context_label"], "snapshot_atomic_batch")
+        self.assertEqual(script.count("BEGIN;"), 1)
+        self.assertEqual(script.count("COMMIT;"), 1)
+        self.assertNotIn('DELETE FROM "issues"', script)
+        self.assertIn('DELETE FROM "keyless_links";', script)
+        self.assertIn('INSERT INTO "issues"', script)
+        self.assertIn("source_minus_target <> 0", script)
+
+    def test_query_failure_is_not_returned_as_empty_rows(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        failed = SimpleNamespace(returncode=1, stdout="", stderr="connection failed")
+        with patch("pipeline_common.subprocess.run", return_value=failed):
+            with self.assertRaises(RuntimeError):
+                db_ops.run_rows("SELECT 1", db_name="main")
+
     def test_load_task_routes_replace_snapshot_to_replace_loader(self):
         logger = FakeLogger()
         calls = []
 
         class FakeDatabaseOperations:
-            def replace_tables_from_csv(self, snapshots, db_name):
-                calls.append((snapshots, db_name))
+            def apply_snapshot_batch(self, modifications, db_name):
+                calls.append((modifications, db_name))
                 return True
-
-            def upsert_from_csv(self, *_args, **_kwargs):
-                raise AssertionError("UPSERT не должен вызываться для replace snapshot")
 
         csv_path = ""
         try:
@@ -220,6 +319,7 @@ class SnapshotDiscoveryTests(unittest.TestCase):
                             "table_name": "keyless_links",
                             "primary_key": None,
                             "csv_file": csv_path,
+                            "row_count": 1,
                         }
                     ],
                 }
@@ -229,7 +329,8 @@ class SnapshotDiscoveryTests(unittest.TestCase):
                 os.remove(csv_path)
 
         self.assertTrue(result.success)
-        self.assertEqual(calls, [([("keyless_links", csv_path)], "main")])
+        self.assertEqual(calls[0][1], "main")
+        self.assertEqual(calls[0][0][0]["table_name"], "keyless_links")
 
     def test_replace_batch_deletes_children_first_and_inserts_parents_first(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
@@ -410,6 +511,80 @@ class BackupRotationTests(unittest.TestCase):
 
         self.assertTrue(should_download_remote_backup(settings, None))
 
+    def test_remote_mode_ignores_existing_local_dump_without_explicit_flag(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            local_dump = os.path.join(root_dir, "old.tar.gz")
+            with open(local_dump, "w", encoding="utf-8") as handle:
+                handle.write("old")
+            settings = make_settings(
+                remote_user="backup",
+                remote_host="example.internal",
+                remote_path="/exports/",
+                backup_tar="nightly.tar.gz",
+                backup_storage_dir=os.path.join(root_dir, "current"),
+                temp_dir=os.path.join(root_dir, "temp"),
+            )
+
+            def fake_scp(command, **_kwargs):
+                with open(command[-1], "w", encoding="utf-8") as handle:
+                    handle.write("fresh")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("pipeline_common.subprocess.run", side_effect=fake_scp):
+                result = copy_from_remote_or_local(settings, logger, local_dump)
+
+            self.assertNotEqual(result, local_dump)
+            with open(result, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "fresh")
+            self.assertTrue(should_download_remote_backup(settings, local_dump))
+
+    def test_remote_failure_does_not_fallback_to_existing_local_dump(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            local_dump = os.path.join(root_dir, "old.tar.gz")
+            with open(local_dump, "w", encoding="utf-8") as handle:
+                handle.write("old")
+            settings = make_settings(
+                remote_user="backup",
+                remote_host="example.internal",
+                remote_path="/exports/",
+                backup_tar="nightly.tar.gz",
+                backup_storage_dir=os.path.join(root_dir, "current"),
+                temp_dir=os.path.join(root_dir, "temp"),
+            )
+            failed = SimpleNamespace(returncode=1, stdout="", stderr="network error")
+            with patch("pipeline_common.subprocess.run", return_value=failed):
+                result = copy_from_remote_or_local(settings, logger, local_dump)
+
+            self.assertIsNone(result)
+
+    def test_local_dump_requires_explicit_flag_when_remote_is_configured(self):
+        logger = FakeLogger()
+        with tempfile.TemporaryDirectory() as root_dir:
+            local_dump = os.path.join(root_dir, "manual.sql")
+            with open(local_dump, "w", encoding="utf-8") as handle:
+                handle.write("SELECT 1;")
+            settings = make_settings(
+                remote_user="backup",
+                remote_host="example.internal",
+                remote_path="/exports/",
+                backup_tar="nightly.tar.gz",
+            )
+            with patch("pipeline_common.subprocess.run") as subprocess_run:
+                result = copy_from_remote_or_local(
+                    settings,
+                    logger,
+                    local_dump,
+                    force_local=True,
+                )
+
+            self.assertEqual(result, local_dump)
+            subprocess_run.assert_not_called()
+            self.assertFalse(
+                should_download_remote_backup(settings, local_dump, force_local=True)
+            )
+
     def test_remote_archive_is_downloaded_to_temp_before_etl(self):
         logger = FakeLogger()
         with tempfile.TemporaryDirectory() as root_dir:
@@ -430,7 +605,7 @@ class BackupRotationTests(unittest.TestCase):
             )
 
             def fake_scp(command, **_kwargs):
-                destination = command[2]
+                destination = command[-1]
                 with open(destination, "w", encoding="utf-8") as handle:
                     handle.write("incoming")
                 return SimpleNamespace(returncode=0, stdout="", stderr="")

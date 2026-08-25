@@ -143,6 +143,11 @@ def main() -> None:
     parser.add_argument("dump_file", nargs="?", help="Путь к .tar.gz или .sql дампу")
     parser.add_argument("--init", action="store_true", help="Первичная инициализация основной БД")
     parser.add_argument("--cleanup", action="store_true", help="Удалять staging БД после завершения")
+    parser.add_argument(
+        "--local-dump",
+        action="store_true",
+        help="Явно использовать переданный локальный dump вместо настроенного [remote]",
+    )
     parser.add_argument("--skip-weekly", action="store_true", help="Не выполнять weekly-пополнение ручных таблиц")
     parser.add_argument(
         "--force-weekly",
@@ -196,7 +201,11 @@ def main() -> None:
     remote_download = requires_dump and should_download_remote_backup(
         settings,
         args.dump_file,
+        force_local=args.local_dump,
     )
+    if requires_dump and args.local_dump and not args.dump_file:
+        logger.error("Флаг --local-dump требует путь dump_file")
+        sys.exit(1)
     if requires_dump and not args.dump_file and not remote_download:
         logger.error(
             "Для стадий extract/restore необходимо передать dump_file "
@@ -212,12 +221,23 @@ def main() -> None:
         logger.error("Стадия load предполагает snapshot из temp scope")
         sys.exit(1)
 
-    db_ops.cleanup_stale_databases(exclude_names=[args.temp_db_name] if args.temp_db_name else [])
-    cleanup_temp_artifacts(settings.temp_dir, logger)
+    try:
+        db_ops.cleanup_stale_databases(
+            exclude_names=[args.temp_db_name] if args.temp_db_name else []
+        )
+        cleanup_temp_artifacts(settings.temp_dir, logger)
+    except Exception as exc:
+        logger.error(f"Предварительная проверка PostgreSQL завершилась ошибкой: {exc}")
+        sys.exit(1)
 
     actual_file = None
     if requires_dump:
-        actual_file = copy_from_remote_or_local(settings, logger, args.dump_file)
+        actual_file = copy_from_remote_or_local(
+            settings,
+            logger,
+            args.dump_file,
+            force_local=args.local_dump,
+        )
         if not actual_file:
             sys.exit(1)
 
@@ -263,7 +283,13 @@ def main() -> None:
     )
     if success and remote_download and applied_to_main and actual_file:
         success = finalize_remote_backup(settings, logger, actual_file)
-    cleanup_temp_artifacts(settings.temp_dir, logger)
+    if success:
+        cleanup_temp_artifacts(settings.temp_dir, logger)
+    else:
+        logger.warning(
+            f"Временные артефакты сохранены после ошибки: temp_dir={settings.temp_dir}, "
+            f"staging={temp_db or '<не создана>'}"
+        )
     sys.exit(0 if success else 1)
 
 

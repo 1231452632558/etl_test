@@ -40,6 +40,24 @@ class CleanupTask(BaseTask):
             extract_dir = context.get('extract_dir')
             export_dir = context.get('export_dir')
             cleanup_temp_db = context.get('cleanup_temp_db', True)
+            preserve_on_failure = bool(context.get('preserve_on_failure', False))
+
+            if preserve_on_failure:
+                preserved = [
+                    value
+                    for value in (temp_db, extract_dir, export_dir)
+                    if value
+                ]
+                self.logger.warning(
+                    f"Очистка пропущена после ошибки; сохранено для диагностики: {preserved}"
+                )
+                return self._create_result(
+                    success=True,
+                    message=f"Диагностические ресурсы сохранены: {len(preserved)}",
+                    data={"preserved_items": preserved},
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             
             cleaned_items = []
             warnings = []

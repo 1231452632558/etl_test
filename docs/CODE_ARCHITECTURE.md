@@ -29,19 +29,20 @@
 - `PipelineSettings` — чтение `etl_config.ini`
 - `ETLLogger` — логирование
 - `DatabaseOperations` — операции с PostgreSQL
-- `copy_from_remote_or_local()` — выбор локального dump или скачивание `scp` во временный файл
+- `copy_from_remote_or_local()` — обязательное скачивание remote dump без fallback на старый локальный файл; локальный режим разрешается только через `--local-dump`
 - `finalize_remote_backup()` — публикация проверенного удаленного архива после успешного ETL
 - `rotate_backups()` — хранение одного текущего и `max_backups - 1` старых архивов
 - `extract_dump()` — распаковка входящего дампа
 - `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
 - `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей
 - `replace_tables_from_csv()` — групповая транзакционная синхронизация явно заданных таблиц
+- `apply_snapshot_batch()` — единая транзакция UPSERT/REPLACE и проверка всех source-строк перед COMMIT
 - `order_snapshot_tables()` — порядок UPSERT с учетом внешних ключей
 - `add_weekly_records()` — weekly-историзация в `users_active` и `group_employee_count`
 
 Ключевой принцип:
 - все действия над БД должны жить здесь, а не дублироваться в task/monolith слое
-- таблицы с ключом загружаются через UPSERT, а перечисленные в `snapshot_replace_tables` — одной общей REPLACE-транзакцией
+- все таблицы загружаются одним атомарным batch; таблицы с ключом используют UPSERT, а `snapshot_replace_tables` — точную замену
 - тип `json` в changed-row предикате приводится к `jsonb`, тип `xml` — к `text`
 
 ### `scripts/etl_pipeline.py`
@@ -145,7 +146,7 @@ cleanup
 ### `load`
 
 Назначение:
-- применить snapshot-CSV в `main_db` через `UPSERT`
+- применить все snapshot-CSV в `main_db` одной транзакцией и проверить source/main до COMMIT
 - остановиться при расхождении схемы staging/main вместо тихого пропуска колонок
 - отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
 

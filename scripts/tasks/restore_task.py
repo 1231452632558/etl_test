@@ -50,6 +50,14 @@ class RestoreTask(BaseTask):
                     started_at=started_at,
                     completed_at=datetime.now()
                 )
+            if not sql_files:
+                return self._create_result(
+                    success=False,
+                    message="Не переданы SQL-файлы для восстановления",
+                    errors=["Пустой список sql_files"],
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             
             create_database = self.target == 'temp' or context.get('create_database', False)
             if create_database:
@@ -64,16 +72,21 @@ class RestoreTask(BaseTask):
                     )
             
             # Восстанавливаем дамп из SQL файлов
-            if sql_files:
-                if not self.db_ops.restore_dump(db_name, sql_files):
-                    return self._create_result(
-                        success=False,
-                        message="Ошибка восстановления дампа",
-                        started_at=started_at,
-                        completed_at=datetime.now()
-                    )
+            if not self.db_ops.restore_dump(db_name, sql_files):
+                return self._create_result(
+                    success=False,
+                    message="Ошибка восстановления дампа",
+                    started_at=started_at,
+                    completed_at=datetime.now()
+                )
             
-            self.db_ops.create_required_tables(db_name)
+            if not self.db_ops.create_required_tables(db_name):
+                return self._create_result(
+                    success=False,
+                    message="Ошибка создания служебных таблиц",
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             if self.target == 'main':
                 seed_results = self.db_ops.seed_manual_tables_if_needed(db_name, self.config.manual_seed_files)
             else:
@@ -83,7 +96,13 @@ class RestoreTask(BaseTask):
                     "эти таблицы обновляются только weekly-шагом в main БД"
                 )
             self.db_ops.log_pipeline_schema_snapshot(db_name, self.config.issues_table, self.config.projects_table)
-            self.db_ops.grant_privileges(db_name)
+            if not self.db_ops.grant_privileges(db_name):
+                return self._create_result(
+                    success=False,
+                    message="Ошибка выдачи прав на восстановленную базу",
+                    started_at=started_at,
+                    completed_at=datetime.now(),
+                )
             
             self.logger.info(f"Восстановление в базу {db_name} завершено успешно")
             

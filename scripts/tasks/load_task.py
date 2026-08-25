@@ -5,9 +5,8 @@
 Применяет UPSERT для keyed-таблиц и атомарный REPLACE для явно заданных keyless-таблиц
 """
 
-import os
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from .base import BaseTask, TaskResult
 
@@ -46,62 +45,24 @@ class LoadTask(BaseTask):
                     completed_at=datetime.now()
                 )
             
-            applied_count = 0
-            errors = []
-            replace_snapshots = []
-            
-            # Применяем каждую модификацию
-            for mod in modifications:
-                change_type = mod.get('change_type')
-                load_mode = mod.get('load_mode', 'upsert')
-                table_name = mod.get('table_name')
-                primary_key = mod.get('primary_key')
-                csv_file = mod.get('csv_file')
-                
-                if not csv_file or not os.path.exists(csv_file):
-                    self.logger.warning(f"CSV файл не найден: {csv_file}")
-                    errors.append(f"Файл не найден: {csv_file}")
-                    continue
-                
-                self.logger.info(
-                    f"Применение {change_type} строк в {table_name}..."
+            if not modifications:
+                return self._create_result(
+                    success=False,
+                    message="Список snapshot-модификаций пуст",
+                    errors=["Нет данных для синхронизации main БД"],
+                    started_at=started_at,
+                    completed_at=datetime.now(),
                 )
 
-                if load_mode == 'replace':
-                    replace_snapshots.append((table_name, csv_file))
-                    continue
-
-                applied = self.db_ops.upsert_from_csv(
-                    table_name, primary_key, csv_file, db_name
-                )
-
-                if applied:
-                    applied_count += 1
-                    self.logger.info(
-                        f"Успешно применено: {change_type} строки в {table_name}"
-                    )
-                else:
-                    error_msg = f"Ошибка {load_mode.upper()} в {table_name}"
-                    self.logger.error(error_msg)
-                    errors.append(error_msg)
-
-            if replace_snapshots:
-                replace_tables = [table_name for table_name, _ in replace_snapshots]
-                self.logger.info(
-                    f"Атомарное применение REPLACE snapshot: tables={replace_tables}"
-                )
-                if self.db_ops.replace_tables_from_csv(replace_snapshots, db_name):
-                    applied_count += len(replace_snapshots)
-                    for table_name in replace_tables:
-                        self.logger.info(
-                            f"Успешно применено: snapshot_replace строки в {table_name}"
-                        )
-                else:
-                    error_msg = f"Ошибка REPLACE batch: {replace_tables}"
-                    self.logger.error(error_msg)
-                    errors.append(error_msg)
-            
-            success = len(errors) == 0
+            self.logger.info(
+                f"Атомарная синхронизация snapshot: "
+                f"db={db_name}, tables={len(modifications)}"
+            )
+            success = self.db_ops.apply_snapshot_batch(modifications, db_name)
+            errors = [] if success else [
+                "Ошибка атомарной snapshot-синхронизации; изменения main БД откатаны"
+            ]
+            applied_count = len(modifications) if success else 0
 
             return self._create_result(
                     success=success,

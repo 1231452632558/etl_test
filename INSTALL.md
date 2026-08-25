@@ -197,12 +197,19 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --cleanup
 python3 scripts/legacy/etl_pipeline.py --config config/etl_config.ini --cleanup
 ```
 
-Команды без позиционного пути используют `[remote]`: архив сначала скачивается
-в `temp_dir`, а в постоянное хранилище переносится только после успешного ETL.
-При локальном dump передайте путь последним аргументом; автоматическая ротация
-удаленных архивов для такого запуска не выполняется.
+При заполненном `[remote]` архив всегда заново скачивается в `temp_dir`, даже если
+cron передает существующий локальный путь. Ошибка `scp` останавливает pipeline:
+fallback на предыдущий локальный архив запрещен. Локальный dump разрешается
+только явно:
 
-Флаг `--cleanup` удаляет staging БД после завершения.
+```bash
+python3 scripts/etl_pipeline.py /path/to/dump.tar.gz --local-dump --config config/etl_config.ini --cleanup
+```
+
+Для `--local-dump` автоматическая ротация удаленных архивов не выполняется.
+
+Флаг `--cleanup` удаляет staging БД после успешного завершения. При ошибке staging
+и временные snapshot-файлы сохраняются для диагностики.
 
 Перед каждым запуском pipeline дополнительно ищет и удаляет осиротевшие staging-БД
 предыдущих запусков. В логе это отражается строкой `Staging cleanup завершен`.

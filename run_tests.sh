@@ -37,7 +37,7 @@ echo -e "${GREEN}Очистка завершена${NC}"
 
 # Шаг 1: Инициализация
 echo -e "\n${YELLOW}=== ШАГ 1: Инициализация основной базы ===${NC}"
-python3 "$ETL_SCRIPT" --init "$DUMPS_DIR/test_dump_v1.sql" --config "$CONFIG_FILE"
+python3 "$ETL_SCRIPT" --init --local-dump "$DUMPS_DIR/test_dump_v1.sql" --config "$CONFIG_FILE"
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}Инициализация успешна${NC}"
@@ -59,7 +59,7 @@ sudo -u postgres psql -d main_db -c "SELECT * FROM orders ORDER BY id;"
 
 # Шаг 2: Обработка ночного дампа
 echo -e "\n${YELLOW}=== ШАГ 2: Обработка ночного дампа ===${NC}"
-python3 "$ETL_SCRIPT" "$DUMPS_DIR/test_dump_v2.sql" --config "$CONFIG_FILE"
+python3 "$ETL_SCRIPT" --local-dump "$DUMPS_DIR/test_dump_v2.sql" --config "$CONFIG_FILE"
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}Обработка ночного дампа успешна${NC}"
@@ -86,7 +86,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname = 'temp_
 # Финальная очистка (опционально)
 echo -e "\n${YELLOW}=== ШАГ 3: Тест с очисткой временной базы ===${NC}"
 echo "Повторная обработка с флагом --cleanup"
-python3 "$ETL_SCRIPT" --cleanup "$DUMPS_DIR/test_dump_v2.sql" --config "$CONFIG_FILE"
+python3 "$ETL_SCRIPT" --cleanup --local-dump "$DUMPS_DIR/test_dump_v2.sql" --config "$CONFIG_FILE"
 
 echo -e "\n${YELLOW}Проверка что временная база удалена:${NC}"
 TEMP_DB_EXISTS=$(sudo -u postgres psql -t -c "SELECT 1 FROM pg_database WHERE datname = 'temp_db';" | tr -d ' ')
@@ -101,4 +101,4 @@ echo "Все тесты пройдены успешно!"
 echo "==============================================${NC}"
 echo -e "\nЛоги доступны в: $SCRIPT_DIR/logs/"
 echo -e "Для автоматизации добавьте в crontab:"
-echo -e "  0 2 * * * cd $SCRIPT_DIR && python3 $ETL_SCRIPT --cleanup /path/to/nightly/dump.sql --config $CONFIG_FILE >> $SCRIPT_DIR/logs/cron.log 2>&1"
+echo -e "  0 2 * * * cd $SCRIPT_DIR && python3 $ETL_SCRIPT --cleanup --config $CONFIG_FILE >> $SCRIPT_DIR/logs/cron.log 2>&1"
