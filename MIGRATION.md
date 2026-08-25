@@ -93,7 +93,7 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 - `projects_table = projects`
 - `auto_discover_tables = true` — обрабатывать все обычные таблицы `public`
 - `snapshot_excluded_tables` — только осознанные дополнительные исключения
-- `snapshot_replace_tables` — keyless-таблицы для атомарной полной синхронизации
+- `snapshot_replace_tables` — таблицы для точной групповой синхронизации одной транзакцией
 - `incremental_tables` — явные overrides ключей
 - `weekly_enabled` и `weekly_days` — включение и дни weekly-среза
 
@@ -108,7 +108,7 @@ sudo -u postgres psql -d <main_db> -c "SELECT COUNT(*) FROM users_active;"
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
-snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
+snapshot_replace_tables = members, member_roles, changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables =
 issues_table = issues
 projects_table = projects

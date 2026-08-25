@@ -48,6 +48,7 @@ class LoadTask(BaseTask):
             
             applied_count = 0
             errors = []
+            replace_snapshots = []
             
             # Применяем каждую модификацию
             for mod in modifications:
@@ -65,15 +66,14 @@ class LoadTask(BaseTask):
                 self.logger.info(
                     f"Применение {change_type} строк в {table_name}..."
                 )
-                
+
                 if load_mode == 'replace':
-                    applied = self.db_ops.replace_from_csv(
-                        table_name, csv_file, db_name
-                    )
-                else:
-                    applied = self.db_ops.upsert_from_csv(
-                        table_name, primary_key, csv_file, db_name
-                    )
+                    replace_snapshots.append((table_name, csv_file))
+                    continue
+
+                applied = self.db_ops.upsert_from_csv(
+                    table_name, primary_key, csv_file, db_name
+                )
 
                 if applied:
                     applied_count += 1
@@ -82,6 +82,22 @@ class LoadTask(BaseTask):
                     )
                 else:
                     error_msg = f"Ошибка {load_mode.upper()} в {table_name}"
+                    self.logger.error(error_msg)
+                    errors.append(error_msg)
+
+            if replace_snapshots:
+                replace_tables = [table_name for table_name, _ in replace_snapshots]
+                self.logger.info(
+                    f"Атомарное применение REPLACE snapshot: tables={replace_tables}"
+                )
+                if self.db_ops.replace_tables_from_csv(replace_snapshots, db_name):
+                    applied_count += len(replace_snapshots)
+                    for table_name in replace_tables:
+                        self.logger.info(
+                            f"Успешно применено: snapshot_replace строки в {table_name}"
+                        )
+                else:
+                    error_msg = f"Ошибка REPLACE batch: {replace_tables}"
                     self.logger.error(error_msg)
                     errors.append(error_msg)
             

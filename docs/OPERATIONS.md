@@ -81,7 +81,7 @@ Staging нужна потому, что входящий dump нельзя ме�
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
-snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
+snapshot_replace_tables = members, member_roles, changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables = table_a:id,table_b:id
 issues_table = issues
 projects_table = projects
@@ -97,6 +97,13 @@ Pipeline выбирает PRIMARY KEY, а при его отсутствии —
 `snapshot_replace_tables`: после проверки схемы она будет точно и атомарно
 заменяться данными из staging. В `snapshot_excluded_tables` таблицу следует
 добавлять только тогда, когда она действительно не нужна в main.
+
+Порядок `snapshot_replace_tables` задаёт порядок вставки. Связанные таблицы
+перечисляются как `members, member_roles`: очистка выполняется в обратном порядке,
+а вся группа заменяется одной транзакцией.
+
+Колонки типа PostgreSQL `json` при UPSERT сравниваются через приведение к `jsonb`.
+Это позволяет определить изменение без неподдерживаемого оператора `json = json`.
 
 `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются
 из `incremental_tables`, потому что принадлежат стабильной main БД.

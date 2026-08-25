@@ -35,13 +35,14 @@
 - `extract_dump()` — распаковка входящего дампа
 - `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
 - `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей
-- `replace_from_csv()` — транзакционная полная синхронизация явно заданных keyless-таблиц
+- `replace_tables_from_csv()` — групповая транзакционная синхронизация явно заданных таблиц
 - `order_snapshot_tables()` — порядок UPSERT с учетом внешних ключей
 - `add_weekly_records()` — weekly-историзация в `users_active` и `group_employee_count`
 
 Ключевой принцип:
 - все действия над БД должны жить здесь, а не дублироваться в task/monolith слое
-- таблицы с ключом загружаются через UPSERT, а перечисленные в `snapshot_replace_tables` — через атомарный REPLACE
+- таблицы с ключом загружаются через UPSERT, а перечисленные в `snapshot_replace_tables` — одной общей REPLACE-транзакцией
+- тип `json` в changed-row предикате приводится к `jsonb`, тип `xml` — к `text`
 
 ### `scripts/etl_pipeline.py`
 

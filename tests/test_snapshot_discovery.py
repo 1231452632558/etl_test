@@ -197,8 +197,8 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         calls = []
 
         class FakeDatabaseOperations:
-            def replace_from_csv(self, table_name, csv_file, db_name):
-                calls.append((table_name, csv_file, db_name))
+            def replace_tables_from_csv(self, snapshots, db_name):
+                calls.append((snapshots, db_name))
                 return True
 
             def upsert_from_csv(self, *_args, **_kwargs):
@@ -229,11 +229,66 @@ class SnapshotDiscoveryTests(unittest.TestCase):
                 os.remove(csv_path)
 
         self.assertTrue(result.success)
-        self.assertEqual(calls, [("keyless_links", csv_path, "main")])
+        self.assertEqual(calls, [([("keyless_links", csv_path)], "main")])
+
+    def test_replace_batch_deletes_children_first_and_inserts_parents_first(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        db_ops.get_table_columns = lambda table_name, db_name: (
+            ["id", "user_id", "project_id"]
+            if table_name == "members"
+            else ["id", "member_id", "role_id"]
+        )
+        captured = {}
+
+        def fake_run_script(script, db_name=None, context_label=None):
+            captured["script"] = script
+            captured["context_label"] = context_label
+            return True
+
+        db_ops._run_psql_script = fake_run_script
+        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: True
+        csv_paths = []
+        try:
+            for header, row in (
+                ("id,user_id,project_id", "10,1,2"),
+                ("id,member_id,role_id", "20,10,3"),
+            ):
+                with tempfile.NamedTemporaryFile(
+                    "w", suffix=".csv", delete=False
+                ) as handle:
+                    csv_paths.append(handle.name)
+                    handle.write(f"{header}\n{row}\n")
+            result = db_ops.replace_tables_from_csv(
+                [
+                    ("members", csv_paths[0]),
+                    ("member_roles", csv_paths[1]),
+                ],
+                "main",
+            )
+        finally:
+            for csv_path in csv_paths:
+                if os.path.exists(csv_path):
+                    os.remove(csv_path)
+
+        script = captured["script"]
+        self.assertTrue(result)
+        self.assertEqual(captured["context_label"], "replace_batch")
+        self.assertEqual(script.count("BEGIN;"), 1)
+        self.assertEqual(script.count("COMMIT;"), 1)
+        self.assertLess(
+            script.index('DELETE FROM "member_roles";'),
+            script.index('DELETE FROM "members";'),
+        )
+        self.assertLess(
+            script.index('INSERT INTO "members"'),
+            script.index('INSERT INTO "member_roles"'),
+        )
 
     def test_single_key_only_table_uses_do_nothing(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_columns = lambda table_name, db_name: ["version"]
+        db_ops.get_table_column_details = lambda table_name, db_name: [
+            ("version", "character varying")
+        ]
         captured = {}
 
         def fake_run_script(script, db_name=None, context_label=None):
@@ -263,7 +318,9 @@ class SnapshotDiscoveryTests(unittest.TestCase):
 
     def test_schema_drift_is_not_silently_ignored(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_columns = lambda table_name, db_name: ["id"]
+        db_ops.get_table_column_details = lambda table_name, db_name: [
+            ("id", "integer")
+        ]
 
         csv_path = ""
         try:
@@ -279,7 +336,10 @@ class SnapshotDiscoveryTests(unittest.TestCase):
 
     def test_upsert_updates_only_changed_rows(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_columns = lambda table_name, db_name: ["id", "subject"]
+        db_ops.get_table_column_details = lambda table_name, db_name: [
+            ("id", "integer"),
+            ("subject", "character varying"),
+        ]
         captured = {}
 
         def fake_run_script(script, db_name=None, context_label=None):
@@ -302,6 +362,39 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         self.assertTrue(result)
         self.assertIn(
             'WHERE "issues"."subject" IS DISTINCT FROM EXCLUDED."subject"',
+            captured["script"],
+        )
+
+    def test_upsert_compares_json_columns_as_jsonb(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        db_ops.get_table_column_details = lambda table_name, db_name: [
+            ("id", "integer"),
+            ("urls", "json"),
+            ("description", "text"),
+        ]
+        captured = {}
+
+        def fake_run_script(script, db_name=None, context_label=None):
+            captured["script"] = script
+            return True
+
+        db_ops._run_psql_script = fake_run_script
+        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: False
+
+        csv_path = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
+                csv_path = handle.name
+                handle.write('id,urls,description\n1,"{""a"":1}",Updated\n')
+            result = db_ops.upsert_from_csv("cves", "id", csv_path, "main")
+        finally:
+            if csv_path and os.path.exists(csv_path):
+                os.remove(csv_path)
+
+        self.assertTrue(result)
+        self.assertIn(
+            '("cves"."urls")::jsonb IS DISTINCT FROM '
+            '(EXCLUDED."urls")::jsonb',
             captured["script"],
         )
 

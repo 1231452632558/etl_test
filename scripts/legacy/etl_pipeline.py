@@ -161,6 +161,38 @@ class ETLPipeline:
             return False
         return True
 
+    def _apply_snapshot_modifications(
+        self,
+        modifications: list[dict],
+        main_db: str,
+    ) -> bool:
+        replace_snapshots: list[tuple[str, str]] = []
+        for mod in modifications:
+            load_mode = str(mod.get("load_mode", "upsert"))
+            table_name = str(mod["table_name"])
+            csv_file = str(mod["csv_file"])
+            self.logger.info(
+                f"{load_mode.upper()} snapshot {table_name} "
+                f"({mod['row_count']} rows) -> {main_db}"
+            )
+            if load_mode == "replace":
+                replace_snapshots.append((table_name, csv_file))
+                continue
+            if not self.db_ops.upsert_from_csv(
+                table_name,
+                mod["primary_key"],
+                csv_file,
+                main_db,
+            ):
+                return False
+
+        if replace_snapshots and not self.db_ops.replace_tables_from_csv(
+            replace_snapshots,
+            main_db,
+        ):
+            return False
+        return True
+
     def run_init(self, dump_file: str | None) -> bool:
         self.logger.info("=== ЗАПУСК ИНИЦИАЛИЗАЦИИ ===")
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
@@ -248,26 +280,8 @@ class ETLPipeline:
                 export_dir,
             )
 
-            for mod in modifications:
-                self.logger.info(
-                    f"{str(mod.get('load_mode', 'upsert')).upper()} snapshot "
-                    f"{mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
-                )
-                if mod.get("load_mode") == "replace":
-                    applied = self.db_ops.replace_from_csv(
-                        str(mod["table_name"]),
-                        str(mod["csv_file"]),
-                        main_db,
-                    )
-                else:
-                    applied = self.db_ops.upsert_from_csv(
-                        str(mod["table_name"]),
-                        mod["primary_key"],
-                        str(mod["csv_file"]),
-                        main_db,
-                    )
-                if not applied:
-                    return False
+            if not self._apply_snapshot_modifications(modifications, main_db):
+                return False
 
             self.db_ops.create_required_tables(main_db)
             if not self._seed_asterisk(main_db):
@@ -419,26 +433,11 @@ class ETLPipeline:
                             self.settings.snapshot_tables,
                             export_dir,
                         )
-                    for mod in modifications:
-                        self.logger.info(
-                            f"{str(mod.get('load_mode', 'upsert')).upper()} snapshot "
-                            f"{mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
-                        )
-                        if mod.get("load_mode") == "replace":
-                            applied = self.db_ops.replace_from_csv(
-                                str(mod["table_name"]),
-                                str(mod["csv_file"]),
-                                main_db,
-                            )
-                        else:
-                            applied = self.db_ops.upsert_from_csv(
-                                str(mod["table_name"]),
-                                mod["primary_key"],
-                                str(mod["csv_file"]),
-                                main_db,
-                            )
-                        if not applied:
-                            return False
+                    if not self._apply_snapshot_modifications(
+                        modifications,
+                        main_db,
+                    ):
+                        return False
                 elif stage == "weekly":
                     if skip_weekly:
                         self.logger.info("Weekly insert пропущен по флагу --skip-weekly")

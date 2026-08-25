@@ -64,7 +64,7 @@ users_active_csv_file = /workspace/logs/users_active_backup.csv
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
-snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
+snapshot_replace_tables = members, member_roles, changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables =
 issues_table = issues
 projects_table = projects
@@ -73,6 +73,10 @@ projects_table = projects
 weekly_enabled = true
 weekly_days = 1
 ```
+
+Дополнительно проверить, что `members` и `member_roles` входят в один REPLACE batch,
+а таблица `cves` с колонками `json` проходит changed-row сравнение без ошибки
+`operator does not exist: json = json`.
 
 Важно:
 - `asterisk_cdr`, `group_employee_count` и `users_active` не должны лежать в `incremental_tables`

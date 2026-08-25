@@ -758,7 +758,12 @@ class DatabaseOperations:
                 f"custom value columns: {blocked_columns}"
             )
             return False
-        table_columns = set(self.get_table_columns(table_name, db_name))
+        table_column_details = self.get_table_column_details(table_name, db_name)
+        table_column_types = {
+            column_name: data_type
+            for column_name, data_type in table_column_details
+        }
+        table_columns = set(table_column_types)
         columns = [col for col in csv_columns if col in table_columns]
         skipped_columns = [col for col in csv_columns if col not in table_columns]
         if not columns:
@@ -788,11 +793,28 @@ class DatabaseOperations:
         update_clause = ", ".join(
             f'{_quote_identifier(col)} = EXCLUDED.{_quote_identifier(col)}' for col in update_columns
         )
-        change_predicate = " OR ".join(
-            f'{_quote_identifier(table_name)}.{_quote_identifier(col)} '
-            f'IS DISTINCT FROM EXCLUDED.{_quote_identifier(col)}'
-            for col in update_columns
-        )
+        change_predicates: List[str] = []
+        for column in update_columns:
+            target_column = (
+                f'{_quote_identifier(table_name)}.{_quote_identifier(column)}'
+            )
+            excluded_column = f'EXCLUDED.{_quote_identifier(column)}'
+            data_type = table_column_types.get(column, "")
+            if data_type == "json":
+                change_predicates.append(
+                    f"({target_column})::jsonb IS DISTINCT FROM "
+                    f"({excluded_column})::jsonb"
+                )
+            elif data_type == "xml":
+                change_predicates.append(
+                    f"({target_column})::text IS DISTINCT FROM "
+                    f"({excluded_column})::text"
+                )
+            else:
+                change_predicates.append(
+                    f"{target_column} IS DISTINCT FROM {excluded_column}"
+                )
+        change_predicate = " OR ".join(change_predicates)
         conflict_action = (
             f"DO UPDATE SET {update_clause} WHERE {change_predicate}"
             if update_clause
@@ -839,75 +861,135 @@ DROP TABLE temp_upsert;
             except OSError:
                 pass
 
-    def replace_from_csv(self, table_name: str, csv_file: str, db_name: str) -> bool:
-        """Атомарно заменяет keyless-таблицу точным snapshot из CSV."""
-        if not os.path.exists(csv_file):
-            self.logger.warning(
-                f"CSV файл не найден для REPLACE: table={table_name}, csv={csv_file}"
-            )
-            return False
+    def replace_tables_from_csv(
+        self,
+        snapshots: Sequence[Tuple[str, str]],
+        db_name: str,
+    ) -> bool:
+        """Атомарно заменяет согласованную группу таблиц snapshot-данными."""
+        if not snapshots:
+            return True
 
-        table_name = _validate_identifier(table_name, "table_name")
-        csv_columns = [
-            _validate_identifier(column, "column")
-            for column in _read_csv_header(csv_file)
-        ]
-        table_columns = self.get_table_columns(table_name, db_name)
-        if not csv_columns:
-            self.logger.error(
-                f"CSV не содержит заголовок для REPLACE: table={table_name}, csv={csv_file}"
-            )
-            return False
-        if set(csv_columns) != set(table_columns):
-            self.logger.error(
-                f"REPLACE остановлен из-за расхождения схемы: db={db_name}, "
-                f"table={table_name}, csv_columns={csv_columns}, "
-                f"table_columns={table_columns}"
-            )
-            return False
+        prepared: List[Dict[str, object]] = []
+        seen_tables: set[str] = set()
+        for index, (raw_table_name, csv_file) in enumerate(snapshots):
+            table_name = _validate_identifier(raw_table_name, "table_name")
+            if table_name in seen_tables:
+                self.logger.error(
+                    f"REPLACE остановлен: таблица указана повторно: {table_name}"
+                )
+                return False
+            seen_tables.add(table_name)
+            if not os.path.exists(csv_file):
+                self.logger.warning(
+                    f"CSV файл не найден для REPLACE: table={table_name}, csv={csv_file}"
+                )
+                return False
 
-        quoted_columns = ", ".join(
-            _quote_identifier(column) for column in csv_columns
-        )
-        data_csv_file = _strip_csv_header(csv_file, delimiter=",")
-        copy_command = (
-            f"\\copy temp_snapshot_replace ({quoted_columns}) FROM '{data_csv_file}' "
-            f"WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '\"', "
-            f"ESCAPE '\"', ENCODING 'UTF8');"
-        )
-        script = f"""
-CREATE TEMP TABLE temp_snapshot_replace AS
+            csv_columns = [
+                _validate_identifier(column, "column")
+                for column in _read_csv_header(csv_file)
+            ]
+            table_columns = self.get_table_columns(table_name, db_name)
+            if not csv_columns:
+                self.logger.error(
+                    f"CSV не содержит заголовок для REPLACE: "
+                    f"table={table_name}, csv={csv_file}"
+                )
+                return False
+            if set(csv_columns) != set(table_columns):
+                self.logger.error(
+                    f"REPLACE остановлен из-за расхождения схемы: db={db_name}, "
+                    f"table={table_name}, csv_columns={csv_columns}, "
+                    f"table_columns={table_columns}"
+                )
+                return False
+
+            prepared.append(
+                {
+                    "table_name": table_name,
+                    "csv_file": csv_file,
+                    "columns": csv_columns,
+                    "temp_table": f"temp_snapshot_replace_{index}",
+                }
+            )
+
+        setup_statements: List[str] = []
+        insert_statements: List[str] = []
+        drop_statements: List[str] = []
+        for item in prepared:
+            table_name = str(item["table_name"])
+            csv_file = str(item["csv_file"])
+            temp_table = str(item["temp_table"])
+            columns = item["columns"]
+            if not isinstance(columns, list):
+                return False
+            quoted_columns = ", ".join(
+                _quote_identifier(column) for column in columns
+            )
+            setup_statements.append(
+                f"""
+CREATE TEMP TABLE {_quote_identifier(temp_table)} AS
 SELECT {quoted_columns}
 FROM {_quote_identifier(table_name)}
 LIMIT 0;
-
-{copy_command}
-
-BEGIN;
-LOCK TABLE {_quote_identifier(table_name)} IN ACCESS EXCLUSIVE MODE;
-DELETE FROM {_quote_identifier(table_name)};
+\\copy {_quote_identifier(temp_table)} ({quoted_columns}) FROM '{csv_file}' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');
+""".strip()
+            )
+            insert_statements.append(
+                f"""
 INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
 SELECT {quoted_columns}
-FROM temp_snapshot_replace;
-COMMIT;
-
-DROP TABLE temp_snapshot_replace;
-"""
-        self.logger.info(
-            f"REPLACE snapshot подготовлен: db={db_name}, table={table_name}, "
-            f"csv={csv_file}, data_csv={data_csv_file}, columns={csv_columns}"
-        )
-        try:
-            return self._run_psql_script(
-                script,
-                db_name=db_name,
-                context_label=f"replace:{table_name}",
+FROM {_quote_identifier(temp_table)};
+""".strip()
             )
-        finally:
-            try:
-                os.remove(data_csv_file)
-            except OSError:
-                pass
+            drop_statements.append(
+                f"DROP TABLE {_quote_identifier(temp_table)};"
+            )
+
+        quoted_tables = ", ".join(
+            _quote_identifier(str(item["table_name"])) for item in prepared
+        )
+        delete_statements = [
+            f'DELETE FROM {_quote_identifier(str(item["table_name"]))};'
+            for item in reversed(prepared)
+        ]
+        script = "\n\n".join(setup_statements)
+        script += "\n\nBEGIN;\n"
+        script += f"LOCK TABLE {quoted_tables} IN ACCESS EXCLUSIVE MODE;\n"
+        script += "\n".join(delete_statements) + "\n"
+        script += "\n".join(insert_statements) + "\n"
+        script += "COMMIT;\n\n"
+        script += "\n".join(drop_statements) + "\n"
+
+        table_names = [str(item["table_name"]) for item in prepared]
+        self.logger.info(
+            f"REPLACE batch подготовлен: db={db_name}, tables={table_names}, "
+            f"count={len(prepared)}"
+        )
+        context_label = (
+            f"replace:{table_names[0]}"
+            if len(table_names) == 1
+            else "replace_batch"
+        )
+        success = self._run_psql_script(
+            script,
+            db_name=db_name,
+            context_label=context_label,
+        )
+        if success:
+            for item in prepared:
+                columns = item["columns"]
+                if isinstance(columns, list) and "id" in columns:
+                    self.sync_sequence_with_max_id(
+                        str(item["table_name"]),
+                        db_name,
+                    )
+        return success
+
+    def replace_from_csv(self, table_name: str, csv_file: str, db_name: str) -> bool:
+        """Совместимый wrapper для атомарной замены одной snapshot-таблицы."""
+        return self.replace_tables_from_csv([(table_name, csv_file)], db_name)
 
     def create_required_tables(self, db_name: str) -> None:
         statements = [
@@ -1979,13 +2061,7 @@ def build_snapshot_exports(
             }
         )
 
-    replace_tables = db_ops.order_snapshot_tables(
-        temp_db,
-        {
-            table_name: "__replace__"
-            for table_name in db_ops.settings.snapshot_replace_tables
-        },
-    )
+    replace_tables = db_ops.settings.snapshot_replace_tables
     for table_name in replace_tables:
         if not db_ops.table_exists(table_name, temp_db):
             db_ops.logger.warning(
