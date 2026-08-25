@@ -250,14 +250,23 @@ class ETLPipeline:
 
             for mod in modifications:
                 self.logger.info(
-                    f"UPSERT snapshot {mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
+                    f"{str(mod.get('load_mode', 'upsert')).upper()} snapshot "
+                    f"{mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
                 )
-                if not self.db_ops.upsert_from_csv(
-                    str(mod["table_name"]),
-                    mod["primary_key"],
-                    str(mod["csv_file"]),
-                    main_db,
-                ):
+                if mod.get("load_mode") == "replace":
+                    applied = self.db_ops.replace_from_csv(
+                        str(mod["table_name"]),
+                        str(mod["csv_file"]),
+                        main_db,
+                    )
+                else:
+                    applied = self.db_ops.upsert_from_csv(
+                        str(mod["table_name"]),
+                        mod["primary_key"],
+                        str(mod["csv_file"]),
+                        main_db,
+                    )
+                if not applied:
                     return False
 
             self.db_ops.create_required_tables(main_db)
@@ -412,14 +421,23 @@ class ETLPipeline:
                         )
                     for mod in modifications:
                         self.logger.info(
-                            f"UPSERT snapshot {mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
+                            f"{str(mod.get('load_mode', 'upsert')).upper()} snapshot "
+                            f"{mod['table_name']} ({mod['row_count']} rows) -> {main_db}"
                         )
-                        if not self.db_ops.upsert_from_csv(
-                            str(mod["table_name"]),
-                            mod["primary_key"],
-                            str(mod["csv_file"]),
-                            main_db,
-                        ):
+                        if mod.get("load_mode") == "replace":
+                            applied = self.db_ops.replace_from_csv(
+                                str(mod["table_name"]),
+                                str(mod["csv_file"]),
+                                main_db,
+                            )
+                        else:
+                            applied = self.db_ops.upsert_from_csv(
+                                str(mod["table_name"]),
+                                mod["primary_key"],
+                                str(mod["csv_file"]),
+                                main_db,
+                            )
+                        if not applied:
                             return False
                 elif stage == "weekly":
                     if skip_weekly:

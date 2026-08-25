@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Задача загрузки изменений в основную базу данных
-Применяет UPSERT для новых и измененных строк
+Применяет UPSERT для keyed-таблиц и атомарный REPLACE для явно заданных keyless-таблиц
 """
 
 import os
@@ -13,7 +13,7 @@ from .base import BaseTask, TaskResult
 
 
 class LoadTask(BaseTask):
-    """Задача применения изменений в основную базу"""
+    """Задача применения snapshot-изменений в основную базу."""
     
     @property
     def name(self) -> str:
@@ -21,7 +21,7 @@ class LoadTask(BaseTask):
     
     def execute(self, context: Dict[str, Any]) -> TaskResult:
         """
-        Применение изменений (UPSERT) в основную базу
+        Применение изменений (UPSERT/REPLACE) в основную базу
         
         Args:
             context: Контекст с ключами:
@@ -52,6 +52,7 @@ class LoadTask(BaseTask):
             # Применяем каждую модификацию
             for mod in modifications:
                 change_type = mod.get('change_type')
+                load_mode = mod.get('load_mode', 'upsert')
                 table_name = mod.get('table_name')
                 primary_key = mod.get('primary_key')
                 csv_file = mod.get('csv_file')
@@ -65,15 +66,22 @@ class LoadTask(BaseTask):
                     f"Применение {change_type} строк в {table_name}..."
                 )
                 
-                if self.db_ops.upsert_from_csv(
-                    table_name, primary_key, csv_file, db_name
-                ):
+                if load_mode == 'replace':
+                    applied = self.db_ops.replace_from_csv(
+                        table_name, csv_file, db_name
+                    )
+                else:
+                    applied = self.db_ops.upsert_from_csv(
+                        table_name, primary_key, csv_file, db_name
+                    )
+
+                if applied:
                     applied_count += 1
                     self.logger.info(
                         f"Успешно применено: {change_type} строки в {table_name}"
                     )
                 else:
-                    error_msg = f"Ошибка UPSERT в {table_name}"
+                    error_msg = f"Ошибка {load_mode.upper()} в {table_name}"
                     self.logger.error(error_msg)
                     errors.append(error_msg)
             

@@ -14,10 +14,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pipeline_common import (  # noqa: E402
     DatabaseOperations,
+    build_snapshot_exports,
     copy_from_remote_or_local,
     finalize_remote_backup,
     should_download_remote_backup,
 )
+from tasks.load_task import LoadTask  # noqa: E402
 
 
 class FakeLogger:
@@ -49,6 +51,7 @@ def make_settings(**overrides):
             "group_employee_count",
             "users_active",
         ),
+        "snapshot_replace_tables": (),
         "issues_table": "issues",
         "projects_table": "projects",
     }
@@ -117,6 +120,116 @@ class SnapshotDiscoveryTests(unittest.TestCase):
         db_ops.run_rows = fake_run_rows
         with self.assertRaisesRegex(ValueError, "unsafe_table"):
             db_ops.resolve_snapshot_tables("staging", {})
+
+    def test_explicit_replace_table_does_not_stop_discovery(self):
+        settings = make_settings(snapshot_replace_tables=("keyless_links",))
+        db_ops = DatabaseOperations(settings, FakeLogger())
+
+        def fake_run_rows(query, db_name=None):
+            if "SELECT c.relname" in query:
+                return [["keyless_links"]]
+            return []
+
+        db_ops.run_rows = fake_run_rows
+        resolved = db_ops.resolve_snapshot_tables("staging", {})
+
+        self.assertEqual(resolved, {})
+
+    def test_replace_snapshot_is_atomic_and_does_not_use_on_conflict(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        db_ops.get_table_columns = lambda table_name, db_name: ["left_id", "right_id"]
+        captured = {}
+
+        def fake_run_script(script, db_name=None, context_label=None):
+            captured["script"] = script
+            captured["context_label"] = context_label
+            return True
+
+        db_ops._run_psql_script = fake_run_script
+        csv_path = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
+                csv_path = handle.name
+                handle.write("left_id,right_id\n1,2\n")
+            result = db_ops.replace_from_csv(
+                "keyless_links",
+                csv_path,
+                "main",
+            )
+        finally:
+            if csv_path and os.path.exists(csv_path):
+                os.remove(csv_path)
+
+        self.assertTrue(result)
+        self.assertEqual(captured["context_label"], "replace:keyless_links")
+        self.assertIn("BEGIN;", captured["script"])
+        self.assertIn('DELETE FROM "keyless_links";', captured["script"])
+        self.assertIn("COMMIT;", captured["script"])
+        self.assertNotIn("ON CONFLICT", captured["script"])
+
+    def test_empty_replace_snapshot_creates_header_only_csv(self):
+        settings = make_settings(snapshot_replace_tables=("keyless_links",))
+        db_ops = DatabaseOperations(settings, FakeLogger())
+        db_ops.resolve_snapshot_tables = lambda *_args, **_kwargs: {}
+        db_ops.order_snapshot_tables = lambda _db, tables: tables
+        db_ops.table_exists = lambda *_args, **_kwargs: True
+        db_ops.export_table_to_csv = lambda *_args, **_kwargs: 0
+        db_ops.get_table_columns = lambda *_args, **_kwargs: ["left_id", "right_id"]
+
+        with tempfile.TemporaryDirectory() as export_dir:
+            modifications = build_snapshot_exports(
+                db_ops,
+                "staging",
+                {},
+                export_dir,
+            )
+            csv_file = modifications[0]["csv_file"]
+            with open(csv_file, "r", encoding="utf-8") as handle:
+                csv_content = handle.read()
+
+        self.assertEqual(len(modifications), 1)
+        self.assertEqual(modifications[0]["load_mode"], "replace")
+        self.assertEqual(modifications[0]["row_count"], 0)
+        self.assertEqual(csv_content, "left_id,right_id\n")
+
+    def test_load_task_routes_replace_snapshot_to_replace_loader(self):
+        logger = FakeLogger()
+        calls = []
+
+        class FakeDatabaseOperations:
+            def replace_from_csv(self, table_name, csv_file, db_name):
+                calls.append((table_name, csv_file, db_name))
+                return True
+
+            def upsert_from_csv(self, *_args, **_kwargs):
+                raise AssertionError("UPSERT не должен вызываться для replace snapshot")
+
+        csv_path = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
+                csv_path = handle.name
+                handle.write("left_id,right_id\n1,2\n")
+            task = LoadTask(make_settings(), logger, FakeDatabaseOperations())
+            result = task.execute(
+                {
+                    "main_db": "main",
+                    "modifications": [
+                        {
+                            "change_type": "snapshot_replace",
+                            "load_mode": "replace",
+                            "table_name": "keyless_links",
+                            "primary_key": None,
+                            "csv_file": csv_path,
+                        }
+                    ],
+                }
+            )
+        finally:
+            if csv_path and os.path.exists(csv_path):
+                os.remove(csv_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(calls, [("keyless_links", csv_path, "main")])
 
     def test_single_key_only_table_uses_do_nothing(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())

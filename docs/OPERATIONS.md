@@ -81,6 +81,7 @@ Staging нужна потому, что входящий dump нельзя ме�
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
+snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables = table_a:id,table_b:id
 issues_table = issues
 projects_table = projects
@@ -92,8 +93,10 @@ Pipeline выбирает PRIMARY KEY, а при его отсутствии —
 
 Таблицы загружаются с учетом внешних ключей: сначала родительские, затем дочерние.
 Если безопасного уникального ключа нет, pipeline останавливается, чтобы таблица не
-была молча пропущена. После осознанного решения ее можно добавить в
-`snapshot_excluded_tables`.
+была молча пропущена. Если таблица должна синхронизироваться, добавьте её в
+`snapshot_replace_tables`: после проверки схемы она будет точно и атомарно
+заменяться данными из staging. В `snapshot_excluded_tables` таблицу следует
+добавлять только тогда, когда она действительно не нужна в main.
 
 `asterisk_cdr`, `group_employee_count` и `users_active` принудительно исключаются
 из `incremental_tables`, потому что принадлежат стабильной main БД.
@@ -109,6 +112,7 @@ Pipeline выбирает PRIMARY KEY, а при его отсутствии —
 - измененные строки обновятся в main через `IS DISTINCT FROM`
 - полностью совпадающие строки не выполняют лишний `UPDATE`
 - удаленные строки автоматически не удаляются
+- для `snapshot_replace_tables` содержимое точно зеркалируется, поэтому удаления также переносятся
 
 Если нужна поддержка удалений, её надо проектировать отдельно.
 

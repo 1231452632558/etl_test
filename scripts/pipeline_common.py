@@ -86,6 +86,7 @@ class PipelineSettings:
     auto_discover_tables: bool
     fail_on_unkeyed_tables: bool
     snapshot_excluded_tables: Tuple[str, ...]
+    snapshot_replace_tables: Tuple[str, ...]
     snapshot_tables: Dict[str, Sequence[str] | str]
     manual_seed_files: Dict[str, str]
     asterisk_csv_file: str
@@ -117,8 +118,21 @@ class PipelineSettings:
         snapshot_excluded_tables = tuple(
             dict.fromkeys((*MANUAL_TABLES, *configured_exclusions))
         )
+        snapshot_replace_tables = cls._parse_identifier_list(
+            parser.get("tables", "snapshot_replace_tables", fallback="")
+        )
+        invalid_replace_tables = sorted(
+            set(snapshot_replace_tables) & set(snapshot_excluded_tables)
+        )
+        if invalid_replace_tables:
+            raise ValueError(
+                "Таблицы нельзя одновременно исключать и заменять через snapshot: "
+                f"{invalid_replace_tables}"
+            )
         for excluded_table in snapshot_excluded_tables:
             snapshot_tables.pop(excluded_table, None)
+        for replace_table in snapshot_replace_tables:
+            snapshot_tables.pop(replace_table, None)
         issues_table = parser.get("tables", "issues_table", fallback="issues").strip() or "issues"
         projects_table = parser.get("tables", "projects_table", fallback="projects").strip() or "projects"
         snapshot_tables.setdefault(issues_table, "id")
@@ -161,6 +175,7 @@ class PipelineSettings:
                 "tables", "fail_on_unkeyed_tables", fallback=True
             ),
             snapshot_excluded_tables=snapshot_excluded_tables,
+            snapshot_replace_tables=snapshot_replace_tables,
             snapshot_tables=snapshot_tables,
             manual_seed_files=manual_seed_files,
             asterisk_csv_file=parser.get(
@@ -824,6 +839,76 @@ DROP TABLE temp_upsert;
             except OSError:
                 pass
 
+    def replace_from_csv(self, table_name: str, csv_file: str, db_name: str) -> bool:
+        """Атомарно заменяет keyless-таблицу точным snapshot из CSV."""
+        if not os.path.exists(csv_file):
+            self.logger.warning(
+                f"CSV файл не найден для REPLACE: table={table_name}, csv={csv_file}"
+            )
+            return False
+
+        table_name = _validate_identifier(table_name, "table_name")
+        csv_columns = [
+            _validate_identifier(column, "column")
+            for column in _read_csv_header(csv_file)
+        ]
+        table_columns = self.get_table_columns(table_name, db_name)
+        if not csv_columns:
+            self.logger.error(
+                f"CSV не содержит заголовок для REPLACE: table={table_name}, csv={csv_file}"
+            )
+            return False
+        if set(csv_columns) != set(table_columns):
+            self.logger.error(
+                f"REPLACE остановлен из-за расхождения схемы: db={db_name}, "
+                f"table={table_name}, csv_columns={csv_columns}, "
+                f"table_columns={table_columns}"
+            )
+            return False
+
+        quoted_columns = ", ".join(
+            _quote_identifier(column) for column in csv_columns
+        )
+        data_csv_file = _strip_csv_header(csv_file, delimiter=",")
+        copy_command = (
+            f"\\copy temp_snapshot_replace ({quoted_columns}) FROM '{data_csv_file}' "
+            f"WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '\"', "
+            f"ESCAPE '\"', ENCODING 'UTF8');"
+        )
+        script = f"""
+CREATE TEMP TABLE temp_snapshot_replace AS
+SELECT {quoted_columns}
+FROM {_quote_identifier(table_name)}
+LIMIT 0;
+
+{copy_command}
+
+BEGIN;
+LOCK TABLE {_quote_identifier(table_name)} IN ACCESS EXCLUSIVE MODE;
+DELETE FROM {_quote_identifier(table_name)};
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM temp_snapshot_replace;
+COMMIT;
+
+DROP TABLE temp_snapshot_replace;
+"""
+        self.logger.info(
+            f"REPLACE snapshot подготовлен: db={db_name}, table={table_name}, "
+            f"csv={csv_file}, data_csv={data_csv_file}, columns={csv_columns}"
+        )
+        try:
+            return self._run_psql_script(
+                script,
+                db_name=db_name,
+                context_label=f"replace:{table_name}",
+            )
+        finally:
+            try:
+                os.remove(data_csv_file)
+            except OSError:
+                pass
+
     def create_required_tables(self, db_name: str) -> None:
         statements = [
             """
@@ -1249,6 +1334,7 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
     ) -> Dict[str, Sequence[str] | str]:
         """Объединяет автообнаруженные таблицы и явные overrides из config."""
         excluded = set(self.settings.snapshot_excluded_tables)
+        replace_tables = set(self.settings.snapshot_replace_tables)
         resolved: Dict[str, Sequence[str] | str] = {}
         unkeyed_tables: List[str] = []
 
@@ -1256,7 +1342,7 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
             candidate_tables = [
                 table_name
                 for table_name in self.list_snapshot_candidate_tables(db_name)
-                if table_name not in excluded
+                if table_name not in excluded and table_name not in replace_tables
             ]
             discovered_keys = self.discover_unique_table_keys(db_name)
             for table_name in candidate_tables:
@@ -1275,7 +1361,8 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
             message = (
                 "Snapshot auto-discovery: таблицы без PRIMARY KEY/UNIQUE index: "
                 f"{unkeyed_tables}. Добавьте безопасный уникальный ключ в БД либо "
-                "явно исключите таблицы через snapshot_excluded_tables."
+                "добавьте таблицы в snapshot_replace_tables для точного зеркалирования; "
+                "исключайте их через snapshot_excluded_tables только если данные не нужны."
             )
             if self.settings.fail_on_unkeyed_tables:
                 raise ValueError(message)
@@ -1285,7 +1372,7 @@ ON CONFLICT ({_quote_identifier("id")}) DO NOTHING;
         self.logger.info(
             f"Snapshot tables resolved: db={db_name}, auto={self.settings.auto_discover_tables}, "
             f"tables={len(ordered)}, excluded={sorted(excluded)}, "
-            f"unkeyed={len(unkeyed_tables)}"
+            f"replace={sorted(replace_tables)}, unkeyed={len(unkeyed_tables)}"
         )
         return ordered
 
@@ -1884,8 +1971,50 @@ def build_snapshot_exports(
         modifications.append(
             {
                 "change_type": "snapshot",
+                "load_mode": "upsert",
                 "table_name": table_name,
                 "primary_key": primary_key,
+                "csv_file": csv_file,
+                "row_count": row_count,
+            }
+        )
+
+    replace_tables = db_ops.order_snapshot_tables(
+        temp_db,
+        {
+            table_name: "__replace__"
+            for table_name in db_ops.settings.snapshot_replace_tables
+        },
+    )
+    for table_name in replace_tables:
+        if not db_ops.table_exists(table_name, temp_db):
+            db_ops.logger.warning(
+                f"REPLACE snapshot table отсутствует в staging: "
+                f"db={temp_db}, table={table_name}"
+            )
+            continue
+        csv_file = os.path.join(export_dir, f"{table_name}.csv")
+        row_count = db_ops.export_table_to_csv(
+            table_name,
+            csv_file,
+            temp_db,
+        )
+        if row_count == 0 and not os.path.exists(csv_file):
+            columns = db_ops.get_table_columns(table_name, temp_db)
+            if not columns:
+                raise ValueError(
+                    f"REPLACE snapshot table не содержит колонок: "
+                    f"db={temp_db}, table={table_name}"
+                )
+            with open(csv_file, "w", encoding="utf-8", newline="") as handle:
+                csv.writer(handle).writerow(columns)
+            os.chmod(csv_file, 0o644)
+        modifications.append(
+            {
+                "change_type": "snapshot_replace",
+                "load_mode": "replace",
+                "table_name": table_name,
+                "primary_key": None,
                 "csv_file": csv_file,
                 "row_count": row_count,
             }

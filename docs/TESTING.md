@@ -64,6 +64,7 @@ users_active_csv_file = /workspace/logs/users_active_backup.csv
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
+snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables =
 issues_table = issues
 projects_table = projects

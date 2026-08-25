@@ -96,6 +96,7 @@ backup_tar = nightly_dump.tar.gz
 auto_discover_tables = true
 fail_on_unkeyed_tables = true
 snapshot_excluded_tables =
+snapshot_replace_tables = changeset_parents, custom_fields_db_types, custom_fields_hrm_user_types, custom_workflows_projects, global_note_templates_projects
 incremental_tables =
 issues_table = issues
 projects_table = projects
@@ -115,6 +116,11 @@ target_day = 1
 
 При `auto_discover_tables=true` pipeline сам находит все обычные таблицы `public`
 и использует их PRIMARY KEY либо UNIQUE index.
+
+Таблицы без такого ключа, которые всё равно должны точно синхронизироваться,
+перечислите в `snapshot_replace_tables`. Они будут атомарно заменены полным
+срезом из staging. `snapshot_excluded_tables` используйте только для данных,
+которые действительно не нужны в main.
 
 `incremental_tables` нужен только для явного override ключа либо при отключенном
 автообнаружении. Пример:
