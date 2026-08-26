@@ -13,13 +13,14 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from pipeline_common import (  # noqa: E402
+    SNAPSHOT_FDW_SCHEMA,
     DatabaseOperations,
-    build_snapshot_exports,
+    build_snapshot_plan,
     copy_from_remote_or_local,
     finalize_remote_backup,
     should_download_remote_backup,
 )
-from tasks.load_task import LoadTask  # noqa: E402
+from tasks import LoadTask  # noqa: E402
 
 
 class FakeLogger:
@@ -70,12 +71,7 @@ class SnapshotDiscoveryTests(unittest.TestCase):
 
         def fake_run_rows(query, db_name=None):
             if "SELECT c.relname" in query:
-                return [
-                    ["asterisk_cdr"],
-                    ["issues"],
-                    ["projects"],
-                    ["users"],
-                ]
+                return [["asterisk_cdr"], ["issues"], ["projects"], ["users"]]
             if "FROM pg_class tbl" in query:
                 return [
                     ["asterisk_cdr", "asterisk_cdr_pkey", "t", "1", "id"],
@@ -89,7 +85,6 @@ class SnapshotDiscoveryTests(unittest.TestCase):
 
         db_ops.run_rows = fake_run_rows
         resolved = db_ops.resolve_snapshot_tables("staging", {})
-
         self.assertEqual(list(resolved), ["projects", "users", "issues"])
         self.assertNotIn("asterisk_cdr", resolved)
         self.assertEqual(resolved["issues"], "id")
@@ -105,702 +100,219 @@ class SnapshotDiscoveryTests(unittest.TestCase):
                     ["groups_users", "groups_users_unique", "f", "1", "group_id"],
                     ["groups_users", "groups_users_unique", "f", "2", "user_id"],
                 ]
-            if "FROM pg_constraint constraint_row" in query:
-                return []
             return []
 
         db_ops.run_rows = fake_run_rows
-        resolved = db_ops.resolve_snapshot_tables("staging", {})
-
-        self.assertEqual(resolved, {"groups_users": ["group_id", "user_id"]})
+        self.assertEqual(
+            db_ops.resolve_snapshot_tables("staging", {}),
+            {"groups_users": ["group_id", "user_id"]},
+        )
 
     def test_unkeyed_table_stops_pipeline(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-
-        def fake_run_rows(query, db_name=None):
-            if "SELECT c.relname" in query:
-                return [["unsafe_table"]]
-            return []
-
-        db_ops.run_rows = fake_run_rows
+        db_ops.run_rows = lambda query, db_name=None: (
+            [["unsafe_table"]] if "SELECT c.relname" in query else []
+        )
         with self.assertRaisesRegex(ValueError, "unsafe_table"):
             db_ops.resolve_snapshot_tables("staging", {})
 
-    def test_explicit_replace_table_does_not_stop_discovery(self):
-        settings = make_settings(snapshot_replace_tables=("keyless_links",))
-        db_ops = DatabaseOperations(settings, FakeLogger())
-
-        def fake_run_rows(query, db_name=None):
-            if "SELECT c.relname" in query:
-                return [["keyless_links"]]
-            return []
-
-        db_ops.run_rows = fake_run_rows
-        resolved = db_ops.resolve_snapshot_tables("staging", {})
-
-        self.assertEqual(resolved, {})
-
-    def test_replace_snapshot_is_atomic_and_does_not_use_on_conflict(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_columns = lambda table_name, db_name: ["left_id", "right_id"]
-        captured = {}
-
-        def fake_run_script(script, db_name=None, context_label=None):
-            captured["script"] = script
-            captured["context_label"] = context_label
-            return True
-
-        db_ops._run_psql_script = fake_run_script
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write("left_id,right_id\n1,2\n")
-            result = db_ops.replace_from_csv(
-                "keyless_links",
-                csv_path,
-                "main",
-            )
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
-        self.assertTrue(result)
-        self.assertEqual(captured["context_label"], "replace:keyless_links")
-        self.assertIn("BEGIN;", captured["script"])
-        self.assertIn('DELETE FROM "keyless_links";', captured["script"])
-        self.assertIn("COMMIT;", captured["script"])
-        self.assertNotIn("ON CONFLICT", captured["script"])
-
-    def test_empty_replace_snapshot_creates_header_only_csv(self):
-        settings = make_settings(snapshot_replace_tables=("keyless_links",))
-        db_ops = DatabaseOperations(settings, FakeLogger())
-        db_ops.resolve_snapshot_tables = lambda *_args, **_kwargs: {}
-        db_ops.order_snapshot_tables = lambda _db, tables: tables
-        db_ops.table_exists = lambda *_args, **_kwargs: True
-        db_ops.get_table_columns = lambda *_args, **_kwargs: ["left_id", "right_id"]
-
-        def export_empty(_table_name, csv_file, *_args, **_kwargs):
-            with open(csv_file, "w", encoding="utf-8") as handle:
-                handle.write("left_id,right_id\n")
-            return 0
-
-        db_ops.export_table_to_csv = export_empty
-
-        with tempfile.TemporaryDirectory() as export_dir:
-            modifications = build_snapshot_exports(
-                db_ops,
-                "staging",
-                {},
-                export_dir,
-            )
-            csv_file = modifications[0]["csv_file"]
-            with open(csv_file, "r", encoding="utf-8") as handle:
-                csv_content = handle.read()
-
-        self.assertEqual(len(modifications), 1)
-        self.assertEqual(modifications[0]["load_mode"], "replace")
-        self.assertEqual(modifications[0]["row_count"], 0)
-        self.assertEqual(csv_content, "left_id,right_id\n")
-
-    def test_empty_keyed_snapshot_is_not_skipped(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.resolve_snapshot_tables = lambda *_args, **_kwargs: {"issues": "id"}
-        db_ops.table_exists = lambda *_args, **_kwargs: True
-
-        def export_empty(_table_name, csv_file, *_args, **_kwargs):
-            with open(csv_file, "w", encoding="utf-8") as handle:
-                handle.write("id,subject\n")
-            return 0
-
-        db_ops.export_table_to_csv = export_empty
-        with tempfile.TemporaryDirectory() as export_dir:
-            modifications = build_snapshot_exports(
-                db_ops,
-                "staging",
-                {},
-                export_dir,
-            )
-            self.assertTrue(os.path.isfile(modifications[0]["csv_file"]))
-
-        self.assertEqual(len(modifications), 1)
-        self.assertEqual(modifications[0]["table_name"], "issues")
-        self.assertEqual(modifications[0]["row_count"], 0)
-
-    def test_atomic_batch_does_not_delete_keyed_rows_and_verifies_source(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_column_details = lambda table_name, _db_name: (
-            [("id", "integer"), ("subject", "character varying")]
-            if table_name == "issues"
-            else [("left_id", "integer"), ("right_id", "integer")]
+    def test_explicit_replace_table_is_not_treated_as_unkeyed(self):
+        db_ops = DatabaseOperations(
+            make_settings(snapshot_replace_tables=("keyless_links",)), FakeLogger()
         )
-        db_ops.get_column_default = lambda *_args, **_kwargs: ""
-        captured = {}
+        db_ops.run_rows = lambda query, db_name=None: (
+            [["keyless_links"]] if "SELECT c.relname" in query else []
+        )
+        self.assertEqual(db_ops.resolve_snapshot_tables("staging", {}), {})
 
-        def fake_run_script(
-            script, db_name=None, context_label=None, timeout_seconds=None
-        ):
-            captured["script"] = script
-            captured["db_name"] = db_name
-            captured["context_label"] = context_label
-            captured["timeout_seconds"] = timeout_seconds
+    def test_build_plan_contains_metadata_and_no_csv_path(self):
+        db_ops = DatabaseOperations(
+            make_settings(snapshot_replace_tables=("keyless_links",)), FakeLogger()
+        )
+        db_ops.resolve_snapshot_tables = lambda db_name, configured: {"issues": "id"}
+        db_ops.table_exists = lambda table_name, db_name: True
+        plan = build_snapshot_plan(db_ops, "staging", {})
+        self.assertEqual(plan[0]["table_name"], "issues")
+        self.assertEqual(plan[0]["load_mode"], "upsert")
+        self.assertEqual(plan[1]["table_name"], "keyless_links")
+        self.assertEqual(plan[1]["load_mode"], "replace")
+        self.assertTrue(all("csv_file" not in item for item in plan))
+
+
+class SnapshotFdwTests(unittest.TestCase):
+    def test_setup_imports_only_selected_tables(self):
+        db_ops = DatabaseOperations(make_settings(db_host="/run/postgresql"), FakeLogger())
+        scripts = []
+        db_ops.run_scalar = lambda query, db_name=None: "postgres"
+
+        def fake_script(script, **kwargs):
+            scripts.append((script, kwargs))
             return True
 
-        db_ops._run_psql_script = fake_run_script
-        csv_paths = []
-        try:
-            for content in (
-                "id,subject\n1,Fresh\n",
-                "left_id,right_id\n10,20\n",
-            ):
-                with tempfile.NamedTemporaryFile(
-                    "w", suffix=".csv", delete=False
-                ) as handle:
-                    handle.write(content)
-                    csv_paths.append(handle.name)
-            result = db_ops.apply_snapshot_batch(
-                [
-                    {
-                        "table_name": "issues",
-                        "load_mode": "upsert",
-                        "primary_key": "id",
-                        "csv_file": csv_paths[0],
-                        "row_count": 1,
-                    },
-                    {
-                        "table_name": "keyless_links",
-                        "load_mode": "replace",
-                        "primary_key": None,
-                        "csv_file": csv_paths[1],
-                        "row_count": 1,
-                    },
-                ],
-                "main",
-            )
-        finally:
-            for csv_path in csv_paths:
-                if os.path.exists(csv_path):
-                    os.remove(csv_path)
+        db_ops._run_psql_script = fake_script
+        self.assertTrue(db_ops.setup_snapshot_fdw("staging", "main", ["issues", "projects"]))
+        sql = scripts[0][0]
+        self.assertIn("CREATE EXTENSION IF NOT EXISTS postgres_fdw", sql)
+        self.assertIn("host '/run/postgresql'", sql)
+        self.assertIn("dbname 'staging'", sql)
+        self.assertIn('LIMIT TO ("issues", "projects")', sql)
+        self.assertIn(f'INTO "{SNAPSHOT_FDW_SCHEMA}"', sql)
 
-        script = captured["script"]
-        self.assertTrue(result)
-        self.assertEqual(captured["context_label"], "snapshot_atomic_batch")
-        self.assertEqual(captured["timeout_seconds"], 14400)
-        self.assertEqual(script.count("BEGIN;"), 1)
-        self.assertEqual(script.count("COMMIT;"), 1)
-        self.assertIn("SET LOCAL lock_timeout = '300s';", script)
-        self.assertNotIn("pg_advisory_xact_lock", script)
-        self.assertNotIn("LOCK TABLE", script)
-        self.assertNotIn('DELETE FROM "issues"', script)
-        self.assertIn('DELETE FROM "keyless_links";', script)
-        self.assertIn('INSERT INTO "issues"', script)
-        self.assertIn("source_minus_target <> 0", script)
-        self.assertNotIn("EXCEPT ALL", script)
-
-    def test_query_failure_is_not_returned_as_empty_rows(self):
+    def test_upsert_reads_foreign_table_and_updates_only_changed_rows(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        failed = SimpleNamespace(returncode=1, stdout="", stderr="connection failed")
-        with patch("pipeline_common.subprocess.run", return_value=failed):
-            with self.assertRaises(RuntimeError):
-                db_ops.run_rows("SELECT 1", db_name="main")
+        sql = db_ops._snapshot_upsert_sql(
+            "issues",
+            ["id", "subject", "metadata"],
+            {"id": "integer", "subject": "text", "metadata": "json"},
+            ["id"],
+        )
+        self.assertIn(f'FROM "{SNAPSHOT_FDW_SCHEMA}"."issues"', sql)
+        self.assertIn('ON CONFLICT ("id")', sql)
+        self.assertIn('"issues"."subject" IS DISTINCT FROM EXCLUDED."subject"', sql)
+        self.assertIn('("issues"."metadata")::jsonb IS DISTINCT FROM', sql)
+        self.assertNotIn("COPY", sql.upper())
 
-    def test_psql_script_sets_diagnostic_application_name(self):
+    def test_apply_runs_keyed_then_replace_group_and_cleans(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        completed = SimpleNamespace(returncode=0, stdout="", stderr="")
-        with patch("pipeline_common.subprocess.run", return_value=completed) as run:
-            result = db_ops._run_psql_script(
-                "SELECT 1;",
-                db_name="main",
-                context_label="snapshot_table:issues",
-            )
+        calls = []
+        db_ops.setup_snapshot_fdw = lambda source, target, tables: True
+        db_ops.cleanup_snapshot_fdw = lambda target: calls.append(("cleanup", target)) or True
+        db_ops.log_suspicious_transactions = lambda target: None
+        db_ops._schema_column_details = lambda schema, tables, db: {
+            "projects": [("id", "integer"), ("name", "text")],
+            "issues": [("id", "integer"), ("subject", "text")],
+            "links": [("from_id", "integer"), ("to_id", "integer")],
+        }
 
-        self.assertTrue(result)
+        def fake_script(script, db_name=None, context_label="", **kwargs):
+            calls.append((context_label, db_name, script))
+            return True
+
+        db_ops._run_psql_script = fake_script
+        success, count, errors = db_ops.apply_snapshot_via_fdw(
+            [
+                {"table_name": "projects", "primary_key": "id", "load_mode": "upsert"},
+                {"table_name": "issues", "primary_key": "id", "load_mode": "upsert"},
+                {"table_name": "links", "primary_key": None, "load_mode": "replace"},
+            ],
+            "staging",
+            "main",
+        )
+        self.assertTrue(success)
+        self.assertEqual(count, 3)
+        self.assertEqual(errors, [])
+        labels = [call[0] for call in calls]
         self.assertEqual(
-            run.call_args.kwargs["env"]["PGAPPNAME"],
-            "etl_pipeline:snapshot_table:issues",
+            labels[:3],
+            ["fdw_table:projects", "fdw_table:issues", "fdw_replace_group"],
         )
+        self.assertEqual(calls[-1], ("cleanup", "main"))
 
-    def test_load_task_routes_snapshot_to_per_table_loader(self):
-        logger = FakeLogger()
+    def test_schema_drift_stops_before_writes_and_cleans(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        cleanup = []
+        db_ops.setup_snapshot_fdw = lambda source, target, tables: True
+        db_ops.cleanup_snapshot_fdw = lambda target: cleanup.append(target) or True
+        db_ops._schema_column_details = lambda schema, tables, db: (
+            {"issues": [("id", "integer"), ("new_column", "text")]}
+            if schema == SNAPSHOT_FDW_SCHEMA
+            else {"issues": [("id", "integer")]}
+        )
+        db_ops._run_psql_script = lambda *args, **kwargs: self.fail("write must not run")
+        success, count, errors = db_ops.apply_snapshot_via_fdw(
+            [{"table_name": "issues", "primary_key": "id", "load_mode": "upsert"}],
+            "staging",
+            "main",
+        )
+        self.assertFalse(success)
+        self.assertEqual(count, 0)
+        self.assertIn("new_column", errors[0])
+        self.assertEqual(cleanup, ["main"])
+
+    def test_load_task_passes_source_and_target(self):
         calls = []
 
-        class FakeDatabaseOperations:
-            def apply_snapshot_in_transactions(self, modifications, db_name):
-                calls.append((modifications, db_name))
+        class FakeDbOps:
+            def apply_snapshot_via_fdw(self, modifications, source_db, target_db):
+                calls.append((modifications, source_db, target_db))
                 return True, len(modifications), []
 
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write("left_id,right_id\n1,2\n")
-            task = LoadTask(make_settings(), logger, FakeDatabaseOperations())
-            result = task.execute(
-                {
-                    "main_db": "main",
-                    "modifications": [
-                        {
-                            "change_type": "snapshot_replace",
-                            "load_mode": "replace",
-                            "table_name": "keyless_links",
-                            "primary_key": None,
-                            "csv_file": csv_path,
-                            "row_count": 1,
-                        }
-                    ],
-                }
-            )
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
+        task = LoadTask(make_settings(), FakeLogger(), FakeDbOps())
+        modifications = [{"table_name": "issues", "primary_key": "id"}]
+        result = task.execute(
+            {"temp_db": "staging", "main_db": "main", "modifications": modifications}
+        )
         self.assertTrue(result.success)
-        self.assertEqual(calls[0][1], "main")
-        self.assertEqual(calls[0][0][0]["table_name"], "keyless_links")
-
-    def test_snapshot_transactions_preflight_then_keyed_tables_then_replace_group(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        calls = []
-
-        def fake_apply(modifications, db_name, validate_only=False):
-            calls.append(
-                (
-                    [str(item["table_name"]) for item in modifications],
-                    db_name,
-                    validate_only,
-                )
-            )
-            return True
-
-        db_ops.apply_snapshot_batch = fake_apply
-        db_ops.log_suspicious_transactions = lambda _db_name: None
-        modifications = [
-            {"table_name": "projects", "load_mode": "upsert", "row_count": 2},
-            {"table_name": "issues", "load_mode": "upsert", "row_count": 3},
-            {"table_name": "members", "load_mode": "replace", "row_count": 4},
-            {"table_name": "member_roles", "load_mode": "replace", "row_count": 5},
-        ]
-
-        result = db_ops.apply_snapshot_in_transactions(modifications, "main")
-
-        self.assertEqual(result, (True, 4, []))
-        self.assertEqual(
-            calls,
-            [
-                (["projects", "issues", "members", "member_roles"], "main", True),
-                (["projects"], "main", False),
-                (["issues"], "main", False),
-                (["members", "member_roles"], "main", False),
-            ],
-        )
-
-    def test_replace_batch_deletes_children_first_and_inserts_parents_first(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_columns = lambda table_name, db_name: (
-            ["id", "user_id", "project_id"]
-            if table_name == "members"
-            else ["id", "member_id", "role_id"]
-        )
-        captured = {}
-
-        def fake_run_script(script, db_name=None, context_label=None):
-            captured["script"] = script
-            captured["context_label"] = context_label
-            return True
-
-        db_ops._run_psql_script = fake_run_script
-        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: True
-        csv_paths = []
-        try:
-            for header, row in (
-                ("id,user_id,project_id", "10,1,2"),
-                ("id,member_id,role_id", "20,10,3"),
-            ):
-                with tempfile.NamedTemporaryFile(
-                    "w", suffix=".csv", delete=False
-                ) as handle:
-                    csv_paths.append(handle.name)
-                    handle.write(f"{header}\n{row}\n")
-            result = db_ops.replace_tables_from_csv(
-                [
-                    ("members", csv_paths[0]),
-                    ("member_roles", csv_paths[1]),
-                ],
-                "main",
-            )
-        finally:
-            for csv_path in csv_paths:
-                if os.path.exists(csv_path):
-                    os.remove(csv_path)
-
-        script = captured["script"]
-        self.assertTrue(result)
-        self.assertEqual(captured["context_label"], "replace_batch")
-        self.assertEqual(script.count("BEGIN;"), 1)
-        self.assertEqual(script.count("COMMIT;"), 1)
-        self.assertLess(
-            script.index('DELETE FROM "member_roles";'),
-            script.index('DELETE FROM "members";'),
-        )
-        self.assertLess(
-            script.index('INSERT INTO "members"'),
-            script.index('INSERT INTO "member_roles"'),
-        )
-
-    def test_single_key_only_table_uses_do_nothing(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_column_details = lambda table_name, db_name: [
-            ("version", "character varying")
-        ]
-        captured = {}
-
-        def fake_run_script(script, db_name=None, context_label=None):
-            captured["script"] = script
-            return True
-
-        db_ops._run_psql_script = fake_run_script
-        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: False
-
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write("version\n202608240001\n")
-            result = db_ops.upsert_from_csv(
-                "schema_migrations",
-                "version",
-                csv_path,
-                "main",
-            )
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
-        self.assertTrue(result)
-        self.assertIn("ON CONFLICT (\"version\")\nDO NOTHING;", captured["script"])
-
-    def test_schema_drift_is_not_silently_ignored(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_column_details = lambda table_name, db_name: [
-            ("id", "integer")
-        ]
-
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write("id,new_column\n1,value\n")
-            result = db_ops.upsert_from_csv("issues", "id", csv_path, "main")
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
-        self.assertFalse(result)
-
-    def test_upsert_updates_only_changed_rows(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_column_details = lambda table_name, db_name: [
-            ("id", "integer"),
-            ("subject", "character varying"),
-        ]
-        captured = {}
-
-        def fake_run_script(script, db_name=None, context_label=None):
-            captured["script"] = script
-            return True
-
-        db_ops._run_psql_script = fake_run_script
-        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: False
-
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write("id,subject\n1,Updated\n")
-            result = db_ops.upsert_from_csv("issues", "id", csv_path, "main")
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
-        self.assertTrue(result)
-        self.assertIn(
-            'WHERE "issues"."subject" IS DISTINCT FROM EXCLUDED."subject"',
-            captured["script"],
-        )
-
-    def test_upsert_compares_json_columns_as_jsonb(self):
-        db_ops = DatabaseOperations(make_settings(), FakeLogger())
-        db_ops.get_table_column_details = lambda table_name, db_name: [
-            ("id", "integer"),
-            ("urls", "json"),
-            ("description", "text"),
-        ]
-        captured = {}
-
-        def fake_run_script(script, db_name=None, context_label=None):
-            captured["script"] = script
-            return True
-
-        db_ops._run_psql_script = fake_run_script
-        db_ops.sync_sequence_with_max_id = lambda *args, **kwargs: False
-
-        csv_path = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False) as handle:
-                csv_path = handle.name
-                handle.write('id,urls,description\n1,"{""a"":1}",Updated\n')
-            result = db_ops.upsert_from_csv("cves", "id", csv_path, "main")
-        finally:
-            if csv_path and os.path.exists(csv_path):
-                os.remove(csv_path)
-
-        self.assertTrue(result)
-        self.assertIn(
-            '("cves"."urls")::jsonb IS DISTINCT FROM '
-            '(EXCLUDED."urls")::jsonb',
-            captured["script"],
-        )
+        self.assertEqual(calls, [(modifications, "staging", "main")])
 
 
-class BackupRotationTests(unittest.TestCase):
-    def test_remote_mode_does_not_require_dump_argument(self):
-        settings = make_settings(
+class BackupTests(unittest.TestCase):
+    def test_remote_download_is_always_required_when_configured(self):
+        settings = SimpleNamespace(
             remote_user="backup",
-            remote_host="example.internal",
-            remote_path="/exports/",
-            backup_tar="nightly.tar.gz",
+            remote_host="srv",
+            remote_path="/backup/",
+            backup_tar="current.tgz",
         )
-
         self.assertTrue(should_download_remote_backup(settings, None))
+        self.assertTrue(should_download_remote_backup(settings, "/tmp/old.tgz"))
 
-    def test_remote_mode_ignores_existing_local_dump_without_explicit_flag(self):
+    def test_local_copy_uses_incoming_file_before_publication(self):
         logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            local_dump = os.path.join(root_dir, "old.tar.gz")
-            with open(local_dump, "w", encoding="utf-8") as handle:
-                handle.write("old")
-            settings = make_settings(
-                remote_user="backup",
-                remote_host="example.internal",
-                remote_path="/exports/",
-                backup_tar="nightly.tar.gz",
-                backup_storage_dir=os.path.join(root_dir, "current"),
-                temp_dir=os.path.join(root_dir, "temp"),
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "remote.tgz"
+            source.write_bytes(b"new dump")
+            settings = SimpleNamespace(
+                remote_user="",
+                remote_host="",
+                remote_path="",
+                backup_tar="",
             )
+            selected = copy_from_remote_or_local(settings, logger, str(source))
+            self.assertEqual(selected, str(source))
 
-            def fake_scp(command, **_kwargs):
-                with open(command[-1], "w", encoding="utf-8") as handle:
-                    handle.write("fresh")
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-            with patch("pipeline_common.subprocess.run", side_effect=fake_scp):
-                result = copy_from_remote_or_local(settings, logger, local_dump)
-
-            self.assertNotEqual(result, local_dump)
-            with open(result, "r", encoding="utf-8") as handle:
-                self.assertEqual(handle.read(), "fresh")
-            self.assertTrue(should_download_remote_backup(settings, local_dump))
-
-    def test_remote_failure_does_not_fallback_to_existing_local_dump(self):
+    def test_successful_rotation_keeps_current_and_two_old(self):
         logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            local_dump = os.path.join(root_dir, "old.tar.gz")
-            with open(local_dump, "w", encoding="utf-8") as handle:
-                handle.write("old")
-            settings = make_settings(
-                remote_user="backup",
-                remote_host="example.internal",
-                remote_path="/exports/",
-                backup_tar="nightly.tar.gz",
-                backup_storage_dir=os.path.join(root_dir, "current"),
-                temp_dir=os.path.join(root_dir, "temp"),
-            )
-            failed = SimpleNamespace(returncode=1, stdout="", stderr="network error")
-            with patch("pipeline_common.subprocess.run", return_value=failed):
-                result = copy_from_remote_or_local(settings, logger, local_dump)
-
-            self.assertIsNone(result)
-
-    def test_local_dump_requires_explicit_flag_when_remote_is_configured(self):
-        logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            local_dump = os.path.join(root_dir, "manual.sql")
-            with open(local_dump, "w", encoding="utf-8") as handle:
-                handle.write("SELECT 1;")
-            settings = make_settings(
-                remote_user="backup",
-                remote_host="example.internal",
-                remote_path="/exports/",
-                backup_tar="nightly.tar.gz",
-            )
-            with patch("pipeline_common.subprocess.run") as subprocess_run:
-                result = copy_from_remote_or_local(
-                    settings,
-                    logger,
-                    local_dump,
-                    force_local=True,
-                )
-
-            self.assertEqual(result, local_dump)
-            subprocess_run.assert_not_called()
-            self.assertFalse(
-                should_download_remote_backup(settings, local_dump, force_local=True)
-            )
-
-    def test_remote_archive_is_downloaded_to_temp_before_etl(self):
-        logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            backup_dir = os.path.join(root_dir, "current")
-            temp_dir = os.path.join(root_dir, "temp")
-            os.makedirs(backup_dir)
-            current_file = os.path.join(backup_dir, "nightly.tar.gz")
-            with open(current_file, "w", encoding="utf-8") as handle:
-                handle.write("previous")
-
-            settings = make_settings(
-                remote_user="backup",
-                remote_host="example.internal",
-                remote_path="/exports/",
-                backup_tar="nightly.tar.gz",
-                backup_storage_dir=backup_dir,
-                temp_dir=temp_dir,
-            )
-
-            def fake_scp(command, **_kwargs):
-                destination = command[-1]
-                with open(destination, "w", encoding="utf-8") as handle:
-                    handle.write("incoming")
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-            with patch("pipeline_common.subprocess.run", side_effect=fake_scp):
-                incoming_file = copy_from_remote_or_local(settings, logger, None)
-
-            self.assertIsNotNone(incoming_file)
-            self.assertTrue(incoming_file.startswith(os.path.join(temp_dir, "incoming_")))
-            with open(current_file, "r", encoding="utf-8") as handle:
-                self.assertEqual(handle.read(), "previous")
-
-    def test_invalid_incoming_archive_does_not_change_existing_backups(self):
-        logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            backup_dir = os.path.join(root_dir, "current")
-            old_backup_dir = os.path.join(root_dir, "old_backup")
-            os.makedirs(backup_dir)
-            os.makedirs(old_backup_dir)
-            current_file = os.path.join(backup_dir, "nightly.tar.gz")
-            with open(current_file, "w", encoding="utf-8") as handle:
-                handle.write("previous")
-
-            settings = make_settings(
-                backup_storage_dir=backup_dir,
-                old_backup_dir=old_backup_dir,
-                backup_tar="nightly.tar.gz",
+        with tempfile.TemporaryDirectory() as directory:
+            backup_dir = Path(directory) / "backup"
+            old_dir = Path(directory) / "old_backup"
+            backup_dir.mkdir()
+            old_dir.mkdir()
+            current = backup_dir / "current.tgz"
+            current.write_bytes(b"previous")
+            incoming = backup_dir / "incoming_new.tgz"
+            incoming.write_bytes(b"new")
+            for index in range(3):
+                archive_dir = old_dir / f"old_2026082{index}"
+                archive_dir.mkdir()
+                (archive_dir / "current.tgz").write_bytes(str(index).encode())
+                os.utime(archive_dir, (index + 1, index + 1))
+            settings = SimpleNamespace(
+                backup_storage_dir=str(backup_dir),
+                old_backup_dir=str(old_dir),
+                backup_tar="current.tgz",
                 max_backups=3,
             )
-            missing_file = os.path.join(root_dir, "incoming_missing.tar.gz")
+            self.assertTrue(finalize_remote_backup(settings, logger, str(incoming)))
+            self.assertEqual(current.read_bytes(), b"new")
+            self.assertEqual(len(list(old_dir.iterdir())), 2)
 
-            self.assertFalse(finalize_remote_backup(settings, logger, missing_file))
-            with open(current_file, "r", encoding="utf-8") as handle:
-                self.assertEqual(handle.read(), "previous")
-            self.assertEqual(os.listdir(old_backup_dir), [])
-
-    def test_successful_finalize_keeps_current_and_two_old_backups(self):
+    def test_failed_publication_does_not_replace_current(self):
         logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            backup_dir = os.path.join(root_dir, "current")
-            old_backup_dir = os.path.join(root_dir, "old_backup")
-            temp_dir = os.path.join(root_dir, "temp")
-            os.makedirs(backup_dir)
-            os.makedirs(old_backup_dir)
-            os.makedirs(temp_dir)
-
-            current_file = os.path.join(backup_dir, "nightly.tar.gz")
-            with open(current_file, "w", encoding="utf-8") as handle:
-                handle.write("yesterday")
-
-            for index, timestamp in ((1, 1000), (2, 2000)):
-                old_dir = os.path.join(old_backup_dir, f"old_2026082{index}_020000")
-                os.makedirs(old_dir)
-                with open(
-                    os.path.join(old_dir, "nightly.tar.gz"),
-                    "w",
-                    encoding="utf-8",
-                ) as handle:
-                    handle.write(f"old-{index}")
-                os.utime(old_dir, (timestamp, timestamp))
-
-            incoming_file = os.path.join(temp_dir, "incoming_nightly.tar.gz")
-            with open(incoming_file, "w", encoding="utf-8") as handle:
-                handle.write("today")
-
-            settings = make_settings(
-                backup_storage_dir=backup_dir,
-                old_backup_dir=old_backup_dir,
-                backup_tar="nightly.tar.gz",
+        with tempfile.TemporaryDirectory() as directory:
+            current = Path(directory) / "current.tgz"
+            current.write_bytes(b"previous")
+            incoming = Path(directory) / "incoming_new.tgz"
+            incoming.write_bytes(b"new")
+            settings = SimpleNamespace(
+                backup_storage_dir=directory,
+                old_backup_dir=str(Path(directory) / "old"),
+                backup_tar="current.tgz",
                 max_backups=3,
             )
-            self.assertTrue(finalize_remote_backup(settings, logger, incoming_file))
-
-            with open(current_file, "r", encoding="utf-8") as handle:
-                self.assertEqual(handle.read(), "today")
-            old_dirs = sorted(
-                item
-                for item in os.listdir(old_backup_dir)
-                if item.startswith("old_")
-            )
-            self.assertEqual(len(old_dirs), 2)
-            old_contents = []
-            for old_dir in old_dirs:
-                archived_file = os.path.join(
-                    old_backup_dir,
-                    old_dir,
-                    "nightly.tar.gz",
-                )
-                with open(archived_file, "r", encoding="utf-8") as handle:
-                    old_contents.append(handle.read())
-            self.assertCountEqual(old_contents, ["old-2", "yesterday"])
-            self.assertFalse(os.path.exists(incoming_file))
-
-    def test_legacy_old_directories_are_moved_to_new_location(self):
-        logger = FakeLogger()
-        with tempfile.TemporaryDirectory() as root_dir:
-            backup_dir = os.path.join(root_dir, "current")
-            old_backup_dir = os.path.join(root_dir, "old_backup")
-            temp_dir = os.path.join(root_dir, "temp")
-            os.makedirs(backup_dir)
-            os.makedirs(temp_dir)
-
-            legacy_dir = os.path.join(backup_dir, "old_20260820_020000")
-            os.makedirs(legacy_dir)
-            with open(
-                os.path.join(legacy_dir, "nightly.tar.gz"),
-                "w",
-                encoding="utf-8",
-            ) as handle:
-                handle.write("legacy")
-
-            incoming_file = os.path.join(temp_dir, "incoming_nightly.tar.gz")
-            with open(incoming_file, "w", encoding="utf-8") as handle:
-                handle.write("today")
-
-            settings = make_settings(
-                backup_storage_dir=backup_dir,
-                old_backup_dir=old_backup_dir,
-                backup_tar="nightly.tar.gz",
-                max_backups=3,
-            )
-            self.assertTrue(finalize_remote_backup(settings, logger, incoming_file))
-
-            self.assertFalse(os.path.exists(legacy_dir))
-            self.assertTrue(
-                os.path.exists(
-                    os.path.join(
-                        old_backup_dir,
-                        "old_20260820_020000",
-                        "nightly.tar.gz",
-                    )
-                )
-            )
+            with patch("pipeline_common.shutil.move", side_effect=OSError("boom")):
+                self.assertFalse(finalize_remote_backup(settings, logger, str(incoming)))
+            self.assertEqual(current.read_bytes(), b"previous")
 
 
 if __name__ == "__main__":

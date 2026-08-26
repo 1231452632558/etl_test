@@ -19,7 +19,7 @@ from pipeline_common import (  # noqa: E402
     DatabaseOperations,
     ETLLogger,
     PipelineSettings,
-    build_snapshot_exports,
+    build_snapshot_plan,
     cleanup_temp_artifacts,
     copy_from_remote_or_local,
     extract_dump,
@@ -98,13 +98,12 @@ class ETLPipeline:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         return f"{self.settings.temp_db_prefix}{timestamp}"
 
-    def _cleanup(self, temp_db: str | None, extract_dir: str | None, export_dir: str | None, cleanup_temp_db: bool) -> None:
+    def _cleanup(self, temp_db: str | None, extract_dir: str | None, cleanup_temp_db: bool) -> None:
         if cleanup_temp_db and temp_db:
             self.logger.info(f"Очистка временной базы {temp_db}...")
             self.db_ops.drop_database(temp_db)
-        for path in (extract_dir, export_dir):
-            if path:
-                shutil.rmtree(path, ignore_errors=True)
+        if extract_dir:
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
     def _seed_asterisk(self, db_name: str) -> bool:
         if not self.db_ops.create_required_tables(db_name):
@@ -166,6 +165,7 @@ class ETLPipeline:
     def _apply_snapshot_modifications(
         self,
         modifications: list[dict],
+        source_db: str,
         main_db: str,
     ) -> bool:
         for mod in modifications:
@@ -173,10 +173,11 @@ class ETLPipeline:
             table_name = str(mod["table_name"])
             self.logger.info(
                 f"{load_mode.upper()} snapshot {table_name} "
-                f"({mod['row_count']} rows) -> {main_db}"
+                f"from={source_db} -> {main_db}"
             )
-        success, applied_count, errors = self.db_ops.apply_snapshot_in_transactions(
+        success, applied_count, errors = self.db_ops.apply_snapshot_via_fdw(
             modifications,
+            source_db,
             main_db,
         )
         if not success:
@@ -268,7 +269,6 @@ class ETLPipeline:
 
         main_db = self.settings.db_name
         temp_db = self._build_temp_db_name()
-        export_dir = os.path.join(self.settings.temp_dir, f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         completed_successfully = False
 
         try:
@@ -284,14 +284,13 @@ class ETLPipeline:
             if not self.db_ops.create_required_tables(temp_db):
                 return False
 
-            modifications = build_snapshot_exports(
+            modifications = build_snapshot_plan(
                 self.db_ops,
                 temp_db,
                 self.settings.snapshot_tables,
-                export_dir,
             )
 
-            if not self._apply_snapshot_modifications(modifications, main_db):
+            if not self._apply_snapshot_modifications(modifications, temp_db, main_db):
                 return False
 
             if not self.db_ops.create_required_tables(main_db):
@@ -316,13 +315,13 @@ class ETLPipeline:
             return True
         finally:
             if completed_successfully:
-                self._cleanup(temp_db, extract_dir, export_dir, cleanup)
+                self._cleanup(temp_db, extract_dir, cleanup)
                 cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
             else:
                 self.logger.warning(
                     "Nightly завершился с ошибкой; staging и временные "
                     f"артефакты сохранены: staging={temp_db}, "
-                    f"extract_dir={extract_dir}, export_dir={export_dir}"
+                    f"extract_dir={extract_dir}"
                 )
 
     def run(
@@ -382,7 +381,6 @@ class ETLPipeline:
         cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
         actual_file = None
         extract_dir = None
-        export_dir = None
         modifications: list[dict] = []
         sql_files: list[str] = []
         temp_db = temp_db_name
@@ -439,34 +437,26 @@ class ETLPipeline:
                     if not self._seed_asterisk(main_db):
                         return False
                 elif stage == "compare":
-                    export_dir = os.path.join(
-                        self.settings.temp_dir,
-                        f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                    )
-                    modifications = build_snapshot_exports(
+                    modifications = build_snapshot_plan(
                         self.db_ops,
                         temp_db,
                         self.settings.snapshot_tables,
-                        export_dir,
                     )
                     for mod in modifications:
                         self.logger.info(
-                            f"Подготовлен snapshot {mod['table_name']}: {mod['csv_file']} ({mod['row_count']} rows)"
+                            f"Подготовлен FDW snapshot: table={mod['table_name']}, "
+                            f"mode={mod['load_mode']}, key={mod['primary_key']}"
                         )
                 elif stage == "load":
-                    if not export_dir:
-                        export_dir = os.path.join(
-                            self.settings.temp_dir,
-                            f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-                        )
-                        modifications = build_snapshot_exports(
+                    if not modifications:
+                        modifications = build_snapshot_plan(
                             self.db_ops,
                             temp_db,
                             self.settings.snapshot_tables,
-                            export_dir,
                         )
                     if not self._apply_snapshot_modifications(
                         modifications,
+                        temp_db,
                         main_db,
                     ):
                         return False
@@ -477,9 +467,8 @@ class ETLPipeline:
                     if not self._run_weekly(main_db, force_weekly=force_weekly):
                         return False
                 elif stage == "cleanup":
-                    self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, export_dir, cleanup)
+                    self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, cleanup)
                     extract_dir = None
-                    export_dir = None
                     temp_db = None if effective_scope == "temp" else temp_db
 
             if self.db_ops.database_exists(main_db):
@@ -504,13 +493,13 @@ class ETLPipeline:
             return True
         finally:
             if completed_successfully and "cleanup" not in stages:
-                self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, export_dir, cleanup)
+                self._cleanup(temp_db if effective_scope == "temp" else None, extract_dir, cleanup)
                 cleanup_temp_artifacts(self.settings.temp_dir, self.logger)
             elif not completed_successfully:
                 self.logger.warning(
                     "Выборочный pipeline завершился с ошибкой; staging и "
                     f"артефакты сохранены: staging={temp_db}, "
-                    f"extract_dir={extract_dir}, export_dir={export_dir}"
+                    f"extract_dir={extract_dir}"
                 )
 
 

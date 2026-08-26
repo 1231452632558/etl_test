@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 MANUAL_TABLES = ("asterisk_cdr", "group_employee_count", "users_active")
+SNAPSHOT_FDW_SERVER = "_etl_snapshot_server"
+SNAPSHOT_FDW_SCHEMA = "_etl_snapshot_source"
 
 
 def _validate_identifier(identifier: str, kind: str = "identifier") -> str:
@@ -33,6 +35,10 @@ def _validate_identifier(identifier: str, kind: str = "identifier") -> str:
 def _quote_identifier(identifier: str) -> str:
     _validate_identifier(identifier)
     return f'"{identifier}"'
+
+
+def _quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _read_csv_header(csv_file: str, delimiter: str = ",") -> List[str]:
@@ -487,6 +493,373 @@ class DatabaseOperations:
                 f"age_seconds={row[5]}, blocked_by={row[6]}, query={row[7]}"
             )
 
+    def _schema_column_details(
+        self,
+        schema_name: str,
+        table_names: Sequence[str],
+        db_name: str,
+    ) -> Dict[str, List[Tuple[str, str]]]:
+        schema_name = _validate_identifier(schema_name, "schema_name")
+        normalized_tables = [
+            _validate_identifier(table_name, "table_name")
+            for table_name in table_names
+        ]
+        if not normalized_tables:
+            return {}
+        table_literals = ", ".join(
+            _quote_literal(table_name) for table_name in normalized_tables
+        )
+        rows = self.run_rows(
+            f"""
+            SELECT table_name, column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = {_quote_literal(schema_name)}
+              AND table_name IN ({table_literals})
+            ORDER BY table_name, ordinal_position;
+            """,
+            db_name=db_name,
+        )
+        details: Dict[str, List[Tuple[str, str]]] = {
+            table_name: [] for table_name in normalized_tables
+        }
+        for row in rows:
+            if len(row) >= 3 and row[0] in details:
+                details[row[0]].append((row[1], row[2]))
+        return details
+
+    def setup_snapshot_fdw(
+        self,
+        source_db: str,
+        target_db: str,
+        table_names: Sequence[str],
+    ) -> bool:
+        """Создает временный postgres_fdw-контур staging -> main."""
+        normalized_tables = [
+            _validate_identifier(table_name, "table_name")
+            for table_name in table_names
+        ]
+        if not normalized_tables:
+            self.logger.error("FDW setup остановлен: список таблиц пуст")
+            return False
+        current_user = self.run_scalar("SELECT CURRENT_USER;", db_name=target_db)
+        if not current_user:
+            self.logger.error(f"FDW setup: не определен CURRENT_USER в db={target_db}")
+            return False
+
+        quoted_tables = ", ".join(
+            _quote_identifier(table_name) for table_name in normalized_tables
+        )
+        script = f"""
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+DROP SERVER IF EXISTS {_quote_identifier(SNAPSHOT_FDW_SERVER)} CASCADE;
+DROP SCHEMA IF EXISTS {_quote_identifier(SNAPSHOT_FDW_SCHEMA)} CASCADE;
+CREATE SERVER {_quote_identifier(SNAPSHOT_FDW_SERVER)}
+FOREIGN DATA WRAPPER postgres_fdw
+OPTIONS (
+    host {_quote_literal(self.settings.db_host)},
+    port {_quote_literal(self.settings.db_port)},
+    dbname {_quote_literal(source_db)},
+    fetch_size '10000'
+);
+CREATE USER MAPPING FOR CURRENT_USER
+SERVER {_quote_identifier(SNAPSHOT_FDW_SERVER)}
+OPTIONS (user {_quote_literal(current_user)});
+CREATE SCHEMA {_quote_identifier(SNAPSHOT_FDW_SCHEMA)};
+IMPORT FOREIGN SCHEMA public
+LIMIT TO ({quoted_tables})
+FROM SERVER {_quote_identifier(SNAPSHOT_FDW_SERVER)}
+INTO {_quote_identifier(SNAPSHOT_FDW_SCHEMA)};
+"""
+        self.logger.info(
+            f"FDW setup: source_db={source_db}, target_db={target_db}, "
+            f"tables={len(normalized_tables)}, fetch_size=10000"
+        )
+        return self._run_psql_script(
+            script,
+            db_name=target_db,
+            context_label="fdw_setup",
+            timeout_seconds=1800,
+        )
+
+    def cleanup_snapshot_fdw(self, target_db: str) -> bool:
+        script = f"""
+DROP SERVER IF EXISTS {_quote_identifier(SNAPSHOT_FDW_SERVER)} CASCADE;
+DROP SCHEMA IF EXISTS {_quote_identifier(SNAPSHOT_FDW_SCHEMA)} CASCADE;
+"""
+        success = self._run_psql_script(
+            script,
+            db_name=target_db,
+            ignore_errors=True,
+            context_label="fdw_cleanup",
+            timeout_seconds=600,
+        )
+        if success:
+            self.logger.info(f"FDW cleanup завершен: target_db={target_db}")
+        return success
+
+    def _snapshot_upsert_sql(
+        self,
+        table_name: str,
+        columns: Sequence[str],
+        column_types: Dict[str, str],
+        primary_key: Sequence[str],
+    ) -> str:
+        quoted_columns = ", ".join(
+            _quote_identifier(column) for column in columns
+        )
+        conflict_columns = ", ".join(
+            _quote_identifier(column) for column in primary_key
+        )
+        update_columns = [
+            column for column in columns if column not in primary_key
+        ]
+        if update_columns:
+            update_clause = ", ".join(
+                f"{_quote_identifier(column)} = EXCLUDED.{_quote_identifier(column)}"
+                for column in update_columns
+            )
+            predicates: List[str] = []
+            for column in update_columns:
+                target_column = (
+                    f"{_quote_identifier(table_name)}.{_quote_identifier(column)}"
+                )
+                excluded_column = f"EXCLUDED.{_quote_identifier(column)}"
+                data_type = column_types.get(column, "")
+                if data_type == "json":
+                    predicates.append(
+                        f"({target_column})::jsonb IS DISTINCT FROM "
+                        f"({excluded_column})::jsonb"
+                    )
+                elif data_type == "xml":
+                    predicates.append(
+                        f"({target_column})::text IS DISTINCT FROM "
+                        f"({excluded_column})::text"
+                    )
+                else:
+                    predicates.append(
+                        f"{target_column} IS DISTINCT FROM {excluded_column}"
+                    )
+            conflict_action = (
+                f"DO UPDATE SET {update_clause} WHERE " + " OR ".join(predicates)
+            )
+        else:
+            conflict_action = "DO NOTHING"
+
+        return f"""
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM {_quote_identifier(SNAPSHOT_FDW_SCHEMA)}.{_quote_identifier(table_name)}
+ON CONFLICT ({conflict_columns})
+{conflict_action};
+""".strip()
+
+    def _snapshot_sequence_sql(
+        self,
+        table_name: str,
+        columns: Sequence[str],
+        primary_key: Sequence[str],
+    ) -> str:
+        candidates = ["id"] if "id" in columns else []
+        if len(primary_key) == 1 and primary_key[0] not in candidates:
+            candidates.append(primary_key[0])
+        if not candidates:
+            return ""
+        column_name = candidates[0]
+        return f"""
+SELECT setval(
+    pg_get_serial_sequence('public.{table_name}', '{column_name}'),
+    COALESCE((SELECT MAX({_quote_identifier(column_name)}) FROM {_quote_identifier(table_name)}), 1),
+    EXISTS(SELECT 1 FROM {_quote_identifier(table_name)})
+)
+WHERE pg_get_serial_sequence('public.{table_name}', '{column_name}') IS NOT NULL;
+""".strip()
+
+    def apply_snapshot_via_fdw(
+        self,
+        modifications: Sequence[Dict[str, object]],
+        source_db: str,
+        target_db: str,
+    ) -> Tuple[bool, int, List[str]]:
+        """Переносит staging snapshot напрямую через postgres_fdw без CSV."""
+        if not modifications:
+            return False, 0, ["Список snapshot-модификаций пуст"]
+
+        table_names = [
+            _validate_identifier(str(item.get("table_name", "")), "table_name")
+            for item in modifications
+        ]
+        if len(table_names) != len(set(table_names)):
+            return False, 0, ["Snapshot содержит повторяющиеся таблицы"]
+
+        applied_count = 0
+        try:
+            if not self.setup_snapshot_fdw(source_db, target_db, table_names):
+                return False, 0, ["Не удалось создать postgres_fdw-контур"]
+
+            source_details = self._schema_column_details(
+                SNAPSHOT_FDW_SCHEMA,
+                table_names,
+                target_db,
+            )
+            target_details = self._schema_column_details(
+                "public",
+                table_names,
+                target_db,
+            )
+            prepared: List[Dict[str, object]] = []
+            for modification in modifications:
+                table_name = str(modification["table_name"])
+                source_columns = [name for name, _ in source_details.get(table_name, [])]
+                target_column_types = dict(target_details.get(table_name, []))
+                if not source_columns:
+                    return False, applied_count, [
+                        f"FDW-таблица не импортирована или не содержит колонок: {table_name}"
+                    ]
+                missing_target_columns = [
+                    column
+                    for column in source_columns
+                    if column not in target_column_types
+                ]
+                if missing_target_columns:
+                    return False, applied_count, [
+                        f"В main отсутствуют колонки staging: table={table_name}, "
+                        f"columns={missing_target_columns}"
+                    ]
+
+                load_mode = str(modification.get("load_mode", "upsert"))
+                primary_key_value = modification.get("primary_key")
+                if isinstance(primary_key_value, (list, tuple)):
+                    primary_key = [str(column) for column in primary_key_value]
+                elif primary_key_value:
+                    primary_key = [str(primary_key_value)]
+                else:
+                    primary_key = []
+                primary_key = [
+                    _validate_identifier(column, "primary_key")
+                    for column in primary_key
+                ]
+                if load_mode == "upsert" and (
+                    not primary_key
+                    or any(column not in source_columns for column in primary_key)
+                ):
+                    return False, applied_count, [
+                        f"Некорректный snapshot key: table={table_name}, key={primary_key}"
+                    ]
+                if load_mode not in {"upsert", "replace"}:
+                    return False, applied_count, [
+                        f"Неизвестный load_mode={load_mode}: table={table_name}"
+                    ]
+                prepared.append(
+                    {
+                        "table_name": table_name,
+                        "load_mode": load_mode,
+                        "primary_key": primary_key,
+                        "columns": source_columns,
+                        "column_types": target_column_types,
+                    }
+                )
+
+            self.logger.info(
+                f"FDW snapshot preflight пройден: source_db={source_db}, "
+                f"target_db={target_db}, tables={len(prepared)}"
+            )
+            self.log_suspicious_transactions(target_db)
+            keyed_items = [item for item in prepared if item["load_mode"] == "upsert"]
+            replace_items = [item for item in prepared if item["load_mode"] == "replace"]
+            total_transactions = len(keyed_items) + bool(replace_items)
+            self.logger.info(
+                f"FDW transaction plan: keyed={len(keyed_items)}, "
+                f"replace_group_tables={len(replace_items)}, "
+                f"transactions={total_transactions}"
+            )
+
+            for index, item in enumerate(keyed_items, 1):
+                table_name = str(item["table_name"])
+                columns = list(item["columns"])
+                primary_key = list(item["primary_key"])
+                script = "BEGIN;\n"
+                script += (
+                    f"SET LOCAL lock_timeout = "
+                    f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
+                )
+                script += self._snapshot_upsert_sql(
+                    table_name,
+                    columns,
+                    dict(item["column_types"]),
+                    primary_key,
+                ) + "\n"
+                sequence_sql = self._snapshot_sequence_sql(
+                    table_name,
+                    columns,
+                    primary_key,
+                )
+                if sequence_sql:
+                    script += sequence_sql + "\n"
+                script += "COMMIT;\n"
+                self.logger.info(
+                    f"FDW transaction [{index}/{total_transactions}]: "
+                    f"table={table_name}, mode=upsert"
+                )
+                if not self._run_psql_script(
+                    script,
+                    db_name=target_db,
+                    context_label=f"fdw_table:{table_name}",
+                    timeout_seconds=self.settings.snapshot_batch_timeout_seconds,
+                ):
+                    return False, applied_count, [
+                        f"Ошибка FDW snapshot-таблицы {table_name}"
+                    ]
+                applied_count += 1
+
+            if replace_items:
+                replace_tables = [str(item["table_name"]) for item in replace_items]
+                script = "BEGIN;\n"
+                script += (
+                    f"SET LOCAL lock_timeout = "
+                    f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
+                )
+                for item in reversed(replace_items):
+                    script += f"DELETE FROM {_quote_identifier(str(item['table_name']))};\n"
+                for item in replace_items:
+                    table_name = str(item["table_name"])
+                    columns = list(item["columns"])
+                    quoted_columns = ", ".join(
+                        _quote_identifier(column) for column in columns
+                    )
+                    script += f"""
+INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
+SELECT {quoted_columns}
+FROM {_quote_identifier(SNAPSHOT_FDW_SCHEMA)}.{_quote_identifier(table_name)};
+"""
+                    sequence_sql = self._snapshot_sequence_sql(
+                        table_name,
+                        columns,
+                        [],
+                    )
+                    if sequence_sql:
+                        script += sequence_sql + "\n"
+                script += "COMMIT;\n"
+                self.logger.info(
+                    f"FDW transaction [{total_transactions}/{total_transactions}]: "
+                    f"mode=replace_group, tables={replace_tables}"
+                )
+                if not self._run_psql_script(
+                    script,
+                    db_name=target_db,
+                    context_label="fdw_replace_group",
+                    timeout_seconds=self.settings.snapshot_batch_timeout_seconds,
+                ):
+                    return False, applied_count, [
+                        f"Ошибка FDW REPLACE-группы: {replace_tables}"
+                    ]
+                applied_count += len(replace_items)
+
+            return True, applied_count, []
+        finally:
+            # Cleanup is unconditional: failed CREATE/IMPORT can leave a
+            # partially created server or schema behind.
+            self.cleanup_snapshot_fdw(target_db)
+
     def _run_psql_file(self, sql_file: str, db_name: Optional[str] = None) -> bool:
         target_db = db_name or self.settings.db_name
         cmd = self._psql_base_cmd(target_db) + ["-f", sql_file]
@@ -742,773 +1115,6 @@ class DatabaseOperations:
         self.logger.info(f"=== Schema Snapshot: db={db_name} ===")
         for table_name in tables:
             self.log_table_schema(table_name, db_name)
-
-    def export_query_to_csv(self, query: str, csv_file: str, db_name: str) -> int:
-        count_query = f"SELECT COUNT(*) FROM ({query}) AS subq;"
-        count_raw = self.run_scalar(count_query, db_name=db_name)
-        if count_raw == "":
-            raise RuntimeError(
-                f"Не получен COUNT перед экспортом: db={db_name}, "
-                f"csv={csv_file}, sql={self._preview_sql(query, 120)}"
-            )
-        count = int(count_raw)
-
-        export_cmd = self._psql_base_cmd(db_name) + [
-            "-c",
-            f"\\copy ({query}) TO STDOUT WITH (FORMAT CSV, HEADER true)",
-        ]
-        with open(csv_file, "w", encoding="utf-8") as handle:
-            result = subprocess.run(export_cmd, stdout=handle, stderr=subprocess.PIPE, text=True, timeout=1800)
-        if result.returncode != 0:
-            error = (result.stderr or "").strip()
-            raise RuntimeError(
-                f"Export error: db={db_name}, csv={csv_file}, "
-                f"error={error or f'returncode={result.returncode}'}, "
-                f"sql={self._preview_sql(query, 120)}"
-            )
-        self.logger.info(f"Экспортирован CSV: db={db_name}, csv={csv_file}, rows={count}")
-        return count
-
-    def export_table_to_csv(
-        self,
-        table_name: str,
-        csv_file: str,
-        db_name: str,
-        order_by: Optional[Sequence[str] | str] = None,
-    ) -> int:
-        table_name = _validate_identifier(table_name, "table_name")
-        columns = self.get_table_columns(table_name, db_name)
-        protected_tables = {self.settings.issues_table, self.settings.projects_table}
-        blocked_columns = [
-            column
-            for column in columns
-            if table_name in protected_tables and column.startswith("cf_")
-        ]
-        export_columns = [column for column in columns if column not in blocked_columns]
-        if not export_columns:
-            self.logger.error(
-                f"Экспорт невозможен: после исключения cf_* не осталось колонок, "
-                f"db={db_name}, table={table_name}"
-            )
-            return 0
-        if blocked_columns:
-            self.logger.info(
-                f"Custom value columns исключены из snapshot: db={db_name}, "
-                f"table={table_name}, columns={blocked_columns}"
-            )
-        quoted_columns = ", ".join(_quote_identifier(column) for column in export_columns)
-        query = f"SELECT {quoted_columns} FROM {_quote_identifier(table_name)}"
-        if order_by:
-            order_columns = list(order_by) if isinstance(order_by, (list, tuple)) else [order_by]
-            normalized_order_columns = [
-                _validate_identifier(column, "order_column") for column in order_columns
-            ]
-            missing_order_columns = [
-                column for column in normalized_order_columns if column not in export_columns
-            ]
-            if missing_order_columns:
-                raise ValueError(
-                    f"Snapshot key отсутствует в экспортируемых колонках: "
-                    f"table={table_name}, columns={missing_order_columns}"
-                )
-            query += " ORDER BY " + ", ".join(
-                _quote_identifier(column) for column in normalized_order_columns
-            )
-        return self.export_query_to_csv(query, csv_file, db_name)
-
-    def upsert_from_csv(self, table_name: str, primary_key: Sequence[str] | str, csv_file: str, db_name: str) -> bool:
-        if not os.path.exists(csv_file):
-            self.logger.warning(f"CSV файл не найден для UPSERT: table={table_name}, csv={csv_file}")
-            return False
-
-        table_name = _validate_identifier(table_name, "table_name")
-        pk_cols = list(primary_key) if isinstance(primary_key, (list, tuple)) else [primary_key]
-        pk_cols = [_validate_identifier(pk, "primary_key") for pk in pk_cols]
-
-        csv_columns = [_validate_identifier(col, "column") for col in _read_csv_header(csv_file)]
-        protected_tables = {self.settings.issues_table, self.settings.projects_table}
-        blocked_columns = [
-            column
-            for column in csv_columns
-            if table_name in protected_tables and column.startswith("cf_")
-        ]
-        if blocked_columns:
-            self.logger.error(
-                f"UPSERT остановлен: snapshot для {table_name} содержит запрещенные "
-                f"custom value columns: {blocked_columns}"
-            )
-            return False
-        table_column_details = self.get_table_column_details(table_name, db_name)
-        table_column_types = {
-            column_name: data_type
-            for column_name, data_type in table_column_details
-        }
-        table_columns = set(table_column_types)
-        columns = [col for col in csv_columns if col in table_columns]
-        skipped_columns = [col for col in csv_columns if col not in table_columns]
-        if not columns:
-            self.logger.error(
-                f"В CSV нет совпадающих колонок для UPSERT: table={table_name}, csv={csv_file}, "
-                f"csv_columns={csv_columns}, table_columns={sorted(table_columns)}"
-            )
-            return False
-        if skipped_columns:
-            self.logger.error(
-                f"UPSERT остановлен из-за расхождения схемы: в main отсутствуют колонки "
-                f"из snapshot, db={db_name}, table={table_name}, "
-                f"missing_target_columns={skipped_columns}"
-            )
-            return False
-        missing_pk_columns = [pk for pk in pk_cols if pk not in columns]
-        if missing_pk_columns:
-            self.logger.error(
-                f"UPSERT остановлен: ключевые колонки отсутствуют в snapshot, "
-                f"db={db_name}, table={table_name}, missing_pk={missing_pk_columns}"
-            )
-            return False
-
-        quoted_columns = ", ".join(_quote_identifier(col) for col in columns)
-        update_columns = [col for col in columns if col not in pk_cols]
-        conflict_columns = ", ".join(_quote_identifier(pk) for pk in pk_cols)
-        update_clause = ", ".join(
-            f'{_quote_identifier(col)} = EXCLUDED.{_quote_identifier(col)}' for col in update_columns
-        )
-        change_predicates: List[str] = []
-        for column in update_columns:
-            target_column = (
-                f'{_quote_identifier(table_name)}.{_quote_identifier(column)}'
-            )
-            excluded_column = f'EXCLUDED.{_quote_identifier(column)}'
-            data_type = table_column_types.get(column, "")
-            if data_type == "json":
-                change_predicates.append(
-                    f"({target_column})::jsonb IS DISTINCT FROM "
-                    f"({excluded_column})::jsonb"
-                )
-            elif data_type == "xml":
-                change_predicates.append(
-                    f"({target_column})::text IS DISTINCT FROM "
-                    f"({excluded_column})::text"
-                )
-            else:
-                change_predicates.append(
-                    f"{target_column} IS DISTINCT FROM {excluded_column}"
-                )
-        change_predicate = " OR ".join(change_predicates)
-        conflict_action = (
-            f"DO UPDATE SET {update_clause} WHERE {change_predicate}"
-            if update_clause
-            else "DO NOTHING"
-        )
-        data_csv_file = _strip_csv_header(csv_file, delimiter=",")
-
-        copy_command = (
-            f"\\copy temp_upsert ({quoted_columns}) FROM '{data_csv_file}' "
-            f"WITH (FORMAT csv, HEADER false, DELIMITER ',', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');"
-        )
-        script = f"""
-CREATE TEMP TABLE temp_upsert AS
-SELECT {quoted_columns}
-FROM {_quote_identifier(table_name)}
-LIMIT 0;
-
-{copy_command}
-
-INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
-SELECT {quoted_columns}
-FROM temp_upsert
-ON CONFLICT ({conflict_columns})
-{conflict_action};
-
-DROP TABLE temp_upsert;
-"""
-        self.logger.info(
-            f"UPSERT подготовлен: db={db_name}, table={table_name}, pk={pk_cols}, "
-            f"csv={csv_file}, data_csv={data_csv_file}, header=true->stripped, delimiter=',', columns={columns}"
-        )
-        try:
-            success = self._run_psql_script(
-                script,
-                db_name=db_name,
-                context_label=f"upsert:{table_name}",
-            )
-            if success and len(pk_cols) == 1:
-                self.sync_sequence_with_max_id(table_name, db_name, column_name=pk_cols[0])
-            return success
-        finally:
-            try:
-                os.remove(data_csv_file)
-            except OSError:
-                pass
-
-    def apply_snapshot_batch(
-        self,
-        modifications: Sequence[Dict[str, object]],
-        db_name: str,
-        validate_only: bool = False,
-    ) -> bool:
-        """Проверяет и атомарно применяет одну таблицу или связанную группу."""
-        if not modifications:
-            self.logger.error("Snapshot batch пуст: синхронизация main БД отменена")
-            return False
-
-        prepared: List[Dict[str, object]] = []
-        seen_tables: set[str] = set()
-        for index, modification in enumerate(modifications):
-            table_name = _validate_identifier(
-                str(modification.get("table_name", "")),
-                "table_name",
-            )
-            if table_name in seen_tables:
-                self.logger.error(
-                    f"Snapshot batch остановлен: таблица указана повторно: {table_name}"
-                )
-                return False
-            seen_tables.add(table_name)
-
-            csv_file = str(modification.get("csv_file", ""))
-            if not csv_file or not os.path.isfile(csv_file):
-                self.logger.error(
-                    f"Snapshot batch остановлен: CSV отсутствует: "
-                    f"table={table_name}, csv={csv_file}"
-                )
-                return False
-            csv_columns = [
-                _validate_identifier(column, "column")
-                for column in _read_csv_header(csv_file)
-            ]
-            if not csv_columns:
-                self.logger.error(
-                    f"Snapshot batch остановлен: CSV не содержит заголовок: "
-                    f"table={table_name}, csv={csv_file}"
-                )
-                return False
-
-            table_column_details = self.get_table_column_details(table_name, db_name)
-            table_column_types = {
-                column_name: data_type
-                for column_name, data_type in table_column_details
-            }
-            missing_target_columns = [
-                column for column in csv_columns if column not in table_column_types
-            ]
-            if missing_target_columns:
-                self.logger.error(
-                    f"Snapshot batch остановлен из-за расхождения схемы: "
-                    f"db={db_name}, table={table_name}, "
-                    f"missing_target_columns={missing_target_columns}"
-                )
-                return False
-
-            load_mode = str(modification.get("load_mode", "upsert"))
-            primary_key_value = modification.get("primary_key")
-            primary_key: List[str] = []
-            if load_mode == "upsert":
-                if isinstance(primary_key_value, (list, tuple)):
-                    primary_key = [
-                        _validate_identifier(str(column), "primary_key")
-                        for column in primary_key_value
-                    ]
-                elif primary_key_value:
-                    primary_key = [
-                        _validate_identifier(str(primary_key_value), "primary_key")
-                    ]
-                missing_primary_key = [
-                    column for column in primary_key if column not in csv_columns
-                ]
-                if not primary_key or missing_primary_key:
-                    self.logger.error(
-                        f"Snapshot batch остановлен: некорректный ключ: "
-                        f"table={table_name}, key={primary_key}, "
-                        f"missing={missing_primary_key}"
-                    )
-                    return False
-            elif load_mode != "replace":
-                self.logger.error(
-                    f"Snapshot batch остановлен: неизвестный load_mode={load_mode}, "
-                    f"table={table_name}"
-                )
-                return False
-
-            try:
-                expected_rows = int(modification["row_count"])
-            except (KeyError, TypeError, ValueError):
-                self.logger.error(
-                    f"Snapshot batch остановлен: отсутствует корректный row_count, "
-                    f"table={table_name}"
-                )
-                return False
-            if expected_rows < 0:
-                self.logger.error(
-                    f"Snapshot batch остановлен: отрицательный row_count, "
-                    f"table={table_name}, row_count={expected_rows}"
-                )
-                return False
-
-            sequence_column = ""
-            sequence_candidates = []
-            if "id" in csv_columns:
-                sequence_candidates.append("id")
-            if len(primary_key) == 1 and primary_key[0] not in sequence_candidates:
-                sequence_candidates.append(primary_key[0])
-            for candidate in sequence_candidates:
-                default_expression = self.get_column_default(
-                    table_name,
-                    candidate,
-                    db_name,
-                )
-                if "nextval(" in default_expression:
-                    sequence_column = candidate
-                    break
-
-            prepared.append(
-                {
-                    "table_name": table_name,
-                    "csv_file": csv_file,
-                    "columns": csv_columns,
-                    "column_types": table_column_types,
-                    "primary_key": primary_key,
-                    "load_mode": load_mode,
-                    "expected_rows": expected_rows,
-                    "sequence_column": sequence_column,
-                    "temp_table": f"temp_snapshot_batch_{index}",
-                }
-            )
-
-        if validate_only:
-            self.logger.info(
-                f"Snapshot preflight пройден: db={db_name}, tables={len(prepared)}"
-            )
-            return True
-
-        setup_statements: List[str] = []
-        delete_replace_statements: List[str] = []
-        upsert_statements: List[str] = []
-        replace_insert_statements: List[str] = []
-        sequence_statements: List[str] = []
-        verify_statements: List[str] = []
-
-        for index, item in enumerate(prepared):
-            table_name = str(item["table_name"])
-            csv_file = str(item["csv_file"])
-            temp_table = str(item["temp_table"])
-            columns = list(item["columns"])
-            column_types = dict(item["column_types"])
-            primary_key = list(item["primary_key"])
-            load_mode = str(item["load_mode"])
-            expected_rows = int(item["expected_rows"])
-            sequence_column = str(item["sequence_column"])
-            quoted_columns = ", ".join(
-                _quote_identifier(column) for column in columns
-            )
-            escaped_csv_file = csv_file.replace("'", "''")
-
-            setup_statements.append(
-                f"""
-CREATE TEMP TABLE {_quote_identifier(temp_table)} AS
-SELECT {quoted_columns}
-FROM {_quote_identifier(table_name)}
-LIMIT 0;
-\copy {_quote_identifier(temp_table)} ({quoted_columns}) FROM '{escaped_csv_file}' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');
-DO $count_{index}$
-DECLARE actual_rows BIGINT;
-BEGIN
-    SELECT COUNT(*) INTO actual_rows FROM {_quote_identifier(temp_table)};
-    IF actual_rows <> {expected_rows} THEN
-        RAISE EXCEPTION 'Snapshot CSV row count mismatch: table={table_name}, expected={expected_rows}, actual=%', actual_rows;
-    END IF;
-END;
-$count_{index}$;
-""".strip()
-            )
-
-            if load_mode == "replace":
-                delete_replace_statements.append(
-                    f"DELETE FROM {_quote_identifier(table_name)};"
-                )
-                replace_insert_statements.append(
-                    f"""
-INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
-SELECT {quoted_columns}
-FROM {_quote_identifier(temp_table)};
-""".strip()
-                )
-            else:
-                update_columns = [
-                    column for column in columns if column not in primary_key
-                ]
-                conflict_columns = ", ".join(
-                    _quote_identifier(column) for column in primary_key
-                )
-                if update_columns:
-                    update_clause = ", ".join(
-                        f"{_quote_identifier(column)} = EXCLUDED.{_quote_identifier(column)}"
-                        for column in update_columns
-                    )
-                    predicates: List[str] = []
-                    for column in update_columns:
-                        target_column = (
-                            f"{_quote_identifier(table_name)}.{_quote_identifier(column)}"
-                        )
-                        excluded_column = f"EXCLUDED.{_quote_identifier(column)}"
-                        data_type = column_types.get(column, "")
-                        if data_type == "json":
-                            predicates.append(
-                                f"({target_column})::jsonb IS DISTINCT FROM "
-                                f"({excluded_column})::jsonb"
-                            )
-                        elif data_type == "xml":
-                            predicates.append(
-                                f"({target_column})::text IS DISTINCT FROM "
-                                f"({excluded_column})::text"
-                            )
-                        else:
-                            predicates.append(
-                                f"{target_column} IS DISTINCT FROM {excluded_column}"
-                            )
-                    conflict_action = (
-                        f"DO UPDATE SET {update_clause} WHERE "
-                        + " OR ".join(predicates)
-                    )
-                else:
-                    conflict_action = "DO NOTHING"
-                upsert_statements.append(
-                    f"""
-INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
-SELECT {quoted_columns}
-FROM {_quote_identifier(temp_table)}
-ON CONFLICT ({conflict_columns})
-{conflict_action};
-""".strip()
-                )
-
-            if sequence_column:
-                sequence_statements.append(
-                    f"""
-SELECT setval(
-    pg_get_serial_sequence('public.{table_name}', '{sequence_column}'),
-    COALESCE((SELECT MAX({_quote_identifier(sequence_column)}) FROM {_quote_identifier(table_name)}), 1),
-    EXISTS(SELECT 1 FROM {_quote_identifier(table_name)})
-);
-""".strip()
-                )
-
-            if load_mode == "replace":
-                # REPLACE выполняется прямым INSERT ... SELECT после DELETE в этой
-                # же транзакции. Проверка количества подтверждает, что PostgreSQL
-                # вставил все строки. Двойной EXCEPT ALL здесь повторно сортировал
-                # миллионы широких строк и мог занимать дольше самой загрузки.
-                source_diff_query = "source_minus_target := 0;"
-                target_diff_query = "target_minus_source := 0;"
-                verification_condition = "source_rows <> target_rows"
-            else:
-                key_match = " AND ".join(
-                    f"target.{_quote_identifier(column)} IS NOT DISTINCT FROM "
-                    f"source.{_quote_identifier(column)}"
-                    for column in primary_key
-                )
-                column_matches: List[str] = []
-                for column in columns:
-                    target_column = f"target.{_quote_identifier(column)}"
-                    source_column = f"source.{_quote_identifier(column)}"
-                    data_type = column_types.get(column, "")
-                    if data_type == "json":
-                        column_matches.append(
-                            f"({target_column})::jsonb IS NOT DISTINCT FROM "
-                            f"({source_column})::jsonb"
-                        )
-                    elif data_type == "xml":
-                        column_matches.append(
-                            f"({target_column})::text IS NOT DISTINCT FROM "
-                            f"({source_column})::text"
-                        )
-                    else:
-                        column_matches.append(
-                            f"{target_column} IS NOT DISTINCT FROM {source_column}"
-                        )
-                row_match = " AND ".join([key_match, *column_matches])
-                source_diff_query = f"""
-    SELECT COUNT(*) INTO source_minus_target
-    FROM {_quote_identifier(temp_table)} AS source
-    WHERE NOT EXISTS (
-        SELECT 1
-        FROM {_quote_identifier(table_name)} AS target
-        WHERE {row_match}
-    );
-""".strip()
-                target_diff_query = "target_minus_source := 0;"
-                verification_condition = "source_minus_target <> 0"
-            verify_statements.append(
-                f"""
-DO $verify_{index}$
-DECLARE
-    source_rows BIGINT;
-    target_rows BIGINT;
-    source_minus_target BIGINT;
-    target_minus_source BIGINT;
-BEGIN
-    SELECT COUNT(*) INTO source_rows FROM {_quote_identifier(temp_table)};
-    SELECT COUNT(*) INTO target_rows FROM {_quote_identifier(table_name)};
-    {source_diff_query}
-    {target_diff_query}
-    IF {verification_condition} THEN
-        RAISE EXCEPTION 'Snapshot verification failed: table={table_name}, source_rows=%, target_rows=%, source_minus_target=%, target_minus_source=%', source_rows, target_rows, source_minus_target, target_minus_source;
-    END IF;
-END;
-$verify_{index}$;
-""".strip()
-            )
-
-        keyed_items = [item for item in prepared if item["load_mode"] == "upsert"]
-        replace_items = [item for item in prepared if item["load_mode"] == "replace"]
-        script = "\n\n".join(setup_statements)
-        script += "\n\nBEGIN;\n"
-        script += (
-            "SET LOCAL lock_timeout = "
-            f"'{self.settings.snapshot_lock_timeout_seconds}s';\n"
-        )
-        script += "\n".join(reversed(delete_replace_statements)) + "\n"
-        script += "\n".join(upsert_statements) + "\n"
-        script += "\n".join(replace_insert_statements) + "\n"
-        script += "\n".join(sequence_statements) + "\n"
-        script += "\n".join(verify_statements) + "\n"
-        script += "COMMIT;\n"
-
-        table_names = [str(item["table_name"]) for item in prepared]
-        if len(table_names) == 1:
-            context_label = f"snapshot_table:{table_names[0]}"
-            transaction_scope = "table"
-        elif all(item["load_mode"] == "replace" for item in prepared):
-            context_label = "snapshot_replace_group"
-            transaction_scope = "replace_group"
-        else:
-            context_label = "snapshot_atomic_batch"
-            transaction_scope = "all_tables"
-        self.logger.info(
-            f"Snapshot transaction prepared: db={db_name}, "
-            f"tables={len(table_names)}, keyed={len(keyed_items)}, "
-            f"replace={len(replace_items)}, "
-            f"timeout_seconds={self.settings.snapshot_batch_timeout_seconds}, "
-            f"lock_timeout_seconds={self.settings.snapshot_lock_timeout_seconds}, "
-            f"transaction_scope={transaction_scope}"
-        )
-        success = self._run_psql_script(
-            script,
-            db_name=db_name,
-            context_label=context_label,
-            timeout_seconds=self.settings.snapshot_batch_timeout_seconds,
-        )
-        if not success:
-            self.logger.error(
-                f"Snapshot transaction rolled back: db={db_name}, "
-                f"tables={table_names}"
-            )
-            return False
-
-        for item in prepared:
-            self.logger.info(
-                f"Snapshot verified: db={db_name}, "
-                f"table={item['table_name']}, rows={item['expected_rows']}"
-            )
-        return True
-
-    def apply_snapshot_in_transactions(
-        self,
-        modifications: Sequence[Dict[str, object]],
-        db_name: str,
-    ) -> Tuple[bool, int, List[str]]:
-        """Применяет keyed-таблицы по одной, а REPLACE — связанной группой."""
-        if not modifications:
-            return False, 0, ["Список snapshot-модификаций пуст"]
-
-        # Сначала проверяем все CSV, ключи и соответствие схемы. Так ошибки
-        # входных данных обнаруживаются до первой изменяющей транзакции.
-        if not self.apply_snapshot_batch(modifications, db_name, validate_only=True):
-            return False, 0, ["Snapshot preflight не пройден"]
-
-        self.log_suspicious_transactions(db_name)
-
-        keyed_modifications = [
-            modification
-            for modification in modifications
-            if str(modification.get("load_mode", "upsert")) == "upsert"
-        ]
-        replace_modifications = [
-            modification
-            for modification in modifications
-            if str(modification.get("load_mode", "upsert")) == "replace"
-        ]
-        total_transactions = len(keyed_modifications) + bool(replace_modifications)
-        applied_count = 0
-
-        self.logger.info(
-            f"Snapshot transaction plan: db={db_name}, "
-            f"keyed_transactions={len(keyed_modifications)}, "
-            f"replace_group_tables={len(replace_modifications)}, "
-            f"transactions={total_transactions}"
-        )
-        for transaction_index, modification in enumerate(keyed_modifications, 1):
-            table_name = str(modification.get("table_name", ""))
-            self.logger.info(
-                f"Snapshot transaction [{transaction_index}/{total_transactions}]: "
-                f"table={table_name}, mode=upsert, rows={modification.get('row_count', 0)}"
-            )
-            if not self.apply_snapshot_batch([modification], db_name):
-                return (
-                    False,
-                    applied_count,
-                    [f"Ошибка snapshot-таблицы {table_name}"],
-                )
-            applied_count += 1
-
-        if replace_modifications:
-            replace_tables = [
-                str(modification.get("table_name", ""))
-                for modification in replace_modifications
-            ]
-            self.logger.info(
-                f"Snapshot transaction [{total_transactions}/{total_transactions}]: "
-                f"mode=replace_group, tables={replace_tables}"
-            )
-            if not self.apply_snapshot_batch(replace_modifications, db_name):
-                return (
-                    False,
-                    applied_count,
-                    [f"Ошибка REPLACE-группы: {replace_tables}"],
-                )
-            applied_count += len(replace_modifications)
-
-        return True, applied_count, []
-
-    def replace_tables_from_csv(
-        self,
-        snapshots: Sequence[Tuple[str, str]],
-        db_name: str,
-    ) -> bool:
-        """Атомарно заменяет согласованную группу таблиц snapshot-данными."""
-        if not snapshots:
-            return True
-
-        prepared: List[Dict[str, object]] = []
-        seen_tables: set[str] = set()
-        for index, (raw_table_name, csv_file) in enumerate(snapshots):
-            table_name = _validate_identifier(raw_table_name, "table_name")
-            if table_name in seen_tables:
-                self.logger.error(
-                    f"REPLACE остановлен: таблица указана повторно: {table_name}"
-                )
-                return False
-            seen_tables.add(table_name)
-            if not os.path.exists(csv_file):
-                self.logger.warning(
-                    f"CSV файл не найден для REPLACE: table={table_name}, csv={csv_file}"
-                )
-                return False
-
-            csv_columns = [
-                _validate_identifier(column, "column")
-                for column in _read_csv_header(csv_file)
-            ]
-            table_columns = self.get_table_columns(table_name, db_name)
-            if not csv_columns:
-                self.logger.error(
-                    f"CSV не содержит заголовок для REPLACE: "
-                    f"table={table_name}, csv={csv_file}"
-                )
-                return False
-            if set(csv_columns) != set(table_columns):
-                self.logger.error(
-                    f"REPLACE остановлен из-за расхождения схемы: db={db_name}, "
-                    f"table={table_name}, csv_columns={csv_columns}, "
-                    f"table_columns={table_columns}"
-                )
-                return False
-
-            prepared.append(
-                {
-                    "table_name": table_name,
-                    "csv_file": csv_file,
-                    "columns": csv_columns,
-                    "temp_table": f"temp_snapshot_replace_{index}",
-                }
-            )
-
-        setup_statements: List[str] = []
-        insert_statements: List[str] = []
-        drop_statements: List[str] = []
-        for item in prepared:
-            table_name = str(item["table_name"])
-            csv_file = str(item["csv_file"])
-            temp_table = str(item["temp_table"])
-            columns = item["columns"]
-            if not isinstance(columns, list):
-                return False
-            quoted_columns = ", ".join(
-                _quote_identifier(column) for column in columns
-            )
-            setup_statements.append(
-                f"""
-CREATE TEMP TABLE {_quote_identifier(temp_table)} AS
-SELECT {quoted_columns}
-FROM {_quote_identifier(table_name)}
-LIMIT 0;
-\\copy {_quote_identifier(temp_table)} ({quoted_columns}) FROM '{csv_file}' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '\"', ESCAPE '\"', ENCODING 'UTF8');
-""".strip()
-            )
-            insert_statements.append(
-                f"""
-INSERT INTO {_quote_identifier(table_name)} ({quoted_columns})
-SELECT {quoted_columns}
-FROM {_quote_identifier(temp_table)};
-""".strip()
-            )
-            drop_statements.append(
-                f"DROP TABLE {_quote_identifier(temp_table)};"
-            )
-
-        quoted_tables = ", ".join(
-            _quote_identifier(str(item["table_name"])) for item in prepared
-        )
-        delete_statements = [
-            f'DELETE FROM {_quote_identifier(str(item["table_name"]))};'
-            for item in reversed(prepared)
-        ]
-        script = "\n\n".join(setup_statements)
-        script += "\n\nBEGIN;\n"
-        script += f"LOCK TABLE {quoted_tables} IN ACCESS EXCLUSIVE MODE;\n"
-        script += "\n".join(delete_statements) + "\n"
-        script += "\n".join(insert_statements) + "\n"
-        script += "COMMIT;\n\n"
-        script += "\n".join(drop_statements) + "\n"
-
-        table_names = [str(item["table_name"]) for item in prepared]
-        self.logger.info(
-            f"REPLACE batch подготовлен: db={db_name}, tables={table_names}, "
-            f"count={len(prepared)}"
-        )
-        context_label = (
-            f"replace:{table_names[0]}"
-            if len(table_names) == 1
-            else "replace_batch"
-        )
-        success = self._run_psql_script(
-            script,
-            db_name=db_name,
-            context_label=context_label,
-        )
-        if success:
-            for item in prepared:
-                columns = item["columns"]
-                if isinstance(columns, list) and "id" in columns:
-                    self.sync_sequence_with_max_id(
-                        str(item["table_name"]),
-                        db_name,
-                    )
-        return success
-
-    def replace_from_csv(self, table_name: str, csv_file: str, db_name: str) -> bool:
-        """Совместимый wrapper для атомарной замены одной snapshot-таблицы."""
-        return self.replace_tables_from_csv([(table_name, csv_file)], db_name)
 
     def create_required_tables(self, db_name: str) -> bool:
         statements = [
@@ -2618,13 +2224,11 @@ def extract_dump(dump_file: str, temp_dir: str, logger: ETLLogger) -> Tuple[Opti
     return extract_dir, sql_files
 
 
-def build_snapshot_exports(
+def build_snapshot_plan(
     db_ops: DatabaseOperations,
     temp_db: str,
     snapshot_tables: Dict[str, Sequence[str] | str],
-    export_dir: str,
 ) -> List[Dict[str, object]]:
-    os.makedirs(export_dir, exist_ok=True)
     modifications: List[Dict[str, object]] = []
     resolved_tables = db_ops.resolve_snapshot_tables(temp_db, snapshot_tables)
     for table_name, primary_key in resolved_tables.items():
@@ -2633,26 +2237,12 @@ def build_snapshot_exports(
                 f"Snapshot table отсутствует в staging: db={temp_db}, "
                 f"table={table_name}"
             )
-        csv_file = os.path.join(export_dir, f"{table_name}.csv")
-        row_count = db_ops.export_table_to_csv(
-            table_name,
-            csv_file,
-            temp_db,
-            order_by=primary_key,
-        )
-        if not os.path.isfile(csv_file):
-            raise RuntimeError(
-                f"Snapshot CSV не создан: db={temp_db}, table={table_name}, "
-                f"csv={csv_file}"
-            )
         modifications.append(
             {
                 "change_type": "snapshot",
                 "load_mode": "upsert",
                 "table_name": table_name,
                 "primary_key": primary_key,
-                "csv_file": csv_file,
-                "row_count": row_count,
             }
         )
 
@@ -2663,29 +2253,16 @@ def build_snapshot_exports(
                 f"REPLACE snapshot table отсутствует в staging: "
                 f"db={temp_db}, table={table_name}"
             )
-        csv_file = os.path.join(export_dir, f"{table_name}.csv")
-        row_count = db_ops.export_table_to_csv(
-            table_name,
-            csv_file,
-            temp_db,
-        )
-        if not os.path.isfile(csv_file):
-            raise RuntimeError(
-                f"REPLACE snapshot CSV не создан: db={temp_db}, "
-                f"table={table_name}, csv={csv_file}"
-            )
         modifications.append(
             {
                 "change_type": "snapshot_replace",
                 "load_mode": "replace",
                 "table_name": table_name,
                 "primary_key": None,
-                "csv_file": csv_file,
-                "row_count": row_count,
             }
         )
     if not modifications:
         raise ValueError(
-            f"Snapshot export не содержит ни одной таблицы: staging={temp_db}"
+            f"Snapshot plan не содержит ни одной таблицы: staging={temp_db}"
         )
     return modifications

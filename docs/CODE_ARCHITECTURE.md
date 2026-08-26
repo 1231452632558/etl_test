@@ -14,8 +14,7 @@
 Это значит, что:
 - SQL-логика
 - restore
-- блокировка материализованных `cf_*`
-- snapshot export/import
+- прямой snapshot-перенос через `postgres_fdw`
 - weekly-логика
 - seed ручных таблиц
 
@@ -33,11 +32,11 @@
 - `finalize_remote_backup()` — публикация проверенного удаленного архива после успешного ETL
 - `rotate_backups()` — хранение одного текущего и `max_backups - 1` старых архивов
 - `extract_dump()` — распаковка входящего дампа
-- `build_snapshot_exports()` — экспорт snapshot-таблиц в CSV
+- `build_snapshot_plan()` — план snapshot без промежуточных файлов
 - `resolve_snapshot_tables()` — обнаружение всех таблиц и безопасных уникальных ключей
-- `replace_tables_from_csv()` — групповая транзакционная синхронизация явно заданных таблиц
-- `apply_snapshot_batch()` — проверяемая транзакция одной keyed-таблицы или связанной REPLACE-группы
-- `apply_snapshot_in_transactions()` — общий preflight и последовательное применение транзакций с учетом прогресса
+- `setup_snapshot_fdw()` — подключение staging как foreign schema
+- `apply_snapshot_via_fdw()` — прямой UPSERT и групповая REPLACE-синхронизация из staging
+- `cleanup_snapshot_fdw()` — удаление временного FDW-контура после успеха или ошибки
 - `order_snapshot_tables()` — порядок UPSERT с учетом внешних ключей
 - `add_weekly_records()` — weekly-историзация в `users_active` и `group_employee_count`
 
@@ -65,20 +64,14 @@ Task-entrypoint.
 - тот же CLI-контракт, что и task-версия
 - выполнение тех же стадий, но без отдельного task runner
 
-### `scripts/tasks/*.py`
+### `scripts/tasks.py`
 
-Отдельные task-классы:
-- `extract_task.py`
-- `restore_task.py`
-- `seed_asterisk_task.py`
-- `compare_task.py`
-- `load_task.py`
-- `weekly_task.py`
-- `cleanup_task.py`
+Все task-классы и оркестратор собраны в одном модуле:
+- `ExtractTask`, `RestoreTask`, `SeedAsteriskTask`
+- `CompareTask`, `LoadTask`, `WeeklyTask`, `CleanupTask`
+- `TaskRunner`
 
-### `scripts/tasks/task_runner.py`
-
-Оркестратор task-версии:
+`TaskRunner`:
 - выполняет стадии по порядку
 - передаёт общий context
 - прерывает выполнение при ошибке
@@ -135,22 +128,19 @@ cleanup
 Назначение:
 - обнаружить обычные таблицы `public` и их PK/UNIQUE-ключи
 - поставить родительские таблицы раньше дочерних
-- экспортировать snapshot-CSV из staging
-- исключить `cf_*` из `issues/projects`
+- сформировать FDW-план таблиц staging
 
 Работает только по `temp_db`.
 
 Результат в context:
 - `modifications`
-- `export_dir`
 
 ### `load`
 
 Назначение:
-- выполнить общий preflight snapshot-CSV, затем применять keyed-таблицы по одной и проверять source/main до каждого COMMIT
+- создать временный postgres_fdw-контур staging→main и применять keyed-таблицы по одной
 - остановиться при расхождении схемы staging/main вместо тихого пропуска колонок
-- отклонить `cf_*` в snapshot `issues/projects`, не меняя существующую схему main
-- использовать отдельные лимиты для полного batch и ожидания блокировок; REPLACE после прямой вставки проверять по row count
+- использовать отдельные лимиты для транзакции и ожидания блокировок
 - не использовать общий `LOCK TABLE` или advisory-lock для всех snapshot-таблиц
 
 Работает только по staging-derived данным.
@@ -196,11 +186,9 @@ Task-версия передаёт между шагами словарь `conte
 - `cleanup_temp_db`
 - `create_database`
 - `modifications`
-- `export_dir`
 
 Практический смысл:
 - если стадия запускается отдельно, нужные ей ключи должны уже существовать или задаваться через CLI-режим
-- `cf_*` никогда не должны присутствовать в `modifications`
 
 ## 5. CLI-контракт
 
@@ -306,7 +294,8 @@ CLI автоматически дополняет план:
 - `Версия репозитория`
 - `План стадий ...`
 - `Schema snapshot`
-- `Custom value columns исключены из snapshot`
+- `FDW setup` / `FDW cleanup`
+- `FDW transaction [N/M]`
 - `Weekly debug ...`
 
 ## 9. Почему важна эквивалентность монолита и tasks

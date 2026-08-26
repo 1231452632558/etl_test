@@ -3,7 +3,7 @@
 ## Требования
 
 - Ubuntu 22.04
-- PostgreSQL 14
+- PostgreSQL 14 с расширением `postgres_fdw`
 - Python 3.x
 - Доступ к `sudo -u postgres psql`
 - SSH-доступ к серверу с nightly dump, если dump забирается по `scp`
@@ -34,6 +34,7 @@ Pipeline использует системный `psql` и `sudo -u postgres`.
 ```bash
 sudo -u postgres psql -c "SELECT version();"
 sudo -u postgres psql -c "SELECT 1;"
+sudo -u postgres psql -c "SELECT default_version FROM pg_available_extensions WHERE name = 'postgres_fdw';"
 ```
 
 Если это не работает, сначала нужно настроить права на sudo и доступ к локальному PostgreSQL.
@@ -72,7 +73,7 @@ mkdir -p /workspace/logs
 [database]
 db_name = your_main_db
 db_user = your_db_user
-db_host = localhost
+db_host = /var/run/postgresql
 db_port = 5432
 temp_db_prefix = temp_restore_
 
@@ -209,7 +210,7 @@ python3 scripts/etl_pipeline.py /path/to/dump.tar.gz --local-dump --config confi
 Для `--local-dump` автоматическая ротация удаленных архивов не выполняется.
 
 Флаг `--cleanup` удаляет staging БД после успешного завершения. При ошибке staging
-и временные snapshot-файлы сохраняются для диагностики.
+сохраняется для диагностики, а временный FDW-контур удаляется всегда.
 
 Перед каждым запуском pipeline дополнительно ищет и удаляет осиротевшие staging-БД
 предыдущих запусков. В логе это отражается строкой `Staging cleanup завершен`.
@@ -279,7 +280,6 @@ sudo chown -R tehpod:tehpod /var/backups/postgres /workspace/old_backup /workspa
 3. Все рабочие таблицы должны иметь PRIMARY KEY/UNIQUE index либо быть явно исключены.
 4. CSV для append `asterisk_cdr` и init-only seed CSV должны лежать в ожидаемом месте.
 5. Пользователь, который запускает cron, должен иметь доступ к `sudo -u postgres`.
-6. Snapshot `issues/projects` не должен содержать колонки `cf_*`.
 
 ## 11. Диагностика
 
@@ -300,16 +300,6 @@ sudo -u postgres psql -c "\l"
 ```bash
 sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'temp_restore_%';"
 ```
-
-### Проверка блокировки custom values
-
-```bash
-sudo -u postgres psql -d your_main_db -c "\d issues"
-sudo -u postgres psql -d your_main_db -c "\d projects"
-```
-
-Ранее созданные `cf_*` остаются в main БД. Pipeline не удаляет их, не обновляет
-из custom values и не переносит через snapshot.
 
 ## 12. Частые проблемы
 
@@ -332,15 +322,3 @@ ssh your_remote_user@your_remote_host
 ```bash
 sudo -u postgres psql -c "SELECT 1;"
 ```
-
-### В snapshot обнаружены `cf_*`
-
-Pipeline намеренно остановит UPSERT `issues/projects`, если входной snapshot
-содержит `cf_*`. Проверьте, что используется актуальный код и snapshot создан
-новой стадией `compare`.
-
-### Старые `cf_*` остались в main
-
-Это ожидаемо: одноразовое удаление больше не входит в pipeline. Если понадобится
-отдельная очистка схемы, выполняйте ее как контролируемую миграцию вне nightly.
-Pipeline намеренно не использует `CASCADE`.

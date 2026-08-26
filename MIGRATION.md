@@ -29,7 +29,7 @@
 ## Что меняется
 
 - Main БД становится долгоживущей
-- `issues` и `projects` загружаются в main без автоматической материализации custom values
+- snapshot-таблицы переносятся напрямую из staging через `postgres_fdw`
 - `asterisk_cdr` дополняется напрямую из CSV в main по отсутствующим `id`
 - `group_employee_count` и `users_active` больше не живут через nightly export/import
 
@@ -286,7 +286,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 После переключения:
 - nightly run завершился без ошибок
 - staging БД удалена
-- новые и измененные строки всех snapshot-таблиц обновлены; `cf_*` не переносились
+- новые и измененные строки всех snapshot-таблиц обновлены
 - `asterisk_cdr` на месте
 - `group_employee_count` и `users_active` не потеряли историю
 

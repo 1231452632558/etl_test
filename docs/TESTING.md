@@ -6,7 +6,6 @@
 - убедиться, что main БД больше не пересоздается nightly
 - проверить restore в staging БД
 - проверить загрузку `asterisk_cdr` из CSV при необходимости
-- проверить, что materialized `cf_*` не попадают в `issues/projects`
 - проверить `UPSERT` snapshot-таблиц
 - проверить weekly/manual таблицы
 - проверить очистку staging БД
@@ -27,6 +26,7 @@ cd /path/to/repo
 python3 --version
 sudo -u postgres psql -c "SELECT version();"
 sudo -u postgres psql -c "SELECT 1;"
+sudo -u postgres psql -c "SELECT default_version FROM pg_available_extensions WHERE name = 'postgres_fdw';"
 ```
 
 ## 2. Какие данные нужны для проверки
@@ -38,8 +38,7 @@ sudo -u postgres psql -c "SELECT 1;"
 
 ### Желательные
 
-1. Дамп, содержащий `issues` и `projects`; желательно с тестовыми `cf_*`,
-   чтобы проверить их исключение из snapshot.
+1. Дамп, содержащий `issues` и `projects`.
 2. CSV для `asterisk_cdr`, если `asterisk_cdr` не приходит во входящем dump.
 3. CSV:
    - `group_employee_count_backup.csv`
@@ -131,7 +130,7 @@ sudo -u postgres psql -c \"SELECT datname FROM pg_database WHERE datname LIKE 't
 - работоспособность task-entrypoint
 
 Что он не проверяет полноценно:
-- блокировку `cf_*` для `issues/projects`
+- реальный `postgres_fdw`-перенос между двумя тестовыми БД
 - `asterisk_cdr` CSV-source
 - weekly/manual таблицы
 - продовую схему данных
@@ -170,26 +169,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM users_active;"
 - `group_employee_count` и `users_active` существуют как таблицы даже если соответствующие CSV не найдены
 - `group_employee_count` и `users_active` могут остаться пустыми, если seed CSV отсутствуют
 
-## 8. Тест 3. Проверка блокировки custom values
-
-После `compare/load` pipeline не должен создавать, обновлять или переносить
-колонки `cf_*` в `issues/projects`.
-
-Проверьте:
-
-```bash
-sudo -u postgres psql -d test_main_db -c "\d issues"
-sudo -u postgres psql -d test_main_db -c "\d projects"
-```
-
-Ожидаемый результат:
-1. В плане стадий нет `transform_custom_values`.
-2. В логах snapshot для `issues/projects` колонки `cf_*` отсутствуют.
-3. Если staging уже содержит `cf_*`, появляется сообщение об их исключении.
-4. Если в ручной CSV для UPSERT подмешаны `cf_*`, загрузка останавливается.
-5. Ранее созданные `cf_*` остаются без изменений: pipeline не выполняет `DROP COLUMN`.
-
-## 9. Тест 4. Nightly run без удаления main БД
+## 8. Тест 3. Nightly run без удаления main БД
 
 Запустите nightly dump.
 
@@ -226,7 +206,7 @@ sudo -u postgres psql -c "SELECT datname FROM pg_database WHERE datname LIKE 'te
 - staging БД создается на время прогона
 - после `--cleanup` staging БД удаляется
 
-## 10. Тест 5. Проверка snapshot-upsert
+## 9. Тест 4. Проверка snapshot-upsert
 
 Для обычных snapshot-таблиц проверьте новые и измененные строки. Для
 `asterisk_cdr` проверяется отдельная append-only стадия:
@@ -240,16 +220,16 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM asterisk_cdr ORDER BY id
 1. Новые строки обычных snapshot-таблиц появились, измененные обновились.
 2. В `asterisk_cdr` добавились только новые `id`; существующие строки не перезаписались.
 3. Main БД не пересоздавалась.
-4. В логе есть `Snapshot verified` для `issues`, `projects` и остальных непустых таблиц.
+4. В логе есть `FDW snapshot preflight пройден` и транзакции для `issues`, `projects` и остальных таблиц.
 5. Искусственная ошибка откатывает текущую таблицу или REPLACE-группу, но не ранее успешно зафиксированные keyed-таблицы.
-6. В логе видны общий `Snapshot preflight`, план транзакций и строки `Snapshot transaction [N/M]` с именем таблицы.
+6. В логе видны общий FDW preflight, план транзакций и строки `FDW transaction [N/M]` с именем таблицы.
 7. SQL не содержит общего `LOCK TABLE` или `pg_advisory_xact_lock` для snapshot-таблиц.
-8. При наличии старой транзакции в логе видны её `pid`, `application`, возраст, ожидание и SQL; ошибки psql содержат контекст `snapshot_table:<table>`.
+8. При наличии старой транзакции в логе видны её `pid`, `application`, возраст, ожидание и SQL; ошибки psql содержат контекст `fdw_table:<table>`.
 
 Проверьте в логе `Snapshot tables resolved` и выборочно сравните несколько таблиц,
 кроме `issues/projects`, включая таблицу с составным UNIQUE-ключом.
 
-## 11. Тест 6. Проверка `asterisk_cdr` CSV-source
+## 10. Тест 5. Проверка `asterisk_cdr` CSV-source
 
 Нужен сценарий, где:
 - входящий dump не содержит `asterisk_cdr`
@@ -273,7 +253,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT COUNT(*) FROM asterisk_cdr WHER
 - строки есть
 - `project_id IS NULL` дает `0`
 
-## 12. Тест 7. Проверка weekly/manual таблиц
+## 11. Тест 6. Проверка weekly/manual таблиц
 
 Нужно проверить:
 - сохранение старых данных
@@ -297,7 +277,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
 - старые записи сохранились
 - за одну дату нет дублей по бизнес-ключам
 
-## 13. Тест 8. Сравнение task и монолита
+## 12. Тест 7. Сравнение task и монолита
 
 Для полной проверки стоит прогнать обе версии на одинаковых входных данных.
 
@@ -308,8 +288,7 @@ sudo -u postgres psql -d test_main_db -c "SELECT * FROM users_active ORDER BY sn
 4. Сравнить:
    - набор таблиц
    - row count в snapshot-таблицах
-   - отсутствие стадии transform в обоих вариантах
-   - отсутствие `cf_*` в snapshot и UPSERT при неизменной целевой схеме
+   - успешный FDW-перенос в обоих вариантах
    - `group_employee_count`
    - `users_active`
 
@@ -322,7 +301,7 @@ sudo -u postgres psql -d test_main_db_task -c "SELECT COUNT(*) FROM projects;"
 sudo -u postgres psql -d test_main_db_mono -c "SELECT COUNT(*) FROM projects;"
 ```
 
-## 14. Что смотреть в логах
+## 13. Что смотреть в логах
 
 Основной лог:
 
@@ -334,15 +313,12 @@ tail -f /workspace/logs/etl_pipeline.log
 - автоматическую очистку старых staging-БД
 - создание staging БД
 - restore dump
-- отсутствие стадии `transform_custom_values`
-- исключение `cf_*` из snapshot `issues/projects`
-- отсутствие операций удаления legacy `cf_*`
-- snapshot export
-- upsert в main
+- FDW setup и cleanup
+- FDW UPSERT в main
 - weekly update
 - cleanup staging БД
 
-## 14.1. Проверка отдельных стадий
+## 13.1. Проверка отдельных стадий
 
 Для targeted-проверок можно гонять только нужный шаг.
 
@@ -362,16 +338,16 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare -
 
 Что проверять:
 1. В начале лога печатается план стадий.
-2. Для `compare` видно исключение `cf_*`, если такие колонки есть.
+2. Для `compare` виден FDW snapshot-план без создания файлов.
 3. Для `weekly` видны `snapshot_date`, counts и debug sample.
 4. Для `seed_asterisk` видны `source_rows`, `inserted_rows` и `skipped`.
 
-## 15. Критерии успешного теста
+## 14. Критерии успешного теста
 
 Тест считается успешным, если:
 1. Main БД не удаляется nightly.
 2. Staging БД создается и очищается.
-3. Стадии custom transform нет, `cf_*` отсутствуют в snapshot, а схема main не изменяется.
+3. Временные FDW server/schema удаляются после load.
 4. Все таблицы public с безопасным ключом обнаружены и обработаны.
 5. Таблицы без ключей и расхождения схемы не пропущены молча.
 6. `asterisk_cdr` присутствует после прогона.
@@ -379,7 +355,7 @@ python3 scripts/etl_pipeline.py --config config/etl_config.ini --tasks compare -
 8. Нет дублей в weekly-таблицах.
 9. Task и монолит дают эквивалентный результат.
 
-## 16. Если найден дефект
+## 15. Если найден дефект
 
 Зафиксируйте:
 1. Какой dump использовался.
