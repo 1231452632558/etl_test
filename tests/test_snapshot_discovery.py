@@ -172,6 +172,18 @@ class SnapshotFdwTests(unittest.TestCase):
         self.assertIn('("issues"."metadata")::jsonb IS DISTINCT FROM', sql)
         self.assertNotIn("COPY", sql.upper())
 
+    def test_sequence_sync_guards_non_sequence_text_key(self):
+        db_ops = DatabaseOperations(make_settings(), FakeLogger())
+        sql = db_ops._snapshot_sequence_sql(
+            "ar_internal_metadata",
+            ["key", "value", "created_at", "updated_at"],
+            ["key"],
+        )
+        self.assertIn("sequence_name := pg_get_serial_sequence", sql)
+        self.assertIn("IF sequence_name IS NOT NULL THEN", sql)
+        self.assertIn('EXECUTE \'SELECT COALESCE(MAX("key")::bigint, 1)', sql)
+        self.assertNotIn("SELECT setval(\n    pg_get_serial_sequence", sql)
+
     def test_apply_runs_keyed_then_replace_group_and_cleans(self):
         db_ops = DatabaseOperations(make_settings(), FakeLogger())
         calls = []

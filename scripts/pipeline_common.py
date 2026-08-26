@@ -665,13 +665,24 @@ ON CONFLICT ({conflict_columns})
         if not candidates:
             return ""
         column_name = candidates[0]
+        quoted_table = _quote_identifier(table_name)
+        quoted_column = _quote_identifier(column_name)
         return f"""
-SELECT setval(
-    pg_get_serial_sequence('public.{table_name}', '{column_name}'),
-    COALESCE((SELECT MAX({_quote_identifier(column_name)}) FROM {_quote_identifier(table_name)}), 1),
-    EXISTS(SELECT 1 FROM {_quote_identifier(table_name)})
-)
-WHERE pg_get_serial_sequence('public.{table_name}', '{column_name}') IS NOT NULL;
+DO $etl_sequence$
+DECLARE
+    sequence_name text;
+    max_value bigint;
+    sequence_called boolean;
+BEGIN
+    sequence_name := pg_get_serial_sequence('public.{table_name}', '{column_name}');
+    IF sequence_name IS NOT NULL THEN
+        EXECUTE 'SELECT COALESCE(MAX({quoted_column})::bigint, 1), '
+                'EXISTS(SELECT 1 FROM {quoted_table}) FROM {quoted_table}'
+        INTO max_value, sequence_called;
+        PERFORM setval(sequence_name::regclass, max_value, sequence_called);
+    END IF;
+END
+$etl_sequence$;
 """.strip()
 
     def apply_snapshot_via_fdw(
