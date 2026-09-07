@@ -41,6 +41,12 @@ Python-реализация nightly ETL-процесса для PostgreSQL, ко
 repo/
 ├── config/
 │   └── etl_config.ini
+├── airflow/
+│   ├── dags/
+│   │   └── pipeline_metabase_dag.py
+│   ├── .env.example
+│   ├── requirements.txt
+│   └── README_RU.md
 ├── docs/
 │   ├── CODE_ARCHITECTURE.md
 │   ├── OPERATIONS.md
@@ -58,6 +64,9 @@ repo/
 ├── INSTALL.md
 └── README.md
 ```
+
+Готовый DAG и русская инструкция по подключению к Apache Airflow находятся в
+[`airflow/`](airflow/README_RU.md).
 
 ## Архитектура
 
