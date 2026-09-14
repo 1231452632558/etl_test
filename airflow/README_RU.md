@@ -1,14 +1,13 @@
 # Добавление Pipeline Metabase в Apache Airflow
 
 Каталог содержит DAG `pipeline_metabase_nightly`, который ежедневно в 02:00 по
-московскому времени выполняет ETL как цепочку нативных Airflow tasks. Файл
-`scripts/etl_pipeline.py` DAG не вызывает и не изменяет.
+московскому времени запускает существующий `scripts/etl_pipeline.py`.
 
-Airflow управляет расписанием, журналом и повторными попытками отдельных стадий.
-Полный безопасный цикл сохранен: получение дампа, staging-БД, CSV snapshot и
-UPSERT в стабильную main-БД, weekly-обновление и очистка staging после успеха. При ошибке
-следующие стадии не запускаются, а staging-БД и диагностические артефакты
-сохраняются.
+Airflow управляет расписанием, журналом и одной повторной попыткой. Сам ETL
+по-прежнему выполняет полный безопасный цикл: получение дампа, staging-БД,
+FDW-синхронизация в стабильную main-БД, weekly-обновление и очистка staging после
+успеха. При ошибке процесс возвращает ненулевой код, задача Airflow становится
+`failed`, а диагностические артефакты и staging-БД сохраняются.
 
 ## Состав каталога
 
@@ -23,7 +22,7 @@ airflow/
 
 ## Требования
 
-- Apache Airflow 2.4+ с TaskFlow API;
+- Apache Airflow 2.x с доступным `BashOperator`;
 - Python 3 и `pendulum` в окружении scheduler/worker;
 - `psql`, `scp`, `ssh` и остальные системные команды, используемые ETL;
 - `sudo` и разрешение без пароля выполнять `sudo -u postgres psql` для
@@ -84,7 +83,7 @@ ln -s \
 ```bash
 PIPELINE_METABASE_PROJECT_DIR=/opt/airflow/pipeline-metabase
 PIPELINE_METABASE_CONFIG_FILE=/opt/airflow/runtime/etl_config.ini
-PIPELINE_METABASE_LOAD_ASTERISK_CDR=true
+PIPELINE_METABASE_PYTHON=python3
 ```
 
 Добавьте их в окружение scheduler и всех worker. Пример находится в
@@ -105,7 +104,7 @@ services:
     environment:
       PIPELINE_METABASE_PROJECT_DIR: /opt/airflow/pipeline-metabase
       PIPELINE_METABASE_CONFIG_FILE: /opt/airflow/runtime/etl_config.ini
-      PIPELINE_METABASE_LOAD_ASTERISK_CDR: "true"
+      PIPELINE_METABASE_PYTHON: python3
 
   airflow-worker:
     volumes:
@@ -114,7 +113,7 @@ services:
     environment:
       PIPELINE_METABASE_PROJECT_DIR: /opt/airflow/pipeline-metabase
       PIPELINE_METABASE_CONFIG_FILE: /opt/airflow/runtime/etl_config.ini
-      PIPELINE_METABASE_LOAD_ASTERISK_CDR: "true"
+      PIPELINE_METABASE_PYTHON: python3
 ```
 
 Запись логов и временных файлов требует writable-каталогов. Поэтому пути из
@@ -135,12 +134,12 @@ services:
 ```bash
 airflow dags list-import-errors
 airflow dags list | grep pipeline_metabase_nightly
-airflow tasks test pipeline_metabase_nightly prepare_run_context 2026-09-07
+airflow tasks test pipeline_metabase_nightly run_incremental_pipeline 2026-09-07
 ```
 
-Команда `tasks test` запускает реальную первую стадию ETL. Сначала используйте
-тестовый конфиг и тестовую PostgreSQL. Затем в Airflow UI проверьте граф DAG и
-прогоните полный тестовый DagRun, прежде чем включать production-расписание.
+Команда `tasks test` запускает реальный ETL. Сначала используйте тестовый конфиг
+и тестовую PostgreSQL. После успешного теста откройте Airflow UI, найдите
+`pipeline_metabase_nightly` и включите DAG.
 
 Для ручного production-запуска после проверки:
 
@@ -154,8 +153,9 @@ airflow dags trigger pipeline_metabase_nightly
   `Europe/Moscow`.
 - `catchup=False`: пропущенные исторические дни автоматически не догоняются.
 - `max_active_runs=1`: два полных запуска DAG не выполняются одновременно.
-- Одна повторная попытка каждой стадии выполняется через 15 минут. Staging-имя
-  стабильно при retry одного DagRun, а CSV UPSERT/weekly операции идемпотентны.
+- Одна повторная попытка выполняется через 15 минут.
+- Предельное время задачи — 6 часов. Оно больше текущего лимита одной
+  snapshot-транзакции в ETL (4 часа).
 - Лог Airflow показывает stdout/stderr, а подробный ETL-лог сохраняется по пути
   `[paths].log_file` из `etl_config.ini`.
 
@@ -163,33 +163,10 @@ airflow dags trigger pipeline_metabase_nightly
 `airflow/dags/pipeline_metabase_dag.py`, проверьте импорт и доставьте новую версию
 DAG штатным способом.
 
-## Граф и контекст выполнения
+## Почему ETL представлен одной задачей Airflow
 
-```text
-prepare_run_context -> download_remote_dump -> extract_dump_files -> restore_staging
-  -> export_snapshot_csv -> load_snapshot_to_main -> load_asterisk_cdr
-  -> update_weekly_tables -> cleanup_successful_run
-```
-
-Через XCom передаются только пути, имя staging-БД и CSV snapshot-план. Секреты и объекты
-подключения не передаются: каждая задача читает защищенный `etl_config.ini` в
-своем worker. При сбое `cleanup_successful_run` не выполняется, поэтому staging и
-распакованный dump остаются для диагностики.
-
-## Отдельный DAG для Asterisk
-
-`load_asterisk_cdr` остается включенным по умолчанию (`true`). Само получение
-CSV отдельным DAG не доказывает, что данные уже загружены в main-БД. Отключить
-эту задачу можно только если внешний DAG после получения CSV сам выполняет
-идемпотентный `CSV -> asterisk_cdr` upsert по `id` в ту же main-БД и поддерживает
-создание таблицы/`project_id`.
-
-После такой проверки задайте во всех scheduler/worker:
-
-```bash
-PIPELINE_METABASE_LOAD_ASTERISK_CDR=false
-```
-
-Тогда task останется в графе для прозрачности, но успешно завершится с причиной
-`managed_by_external_asterisk_dag`, не повторяя загрузку CSV. В текущем репозитории кода внешнего Asterisk DAG нет,
-поэтому этот флаг намеренно не переключен автоматически.
+Стадии ETL передают друг другу runtime-контекст: путь принятого архива, имя
+созданной staging-БД и рассчитанный FDW-план. Текущая реализация также выполняет
+табличные транзакции и сохраняет диагностическое состояние при сбое. Один
+`BashOperator` не разрывает этот контракт и позволяет повторно использовать уже
+проверенный CLI без дублирования бизнес-логики в DAG.
