@@ -23,8 +23,8 @@ airflow/
 
 ## Требования
 
-- Apache Airflow 2.4+ с TaskFlow API;
-- Python 3 и `pendulum` в окружении scheduler/worker;
+- Apache Airflow **3.3.1** с Task SDK (`airflow.sdk`);
+- Python 3.10–3.14 и `pendulum` в окружении scheduler/worker;
 - `psql`, `scp`, `ssh` и остальные системные команды, используемые ETL;
 - `sudo` и разрешение без пароля выполнять `sudo -u postgres psql` для
   пользователя Airflow (это требование текущего `pipeline_common.py`);
@@ -130,8 +130,8 @@ services:
 Выполните команды от имени пользователя и в окружении Airflow:
 
 ```bash
-airflow dags list-import-errors
-airflow dags list | grep pipeline_metabase_nightly
+airflow dags list-import-errors --local
+airflow dags list --local | grep pipeline_metabase_nightly
 airflow tasks test pipeline_metabase_nightly prepare_run_context 2026-09-07
 ```
 
@@ -139,10 +139,11 @@ airflow tasks test pipeline_metabase_nightly prepare_run_context 2026-09-07
 тестовый конфиг и тестовую PostgreSQL. Затем в Airflow UI проверьте граф DAG и
 прогоните полный тестовый DagRun, прежде чем включать production-расписание.
 
-Для ручного production-запуска после проверки:
+Для ручного production-запуска используйте интерфейс Airflow либо `airflowctl`
+(в Airflow 3 удалённые операции вынесены из локального `airflow` CLI):
 
 ```bash
-airflow dags trigger pipeline_metabase_nightly
+airflowctl dagrun trigger --dag-id pipeline_metabase_nightly
 ```
 
 ## Эксплуатационные настройки

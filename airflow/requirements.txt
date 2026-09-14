@@ -1,4 +1,4 @@
-# DAG использует TaskFlow API Airflow 2.4+.
+# Целевая и проверяемая версия: Apache Airflow 3.3.1.
 # Версию apache-airflow обычно задает сам дистрибутив Airflow, поэтому здесь
 # перечислена только явная runtime-зависимость DAG.
 pendulum>=2.1,<4

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import sys
@@ -15,10 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pendulum
-from airflow import DAG
-from airflow.decorators import task
-from airflow.exceptions import AirflowFailException
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import DAG, task
+from airflow.sdk.exceptions import AirflowFailException
 
 
 DAG_ID = "pipeline_metabase_nightly"
@@ -77,7 +76,17 @@ with DAG(
         log_git_revision(logger)
         # Имя соответствует шаблону основного pipeline и стабильно при retry
         # одного DagRun, поэтому штатная очистка умеет найти его позднее.
-        timestamp = context["logical_date"].strftime("%Y%m%d_%H%M%S")
+        dag_run = context["dag_run"]
+        logical_date = dag_run.logical_date
+        if logical_date is not None:
+            timestamp = logical_date.strftime("%Y%m%d_%H%M%S")
+        else:
+            # В Airflow 3 ручной/API-запуск может не иметь logical_date.
+            # Детерминированные 14 цифр сохраняют имя при retry и соответствуют
+            # шаблону очистки staging-БД в pipeline_common.py.
+            digest = int(hashlib.sha256(dag_run.run_id.encode("utf-8")).hexdigest(), 16)
+            compact = f"{digest % (10**14):014d}"
+            timestamp = f"{compact[:8]}_{compact[8:]}"
         temp_db = f"{settings.temp_db_prefix}{timestamp}"
         try:
             db_ops.cleanup_stale_databases(exclude_names=[temp_db])
@@ -202,7 +211,7 @@ with DAG(
             _task_error("publish_verified_backup", "не удалось ротировать проверенный backup")
         return {"published": True}
 
-    @task(trigger_rule=TriggerRule.ALL_SUCCESS)
+    @task
     def cleanup_successful_run(
         run_context: dict[str, str], publish_summary: dict[str, bool]
     ) -> dict[str, Any]:
