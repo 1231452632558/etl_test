@@ -14,6 +14,8 @@ Airflow управляет расписанием, журналом и повт�
 
 ```text
 airflow/
+├── Dockerfile
+├── airflow-postgres.sudoers
 ├── dags/
 │   └── pipeline_metabase_dag.py
 ├── .env.example
@@ -34,6 +36,31 @@ airflow/
 Если используется CeleryExecutor или KubernetesExecutor, проект, конфиг и ключи
 должны быть доступны именно тому worker/pod, который выполняет задачу. Одной
 установки файлов только в scheduler недостаточно.
+
+## Как DAG получает доступ к PostgreSQL
+
+Airflow не меняет способ запуска `psql`, который использует основной код
+pipeline. Каждый SQL-вызов по-прежнему выполняется так:
+
+```bash
+sudo -u postgres psql -X -v ON_ERROR_STOP=1 \
+  -h <db_host> -p <db_port> -d <имя_базы>
+```
+
+Параметр `db_user` из `etl_config.ini` не заменяет системного пользователя в
+этой команде. Он используется как владелец создаваемой staging-БД. Поэтому
+операционная система, в которой фактически выполняется task, должна содержать:
+
+- системного пользователя `postgres`;
+- команды `sudo` и `psql`;
+- правило `sudoers`, разрешающее фактическому пользователю task запускать
+  `psql` от имени `postgres` без пароля.
+
+Важно: если Airflow запущен в Docker, правила `/etc/sudoers` и пользователи
+хостовой машины внутри контейнера не видны. Их нужно добавить в образ worker.
+Ошибка `sudo: unknown user postgres` означает именно отсутствие пользователя
+`postgres` внутри контейнера, а не отсутствие разрешения у пользователя на
+хосте.
 
 ## 1. Подготовить runtime-конфигурацию
 
@@ -119,10 +146,146 @@ services:
 подключаться к PostgreSQL через Unix socket, смонтируйте также каталог socket;
 иначе настройте TCP-подключение и безопасную аутентификацию.
 
-Стандартный Docker-образ Airflow может не содержать `sudo` и системного
-пользователя `postgres`. В таком случае приведенных mounts недостаточно: нужен
-корпоративный образ worker с PostgreSQL client, `sudo`, пользователем `postgres`
-и минимальным правилом `sudoers`, разрешающим только требуемый вызов `psql`.
+### 4.1. Проверить окружение именно внутри worker
+
+Проверять нужно не scheduler и не хост, а контейнер, который исполняет task.
+Подставьте имя своего сервиса worker:
+
+```bash
+docker compose exec airflow-worker id
+docker compose exec airflow-worker getent passwd postgres
+docker compose exec airflow-worker command -v sudo
+docker compose exec airflow-worker command -v psql
+docker compose exec airflow-worker \
+  sudo -n -u postgres psql --version
+```
+
+Ожидаемый результат: task запускается пользователем `airflow`, запись
+`postgres` существует, пути к `sudo` и `psql` найдены, последняя команда не
+запрашивает пароль. Если task выполняет scheduler, замените `airflow-worker` на
+имя сервиса scheduler.
+
+Типовые ошибки:
+
+| Сообщение | Причина |
+|---|---|
+| `sudo: unknown user postgres` | Внутри worker нет системного пользователя `postgres` |
+| `sudo: a password is required` | Для пользователя task нет действующего правила `NOPASSWD` |
+| `psql: command not found` | В образ не установлен PostgreSQL client |
+| `Peer authentication failed` | Не смонтирован socket, не совпадает UID либо не подходит правило `pg_hba.conf` |
+| `Connection refused` | Неверны `db_host`/`db_port` или PostgreSQL недоступен из worker |
+
+### 4.2. Установка Airflow непосредственно на сервер
+
+Если worker работает без Docker на том же сервере, где раньше запускался
+скрипт, правило должно быть выдано именно пользователю службы Airflow. Сначала
+узнайте путь к `psql`:
+
+```bash
+command -v psql
+```
+
+Создайте через `visudo` файл `/etc/sudoers.d/airflow-postgres` (замените путь к
+`psql`, если команда выше показала другой):
+
+```sudoers
+airflow ALL=(postgres) NOPASSWD: /usr/bin/psql
+```
+
+Проверьте правило от имени пользователя Airflow:
+
+```bash
+sudo -u airflow sudo -n -u postgres \
+  psql -X -h /var/run/postgresql -p 5432 -d postgres \
+  -c 'SELECT current_user;'
+```
+
+Команда должна вернуть `postgres` и не запросить пароль.
+
+### 4.3. Подготовка Docker-образа worker
+
+Стандартный образ Airflow может не содержать `sudo`, PostgreSQL client и
+системного пользователя `postgres`. Используйте собственный образ на базе той же
+версии Airflow. Сначала на хосте PostgreSQL определите числовые UID/GID:
+
+```bash
+id -u postgres
+id -g postgres
+```
+
+Пример `Dockerfile` (значения `999` замените результатами команд выше):
+
+```dockerfile
+FROM apache/airflow:3.3.1-python3.13
+
+USER root
+
+ARG POSTGRES_UID=999
+ARG POSTGRES_GID=999
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${POSTGRES_GID}" postgres \
+    && useradd --uid "${POSTGRES_UID}" --gid postgres \
+         --no-create-home --shell /usr/sbin/nologin postgres
+
+COPY airflow/airflow-postgres.sudoers /etc/sudoers.d/airflow-postgres
+RUN chmod 0440 /etc/sudoers.d/airflow-postgres \
+    && visudo -cf /etc/sudoers.d/airflow-postgres
+
+USER airflow
+```
+
+Содержимое `airflow/airflow-postgres.sudoers`:
+
+```sudoers
+airflow ALL=(postgres) NOPASSWD: /usr/bin/psql
+```
+
+В `docker-compose.yml` собирайте этот образ для компонента, который выполняет
+task, и смонтируйте Unix socket PostgreSQL:
+
+```yaml
+services:
+  airflow-worker:
+    build:
+      context: /srv/pipeline-metabase
+      dockerfile: airflow/Dockerfile
+      args:
+        POSTGRES_UID: "999"
+        POSTGRES_GID: "999"
+    volumes:
+      - /var/run/postgresql:/var/run/postgresql
+```
+
+Пересоберите и перезапустите исполняющий компонент:
+
+```bash
+docker compose build --no-cache airflow-worker
+docker compose up -d airflow-worker
+```
+
+Если используется LocalExecutor, тот же `build` должен быть задан сервису
+scheduler, и пересобрать нужно его.
+
+Для peer-аутентификации числовой UID пользователя `postgres` в контейнере должен
+совпадать с UID `postgres` на хосте. Если Docker использует user namespace
+remapping или socket PostgreSQL нельзя смонтировать, этот вариант неприменим:
+нужно переходить на TCP-аутентификацию отдельной ролью PostgreSQL. Текущий код
+всегда вызывает `sudo -u postgres`, поэтому такой переход требует отдельного
+изменения `pipeline_common.py` и настроек прав роли.
+
+После пересборки повторите проверки из пункта 4.1, затем проверьте реальное
+подключение:
+
+```bash
+docker compose exec airflow-worker \
+  sudo -n -u postgres psql -X \
+  -h /var/run/postgresql -p 5432 -d postgres \
+  -c 'SELECT current_user;'
+```
+
 Не выдавайте пользователю Airflow неограниченный `NOPASSWD: ALL`.
 
 ## 5. Проверить DAG до включения расписания
