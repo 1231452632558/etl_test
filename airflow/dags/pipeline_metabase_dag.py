@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pendulum
-from airflow.sdk import DAG, task
+from airflow.sdk import Connection, DAG, task
 from airflow.sdk.exceptions import AirflowFailException
 
 
@@ -28,21 +28,43 @@ CONFIG_FILE = os.environ.get(
     "PIPELINE_METABASE_CONFIG_FILE",
     "/opt/airflow/runtime/etl_config.ini",
 )
+DB_HOST_CONNECTION_ID = os.environ.get(
+    "PIPELINE_METABASE_DB_HOST_CONN_ID",
+    "pipeline_metabase_db_host",
+)
 
 
 def _runtime() -> tuple[Any, Any, Any]:
     """Создать независимое runtime-окружение для одного Airflow task."""
 
-    scripts_dir = str(PROJECT_DIR / "scripts")
-    if scripts_dir not in sys.path:
-        sys.path.insert(0, scripts_dir)
-    from pipeline_common import DatabaseOperations, ETLLogger, PipelineSettings
+    import_paths = [PROJECT_DIR / "scripts", PROJECT_DIR / "airflow" / "runtime"]
+    for import_path in import_paths:
+        path_text = str(import_path)
+        if path_text not in sys.path:
+            sys.path.insert(0, path_text)
+    from pipeline_common import ETLLogger, PipelineSettings
+    from remote_postgres import SshPostgresDatabaseOperations, SshPostgresTarget
 
     if not os.path.exists(CONFIG_FILE):
         raise AirflowFailException(f"Конфигурационный файл не найден: {CONFIG_FILE}")
     settings = PipelineSettings.from_file(CONFIG_FILE)
     logger = ETLLogger(settings.log_file, settings.log_level)
-    return settings, logger, DatabaseOperations(settings, logger)
+    try:
+        connection = Connection.get(DB_HOST_CONNECTION_ID)
+        target = SshPostgresTarget.from_airflow_connection(
+            connection,
+            default_db_socket=settings.db_host,
+            default_db_port=settings.db_port,
+        )
+    except Exception as exc:
+        raise AirflowFailException(
+            f"Не удалось загрузить SSH Connection {DB_HOST_CONNECTION_ID}: {exc}"
+        ) from exc
+    # В Airflow db_host — это socket уже на целевом сервере. Сам worker до БД
+    # не подключается: все psql-команды выполняются через SSH adapter.
+    settings.db_host = target.db_socket
+    settings.db_port = target.db_port
+    return settings, logger, SshPostgresDatabaseOperations(settings, logger, target)
 
 
 def _task_error(task_name: str, message: str, errors: list[str] | None = None) -> None:

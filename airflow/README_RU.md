@@ -15,9 +15,10 @@ Airflow управляет расписанием, журналом и повт�
 ```text
 airflow/
 ├── Dockerfile
-├── airflow-postgres.sudoers
 ├── dags/
 │   └── pipeline_metabase_dag.py
+├── runtime/
+│   └── remote_postgres.py
 ├── .env.example
 ├── requirements.txt
 └── README_RU.md
@@ -27,11 +28,12 @@ airflow/
 
 - Apache Airflow **3.3.1** с Task SDK (`airflow.sdk`);
 - Python 3.10–3.14 и `pendulum` в окружении scheduler/worker;
-- `psql`, `scp`, `ssh` и остальные системные команды, используемые ETL;
-- `sudo` и разрешение без пароля выполнять `sudo -u postgres psql` для
-  пользователя Airflow (это требование текущего `pipeline_common.py`);
-- сетевой доступ от Airflow worker к PostgreSQL и серверу с дампом;
-- рабочий конфиг `etl_config.ini`, SSH-ключ и способ аутентификации PostgreSQL.
+- `ssh` и `scp` внутри контейнера Airflow worker;
+- сетевой SSH-доступ worker к целевому серверу PostgreSQL и источнику дампа;
+- технический пользователь на целевом сервере, которому разрешено без пароля
+  выполнять только `psql` от имени системного пользователя `postgres`;
+- рабочий конфиг `etl_config.ini`, приватный SSH-ключ и заполненный
+  `known_hosts` в виде Docker secrets или защищенных read-only mounts.
 
 Если используется CeleryExecutor или KubernetesExecutor, проект, конфиг и ключи
 должны быть доступны именно тому worker/pod, который выполняет задачу. Одной
@@ -39,28 +41,25 @@ airflow/
 
 ## Как DAG получает доступ к PostgreSQL
 
-Airflow не меняет способ запуска `psql`, который использует основной код
-pipeline. Каждый SQL-вызов по-прежнему выполняется так:
+Airflow и PostgreSQL находятся на разных серверах. Поэтому worker **не**
+запускает локальный `sudo`, не монтирует PostgreSQL socket и не подключается к
+порту БД напрямую. Для каждой SQL-операции используется цепочка:
 
-```bash
-sudo -u postgres psql -X -v ON_ERROR_STOP=1 \
-  -h <db_host> -p <db_port> -d <имя_базы>
+```text
+Airflow task в контейнере
+  -> SSH под техническим пользователем
+  -> целевой сервер PostgreSQL
+  -> sudo -n -u postgres /usr/bin/psql
+  -> локальный Unix socket PostgreSQL
 ```
 
-Параметр `db_user` из `etl_config.ini` не заменяет системного пользователя в
-этой команде. Он используется как владелец создаваемой staging-БД. Поэтому
-операционная система, в которой фактически выполняется task, должна содержать:
+SQL передается в stdin удаленного `psql`, включая большие файлы восстановления.
+Пароль PostgreSQL в Airflow не хранится. `postgres_fdw` создается и выполняется
+на целевом сервере между staging и main в одном PostgreSQL-кластере, поэтому
+переливка main не идет через CSV и не проходит через Airflow worker.
 
-- системного пользователя `postgres`;
-- команды `sudo` и `psql`;
-- правило `sudoers`, разрешающее фактическому пользователю task запускать
-  `psql` от имени `postgres` без пароля.
-
-Важно: если Airflow запущен в Docker, правила `/etc/sudoers` и пользователи
-хостовой машины внутри контейнера не видны. Их нужно добавить в образ worker.
-Ошибка `sudo: unknown user postgres` означает именно отсутствие пользователя
-`postgres` внутри контейнера, а не отсутствие разрешения у пользователя на
-хосте.
+Основной `scripts/pipeline_common.py` не изменен. Удаленный способ выполнения
+реализован только для DAG в `airflow/runtime/remote_postgres.py`.
 
 ## 1. Подготовить runtime-конфигурацию
 
@@ -74,18 +73,25 @@ sudo install -m 640 -o airflow -g airflow \
   /opt/airflow/runtime/etl_config.ini
 ```
 
-Проверьте в конфиге пути `backup_storage_dir`, `old_backup_dir`, `temp_dir`,
-`log_file` и CSV-файлы: они должны существовать и быть доступны пользователю,
-под которым выполняется Airflow task.
+Пути `backup_storage_dir`, `old_backup_dir`, `temp_dir`, `log_file` и seed CSV
+относятся к файловой системе worker. Для Celery/Kubernetes задачи могут попасть
+на разные worker, поэтому `temp_dir`, каталоги dump и логов должны находиться на
+общем persistent volume. Иначе следующая task не увидит файл предыдущей.
 
-Для PostgreSQL используйте один из вариантов:
+В секции `[database]` оставьте параметры целевого PostgreSQL, доступные уже на
+целевом сервере:
 
-- Unix socket и разрешенную сервером аутентификацию;
-- файл `.pgpass` с правами `0600` у пользователя Airflow;
-- переменную `PGPASSFILE`, указывающую на смонтированный secret-файл.
+```ini
+[database]
+db_name = main
+db_user = <владелец_main_и_staging>
+db_host = /var/run/postgresql
+db_port = 5432
+temp_db_prefix = temp_restore_
+```
 
-Для `scp` установите приватный ключ как secret и заранее добавьте ключ удаленного
-хоста в `known_hosts`. Не отключайте проверку host key.
+`db_host` здесь — путь к Unix socket **на целевом сервере**, а не внутри
+контейнера Airflow. SSH-параметры задаются отдельно через Airflow Connection.
 
 ## 2. Разместить проект и DAG
 
@@ -111,140 +117,112 @@ ln -s \
 ```bash
 PIPELINE_METABASE_PROJECT_DIR=/opt/airflow/pipeline-metabase
 PIPELINE_METABASE_CONFIG_FILE=/opt/airflow/runtime/etl_config.ini
+PIPELINE_METABASE_DB_HOST_CONN_ID=pipeline_metabase_db_host
 ```
 
 Добавьте их в окружение scheduler и всех worker. Пример находится в
 `airflow/.env.example`. После изменения окружения перезапустите соответствующие
 компоненты Airflow.
 
-## 4. Вариант для Docker Compose
+## 4. Настроить целевой сервер PostgreSQL
 
-Добавьте одинаковые mounts и environment как минимум в `airflow-scheduler` и
-`airflow-worker` (а при LocalExecutor — в компонент, исполняющий задачи):
+Используйте существующего технического Linux-пользователя, под которым раньше
+запускался скрипт. Ниже он обозначен как `<etl_ssh_user>`.
 
-```yaml
-services:
-  airflow-scheduler:
-    volumes:
-      - /srv/pipeline-metabase:/opt/airflow/pipeline-metabase:ro
-      - /srv/airflow-runtime:/opt/airflow/runtime:ro
-    environment:
-      PIPELINE_METABASE_PROJECT_DIR: /opt/airflow/pipeline-metabase
-      PIPELINE_METABASE_CONFIG_FILE: /opt/airflow/runtime/etl_config.ini
-
-  airflow-worker:
-    volumes:
-      - /srv/pipeline-metabase:/opt/airflow/pipeline-metabase:ro
-      - /srv/airflow-runtime:/opt/airflow/runtime:ro
-    environment:
-      PIPELINE_METABASE_PROJECT_DIR: /opt/airflow/pipeline-metabase
-      PIPELINE_METABASE_CONFIG_FILE: /opt/airflow/runtime/etl_config.ini
-```
-
-Запись логов и временных файлов требует writable-каталогов. Поэтому пути из
-`etl_config.ini` нужно отдельно смонтировать с правом записи. Если worker должен
-подключаться к PostgreSQL через Unix socket, смонтируйте также каталог socket;
-иначе настройте TCP-подключение и безопасную аутентификацию.
-
-### 4.1. Проверить окружение именно внутри worker
-
-Проверять нужно не scheduler и не хост, а контейнер, который исполняет task.
-Подставьте имя своего сервиса worker:
+На целевом сервере проверьте команды:
 
 ```bash
-docker compose exec airflow-worker id
-docker compose exec airflow-worker getent passwd postgres
-docker compose exec airflow-worker command -v sudo
-docker compose exec airflow-worker command -v psql
-docker compose exec airflow-worker \
-  sudo -n -u postgres psql --version
-```
-
-Ожидаемый результат: task запускается пользователем `airflow`, запись
-`postgres` существует, пути к `sudo` и `psql` найдены, последняя команда не
-запрашивает пароль. Если task выполняет scheduler, замените `airflow-worker` на
-имя сервиса scheduler.
-
-Типовые ошибки:
-
-| Сообщение | Причина |
-|---|---|
-| `sudo: unknown user postgres` | Внутри worker нет системного пользователя `postgres` |
-| `sudo: a password is required` | Для пользователя task нет действующего правила `NOPASSWD` |
-| `psql: command not found` | В образ не установлен PostgreSQL client |
-| `Peer authentication failed` | Не смонтирован socket, не совпадает UID либо не подходит правило `pg_hba.conf` |
-| `Connection refused` | Неверны `db_host`/`db_port` или PostgreSQL недоступен из worker |
-
-### 4.2. Установка Airflow непосредственно на сервер
-
-Если worker работает без Docker на том же сервере, где раньше запускался
-скрипт, правило должно быть выдано именно пользователю службы Airflow. Сначала
-узнайте путь к `psql`:
-
-```bash
-command -v psql
-```
-
-Создайте через `visudo` файл `/etc/sudoers.d/airflow-postgres` (замените путь к
-`psql`, если команда выше показала другой):
-
-```sudoers
-airflow ALL=(postgres) NOPASSWD: /usr/bin/psql
-```
-
-Проверьте правило от имени пользователя Airflow:
-
-```bash
-sudo -u airflow sudo -n -u postgres \
-  psql -X -h /var/run/postgresql -p 5432 -d postgres \
+sudo -u <etl_ssh_user> sudo -n -u postgres \
+  /usr/bin/psql -X -h /var/run/postgresql -p 5432 -d postgres \
   -c 'SELECT current_user;'
 ```
 
-Команда должна вернуть `postgres` и не запросить пароль.
-
-### 4.3. Подготовка Docker-образа worker
-
-Стандартный образ Airflow может не содержать `sudo`, PostgreSQL client и
-системного пользователя `postgres`. Используйте собственный образ на базе той же
-версии Airflow. Сначала на хосте PostgreSQL определите числовые UID/GID:
-
-```bash
-id -u postgres
-id -g postgres
-```
-
-Пример `Dockerfile` (значения `999` замените результатами команд выше):
-
-```dockerfile
-FROM apache/airflow:3.3.1-python3.13
-
-USER root
-
-ARG POSTGRES_UID=999
-ARG POSTGRES_GID=999
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client sudo \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid "${POSTGRES_GID}" postgres \
-    && useradd --uid "${POSTGRES_UID}" --gid postgres \
-         --no-create-home --shell /usr/sbin/nologin postgres
-
-COPY airflow/airflow-postgres.sudoers /etc/sudoers.d/airflow-postgres
-RUN chmod 0440 /etc/sudoers.d/airflow-postgres \
-    && visudo -cf /etc/sudoers.d/airflow-postgres
-
-USER airflow
-```
-
-Содержимое `airflow/airflow-postgres.sudoers`:
+Результат должен содержать `postgres`, пароль запрашиваться не должен. Если
+правила еще нет, создайте его через `visudo` в
+`/etc/sudoers.d/pipeline-metabase-airflow`:
 
 ```sudoers
-airflow ALL=(postgres) NOPASSWD: /usr/bin/psql
+<etl_ssh_user> ALL=(postgres) NOPASSWD: /usr/bin/psql
 ```
 
-В `docker-compose.yml` собирайте этот образ для компонента, который выполняет
-task, и смонтируйте Unix socket PostgreSQL:
+Не выдавайте `NOPASSWD: ALL`. Убедитесь, что PostgreSQL принимает локальные
+подключения пользователя `postgres` через указанный socket. Порт PostgreSQL
+открывать для сервера Airflow не требуется.
+
+Доступ к `psql` от имени `postgres` является привилегированным, даже если в
+`sudoers` разрешена только одна команда. Используйте отдельный SSH-ключ только
+для этого DAG, ограничьте вход на SSH firewall-ом адресом сервера Airflow и
+добавьте для ключа в `authorized_keys` как минимум параметры
+`from="<IP_AIRFLOW>",restrict`. Не используйте личный ключ администратора.
+
+Для FDW администратор PostgreSQL должен один раз установить расширение в main:
+
+```bash
+sudo -u postgres /usr/bin/psql -X \
+  -h /var/run/postgresql -p 5432 -d main \
+  -c 'CREATE EXTENSION IF NOT EXISTS postgres_fdw;'
+```
+
+DAG создает только временный foreign server/schema и удаляет их после загрузки.
+
+## 5. Настроить SSH Connection в Airflow
+
+Создайте Airflow Connection с ID `pipeline_metabase_db_host`. Достаточно типа
+`Generic`: DAG использует публичный `Connection` API Airflow 3.3.1 и системный
+OpenSSH client, а не `PostgresHook`.
+
+| Поле | Значение |
+|---|---|
+| Host | DNS-имя или IP целевого сервера PostgreSQL |
+| Login | `<etl_ssh_user>` |
+| Port | SSH-порт, обычно `22` |
+| Password | не заполнять; используется SSH-ключ |
+| Schema | не используется |
+
+Поле Extra:
+
+```json
+{
+  "identity_file": "/run/secrets/pipeline_db_ssh_key",
+  "known_hosts_file": "/opt/airflow/ssh/known_hosts",
+  "db_socket": "/var/run/postgresql",
+  "db_port": 5432,
+  "connect_timeout": 15,
+  "restore_timeout_seconds": 14400,
+  "remote_sudo": "/usr/bin/sudo",
+  "remote_psql": "/usr/bin/psql",
+  "remote_db_os_user": "postgres"
+}
+```
+
+Пути относятся к контейнеру worker. Connection можно хранить в metadata DB,
+переменной `AIRFLOW_CONN_PIPELINE_METABASE_DB_HOST` или внешнем Secrets Backend.
+Не помещайте приватный ключ в Connection, репозиторий или JSON Extra.
+`restore_timeout_seconds` ограничивает потоковое восстановление одного SQL-файла;
+по умолчанию это 4 часа. SSH keepalive включен в adapter, поэтому длительное
+восстановление не зависит от короткого простоя соединения.
+
+## 6. Настроить Docker Compose
+
+Файл `airflow/Dockerfile` добавляет в Airflow 3.3.1 только OpenSSH client. `sudo`,
+`psql` и пользователь `postgres` внутри контейнера больше не нужны.
+
+Пример для worker:
+
+Перед запуском разместите отдельный ключ так, чтобы его мог читать UID
+пользователя `airflow` в контейнере, но не другие пользователи хоста. Для
+официального образа UID по умолчанию равен `50000`:
+
+```bash
+sudo install -o 50000 -g 0 -m 0400 \
+  /защищенный/источник/pipeline_db_ssh_key \
+  /srv/airflow-secrets/pipeline_db_ssh_key
+sudo install -o 50000 -g 0 -m 0444 \
+  /защищенный/источник/known_hosts \
+  /srv/airflow-ssh/known_hosts
+```
+
+Если в Compose задан другой `AIRFLOW_UID`, используйте его вместо `50000`.
 
 ```yaml
 services:
@@ -252,43 +230,66 @@ services:
     build:
       context: /srv/pipeline-metabase
       dockerfile: airflow/Dockerfile
-      args:
-        POSTGRES_UID: "999"
-        POSTGRES_GID: "999"
+    environment:
+      PIPELINE_METABASE_PROJECT_DIR: /opt/airflow/pipeline-metabase
+      PIPELINE_METABASE_CONFIG_FILE: /opt/airflow/runtime/etl_config.ini
+      PIPELINE_METABASE_DB_HOST_CONN_ID: pipeline_metabase_db_host
     volumes:
-      - /var/run/postgresql:/var/run/postgresql
+      - /srv/pipeline-metabase:/opt/airflow/pipeline-metabase:ro
+      - /srv/airflow-runtime:/opt/airflow/runtime:ro
+      - pipeline-etl-data:/opt/airflow/pipeline-data
+      - /srv/airflow-ssh/known_hosts:/opt/airflow/ssh/known_hosts:ro
+      - /srv/airflow-secrets/pipeline_db_ssh_key:/run/secrets/pipeline_db_ssh_key:ro
+
+volumes:
+  pipeline-etl-data:
 ```
 
-Пересоберите и перезапустите исполняющий компонент:
+Пути `[paths]` в `etl_config.ini` направьте в
+`/opt/airflow/pipeline-data/...`. Тот же volume должен быть подключен ко всем
+worker, которые могут исполнять задачи DAG. Обычный локальный named volume не
+является общим для worker на разных Docker-хостах — там нужен NFS/CephFS или
+другое общее хранилище.
+
+Пересоберите исполняющий компонент:
 
 ```bash
 docker compose build --no-cache airflow-worker
 docker compose up -d airflow-worker
 ```
 
-Если используется LocalExecutor, тот же `build` должен быть задан сервису
-scheduler, и пересобрать нужно его.
+При LocalExecutor образ, mounts и environment задаются scheduler, потому что
+именно он исполняет задачи.
 
-Для peer-аутентификации числовой UID пользователя `postgres` в контейнере должен
-совпадать с UID `postgres` на хосте. Если Docker использует user namespace
-remapping или socket PostgreSQL нельзя смонтировать, этот вариант неприменим:
-нужно переходить на TCP-аутентификацию отдельной ролью PostgreSQL. Текущий код
-всегда вызывает `sudo -u postgres`, поэтому такой переход требует отдельного
-изменения `pipeline_common.py` и настроек прав роли.
+## 7. Проверить SSH и PostgreSQL до запуска DAG
 
-После пересборки повторите проверки из пункта 4.1, затем проверьте реальное
-подключение:
+Сначала проверьте файлы и SSH из исполняющего контейнера:
 
 ```bash
 docker compose exec airflow-worker \
-  sudo -n -u postgres psql -X \
-  -h /var/run/postgresql -p 5432 -d postgres \
-  -c 'SELECT current_user;'
+  test -r /run/secrets/pipeline_db_ssh_key
+docker compose exec airflow-worker \
+  test -r /opt/airflow/ssh/known_hosts
+docker compose exec airflow-worker \
+  ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+  -o UserKnownHostsFile=/opt/airflow/ssh/known_hosts \
+  -i /run/secrets/pipeline_db_ssh_key \
+  <etl_ssh_user>@<db_host> \
+  'sudo -n -u postgres /usr/bin/psql -X -h /var/run/postgresql -p 5432 -d postgres -c "SELECT current_user;"'
 ```
 
-Не выдавайте пользователю Airflow неограниченный `NOPASSWD: ALL`.
+Команда должна вернуть `postgres`. Типовые ошибки:
 
-## 5. Проверить DAG до включения расписания
+| Сообщение | Причина |
+|---|---|
+| `Permission denied (publickey)` | неверный ключ, Login или `authorized_keys` на целевом сервере |
+| `Host key verification failed` | отсутствует/не совпадает запись в `known_hosts` |
+| `sudo: a password is required` | правило `NOPASSWD` не действует для SSH-пользователя |
+| `psql: command not found` | в Connection Extra указан неверный `remote_psql` |
+| `Peer authentication failed` | не подходит локальное правило `pg_hba.conf` на сервере PostgreSQL |
+| `could not connect ... socket` | неверны `db_socket`/`db_port` или PostgreSQL не запущен |
+
+## 8. Проверить DAG до включения расписания
 
 Выполните команды от имени пользователя и в окружении Airflow:
 
@@ -335,9 +336,10 @@ prepare_run_context -> download_and_extract -> restore_staging
 ```
 
 Через XCom передаются только пути, имя staging-БД и FDW-план. Секреты и объекты
-подключения не передаются: каждая задача читает защищенный `etl_config.ini` в
-своем worker. При сбое `cleanup_successful_run` не выполняется, поэтому staging и
-распакованный dump остаются для диагностики.
+подключения не передаются: каждая задача отдельно читает защищенный
+`etl_config.ini` и Airflow Connection в своем worker. При сбое
+`cleanup_successful_run` не выполняется, поэтому staging и распакованный dump
+остаются для диагностики.
 
 ## Отдельный DAG для Asterisk
 
